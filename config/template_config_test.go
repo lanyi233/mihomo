@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -101,4 +102,37 @@ func TestTemplateSystemData(t *testing.T) {
 	require.Contains(t, string(buf), runtime.GOOS)
 	require.Contains(t, string(buf), runtime.GOARCH)
 	require.NotEmpty(t, os.Getenv("PATH"))
+}
+
+func TestSplitTemplateCommand(t *testing.T) {
+	args, err := splitTemplateCommand(`'path/to/program' "argument with spaces" 1 2`)
+	require.NoError(t, err)
+	require.Equal(t, []string{"path/to/program", "argument with spaces", "1", "2"}, args)
+
+	_, err = splitTemplateCommand(`'unterminated`)
+	require.Error(t, err)
+}
+
+func TestRunTemplateCommand(t *testing.T) {
+	output, err := runTemplateCommand(`printf 'hello %s' world`)
+	require.NoError(t, err)
+	require.Equal(t, "hello world", output)
+
+	_, err = runTemplateCommand("command-that-does-not-exist")
+	require.Error(t, err)
+}
+
+func TestRunTemplateCommandPipeline(t *testing.T) {
+	output, err := runTemplateCommand(`(printf 'hello') | (tr 'a-z' 'A-Z')`)
+	require.NoError(t, err)
+	require.Equal(t, "HELLO", output)
+}
+
+func TestRunTemplateCommandWithQuotedPathAndArguments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "program with spaces")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s|%s|%s' \"$1\" \"$2\" \"$3\"\n"), 0o700))
+	output, err := runTemplateCommand(fmt.Sprintf("%q 1 2 3", path))
+	require.NoError(t, err)
+	require.Equal(t, "1|2|3", output)
 }
