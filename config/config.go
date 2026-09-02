@@ -18,7 +18,6 @@ import (
 	"github.com/metacubex/mihomo/common/orderedmap"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/yaml"
-	"github.com/metacubex/mihomo/component/age"
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/cidr"
 	"github.com/metacubex/mihomo/component/fakeip"
@@ -488,29 +487,29 @@ func Parse(buf []byte) (*Config, error) {
 
 func DefaultRawConfig() *RawConfig {
 	return &RawConfig{
-		AllowLan:          false,
-		BindAddress:       "*",
-		LanAllowedIPs:     []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
-		IPv6:              true,
-		Mode:              T.Rule,
-		GeoAutoUpdate:     false,
-		GeoUpdateInterval: 24,
-		GeodataMode:       geodata.GeodataMode(),
-		GeodataLoader:     "memconservative",
-		LgbmAutoUpdate:    false,
-		LgbmUpdateInterval:72,
-		LgbmUrl:           lightgbm.GetModelDownloadURL(),
-		UnifiedDelay:      false,
-		Authentication:    []string{},
-		LogLevel:          log.INFO,
-		Hosts:             map[string]any{},
-		Rule:              []string{},
-		Proxy:             []map[string]any{},
-		ProxyGroup:        []map[string]any{},
-		TCPConcurrent:     false,
-		FindProcessMode:   process.FindProcessStrict,
-		GlobalUA:          "clash.meta/" + C.Version,
-		ETagSupport:       true,
+		AllowLan:           false,
+		BindAddress:        "*",
+		LanAllowedIPs:      []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
+		IPv6:               true,
+		Mode:               T.Rule,
+		GeoAutoUpdate:      false,
+		GeoUpdateInterval:  24,
+		GeodataMode:        geodata.GeodataMode(),
+		GeodataLoader:      "memconservative",
+		LgbmAutoUpdate:     false,
+		LgbmUpdateInterval: 72,
+		LgbmUrl:            lightgbm.GetModelDownloadURL(),
+		UnifiedDelay:       false,
+		Authentication:     []string{},
+		LogLevel:           log.INFO,
+		Hosts:              map[string]any{},
+		Rule:               []string{},
+		Proxy:              []map[string]any{},
+		ProxyGroup:         []map[string]any{},
+		TCPConcurrent:      false,
+		FindProcessMode:    process.FindProcessStrict,
+		GlobalUA:           "clash.meta/" + C.Version,
+		ETagSupport:        true,
 		DNS: RawDNS{
 			Enable:         false,
 			IPv6:           false,
@@ -618,13 +617,13 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 	rawCfg := DefaultRawConfig()
 
 	// decrypt config
-	buf, err := age.DecryptBytes(buf)
+	buf, err := RenderTemplateBytes(buf)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt config error: %w", err)
+		return nil, err
 	}
 
 	if err := yaml.Unmarshal(buf, rawCfg); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("config yaml decode: %w", err)
 	}
 
 	return rawCfg, nil
