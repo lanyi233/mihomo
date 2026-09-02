@@ -77,9 +77,6 @@ jobs:
         echo "Checking redirect_server.go for dual-stack changes:"
         grep -B2 "if s.listenAddr.Is4()" redirect_server.go || echo "Dual-stack change not found"
 
-    - name: Modify the Update Link
-      run: sed -i 's|github\.com/MetaCubeX/mihomo|github.com/TanakaLun/mihomo|g' ./component/updater/update_core.go
-
     - name: Update CA
       run: |
         sudo apt-get update && sudo apt-get install -y ca-certificates
