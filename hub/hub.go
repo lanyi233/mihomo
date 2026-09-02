@@ -9,6 +9,8 @@ import (
 
 type Option func(*config.Config)
 
+var templateEnabled bool
+
 func WithExternalUI(externalUI string) Option {
 	return func(cfg *config.Config) {
 		cfg.Controller.ExternalUI = externalUI
@@ -53,6 +55,10 @@ func WithSecret(secret string) Option {
 
 // ApplyConfig dispatch configure to all parts include ExternalController
 func ApplyConfig(cfg *config.Config) {
+	applyConfig(cfg)
+}
+
+func applyConfig(cfg *config.Config) {
 	applyRoute(cfg)
 	executor.ApplyConfig(cfg, true)
 }
@@ -96,11 +102,10 @@ func Parse(configBytes []byte, options ...Option) error {
 	if err != nil {
 		return err
 	}
-
 	for _, option := range options {
 		option(cfg)
 	}
 
-	ApplyConfig(cfg)
+	applyConfig(cfg)
 	return nil
 }
