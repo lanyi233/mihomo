@@ -1,70 +1,111 @@
-# mihomo main configuration template example
+# mihomo template configuration reference
+# mihomo 模板配置参考
 #
-# Start, validate, or render this file with:
-#   mihomo -f ./template_config.yaml
-#   mihomo -t -f ./template_config.yaml
-#   mihomo template -o ./rendered.yaml ./template_config.yaml
+# Render this file with the standalone template command.
+# 使用独立的 template 子命令渲染此文件。
 #
-# The template is rendered before the normal YAML parser runs. The rendered
-# output must still be valid mihomo YAML.
+# mihomo template ./template_config.yaml
+# mihomo template -o ./rendered.yaml ./template_config.yaml
+# mihomo -t -f ./template_config.yaml
 #
-# Required environment variables used by this example:
-#   MIHOMO_MIXED_PORT
-#   MIHOMO_API_SECRET
-#   MIHOMO_PROXY_SERVER
-#   MIHOMO_PROXY_PORT
-#   MIHOMO_PROXY_PASSWORD
-#   MIHOMO_LOG_LEVEL
-#   MIHOMO_DEBUG (set to true or false)
+# The normal mihomo configuration path renders templates automatically.
+# mihomo 正常加载主配置时会自动执行模板渲染。
+#
+# This file is a complete example, not a production-ready configuration.
+# 本文件是完整示例，不代表可直接用于生产环境的配置。
 
 {{- $baseURL := "https://testing.com/rules" -}}
 {{- $ruleSets := tuple "google" "youtube" "telegram" "github" "openai" -}}
+{{- $defaultMode := default "rule" (env "MIHOMO_MODE") -}}
+{{- $logLevel := env "MIHOMO_LOG_LEVEL" | trim | lower -}}
 
-# .System exposes values from the running mihomo process.
-# Available fields in this example:
-#   .System.OS
-#   .System.Arch
-#   .System.Version
+# Set every variable below before validating this example.
+# 校验此示例前请设置下面列出的全部变量。
 #
-# Do not put these explanatory fields into the configuration itself. Use them
-# in a real mihomo field, for example:
-external-controller: 127.0.0.1:9093
-external-controller-cors:
-  allow-origins:
-    - "*"
-  allow-private-network: true
+# MIHOMO_MIXED_PORT=10801
+# MIHOMO_MODE=rule
+# MIHOMO_LOG_LEVEL=info
+# MIHOMO_API_SECRET=replace-me
+# MIHOMO_PROXY_SERVER=127.0.0.1
+# MIHOMO_PROXY_PORT=1080
+# MIHOMO_PROXY_PASSWORD=replace-me
+# MIHOMO_DEBUG=false
 
+# System values are provided by the mihomo process.
+# System 字段由 mihomo 进程提供。
+#
+# .System.OS is the operating system name, such as linux.
+# .System.OS 是操作系统名称，例如 linux。
+# .System.Arch is the CPU architecture, such as amd64.
+# .System.Arch 是 CPU 架构名称，例如 amd64。
+# .System.Version is the compiled mihomo version.
+# .System.Version 是编译时写入的 mihomo 版本。
+
+# Environment values should be quoted when they are strings.
+# 环境变量作为字符串使用时应进行 YAML 引号转义。
 mixed-port: {{ env "MIHOMO_MIXED_PORT" }}
 allow-lan: true
 bind-address: "*"
 ipv6: true
-mode: rule
+mode: {{ $defaultMode | quote }}
 find-process-mode: strict
+log-level: {{ $logLevel | quote }}
 
-# env and expandenv fail when a referenced variable is not set. An explicitly
-# set empty value remains empty. Quote string-valued results when needed.
+# The env function fails when the variable is absent.
+# env 函数在变量不存在时会返回错误。
+# An explicitly defined empty variable remains an empty string.
+# 显式设置为空字符串的变量仍然保持为空字符串。
 secret: {{ env "MIHOMO_API_SECRET" | quote }}
 
-# text/template conditionals and Sprig string helpers can be combined.
-# Set MIHOMO_LOG_LEVEL before using this example.
-log-level: {{ env "MIHOMO_LOG_LEVEL" | lower | trim | quote }}
+# The expandenv function expands shell-style environment references.
+# expandenv 函数会展开 shell 风格的环境变量引用。
+# Use it only when the resulting value is valid in this YAML position.
+# 只有在结果适合当前 YAML 字段时才使用它。
+external-ui-name: {{ expandenv "mihomo-$MIHOMO_MODE-$MIHOMO_LOG_LEVEL" | quote }}
 
+# if supports conditionals and comparisons.
+# if 支持条件判断和比较操作。
+{{ if eq (env "MIHOMO_DEBUG") "true" }}
+tcp-concurrent: true
+{{ else }}
+tcp-concurrent: false
+{{ end }}
+
+# The system context can select platform-specific configuration.
+# System 上下文可以选择平台相关的配置。
+{{ if eq .System.OS "linux" }}
+tun:
+  enable: false
+  auto-route: true
+{{ else }}
+tun:
+  enable: false
+{{ end }}
+
+# Profile settings follow the regular mihomo configuration schema.
+# Profile 配置遵循 mihomo 原有配置结构。
 profile:
   store-selected: true
   store-fake-ip: true
 
+# DNS values can also be selected conditionally.
+# DNS 配置也可以根据条件选择。
 dns:
   enable: true
   listen: 0.0.0.0:1053
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 223.5.5.5
+    - 8.8.8.8
   nameserver:
     - 223.5.5.5
     - 119.29.29.29
 
-# Generate several providers from one tuple. Keep the newline after the YAML
-# key before the range block; whitespace trimming can remove it and produce
-# invalid YAML.
+# A tuple creates an ordered list for range.
+# tuple 创建一个可以被 range 遍历的有序列表。
+# Keep a real newline after a YAML mapping key.
+# YAML 映射键后必须保留真实换行。
 rule-providers:
 {{ range $ruleSets }}
   {{ . }}:
@@ -76,18 +117,16 @@ rule-providers:
     interval: 86400
 {{ end }}
 
+# The same list can generate routing rules.
+# 同一个列表可以生成路由规则。
 rules:
 {{ range $ruleSets }}
   - RULE-SET,{{ . }},节点选择
 {{ end }}
   - MATCH,节点选择
 
-# A conditional section. MIHOMO_DEBUG must be set to "true" or "false" for
-# this example because env is intentionally strict for missing variables.
-{{ if eq (env "MIHOMO_DEBUG") "true" }}
-tcp-concurrent: true
-{{ end }}
-
+# Use quote for values that may contain YAML punctuation.
+# 对可能含有 YAML 标点的值使用 quote。
 proxies:
   - name: "主代理"
     type: socks5
@@ -95,6 +134,8 @@ proxies:
     port: {{ env "MIHOMO_PROXY_PORT" }}
     password: {{ env "MIHOMO_PROXY_PASSWORD" | quote }}
 
+# A generated proxy group is ordinary mihomo YAML after rendering.
+# 生成后的代理组仍然是普通 mihomo YAML。
 proxy-groups:
   - name: 节点选择
     type: select
@@ -102,17 +143,141 @@ proxy-groups:
       - 主代理
       - DIRECT
 
-# The following comments describe commonly useful Sprig forms without placing
-# executable template actions in YAML comments:
-#
-# default "DIRECT" ""
-# upper "linux"
-# quote (env "MIHOMO_PROXY_PASSWORD")
-# printf "%s-%s" .System.OS .System.Arch
-# expandenv "$HOME/.config/mihomo"
-# if eq .System.OS "linux" ... end
-# range tuple "one" "two" ... end
+# String helpers can be chained with the pipeline operator.
+# 字符串函数可以使用管道操作符串联调用。
+# The following field uses the current system values in a real config field.
+# 下面的字段把当前系统值用于真实配置字段。
+external-controller: 127.0.0.1:9093
+external-controller-cors:
+  allow-origins:
+    - "*"
+  allow-private-network: true
 
-# Example of a system-aware value in a valid configuration field:
-# external-ui-name can include the system OS and architecture through the
-# normal field expression syntax.
+# printf formats values without invoking a shell.
+# printf 只格式化值，不会调用 shell。
+# quote returns a YAML-safe quoted string for normal scalar output.
+# quote 为普通标量输出返回带 YAML 引号的字符串。
+external-controller-unix: {{ printf "./run/%s-%s.sock" .System.OS .System.Arch | quote }}
+
+# Sprig list functions can transform a list before range.
+# Sprig 列表函数可以在 range 前处理列表。
+{{- $extraRules := list "private" "lan" -}}
+{{- $allRules := concat $ruleSets $extraRules -}}
+
+# List transformations are shown in a commented explanation.
+# 列表转换在下面以说明形式展示。
+# first $allRules
+# first $allRules
+# last $allRules
+# last $allRules
+# uniq $allRules
+# uniq $allRules
+# reverse $allRules
+# reverse $allRules
+
+# A conditional generated section can be omitted completely.
+# 条件生成的区块可以完全省略。
+{{ if hasKey (dict "enabled" true) "enabled" }}
+sniffer:
+  enable: false
+  override-destination: true
+{{ end }}
+
+# Dictionary helpers are useful for assembling temporary template data.
+# 字典函数适合组装临时模板数据。
+{{- $labels := dict "platform" .System.OS "arch" .System.Arch -}}
+# The values below are examples of dictionary access syntax.
+# 下面是字典访问语法示例。
+# get $labels "platform"
+# hasKey $labels "arch"
+# keys $labels
+
+# Numeric and boolean output should normally remain unquoted.
+# 数字和布尔值输出通常不应加引号。
+# The mixed-port field above is a numeric example.
+# 上面的 mixed-port 字段是数字输出示例。
+# A boolean example can be written as ipv6: followed by an eq result.
+# 布尔值示例可以写成 ipv6: 后跟 eq 比较结果。
+
+# String-looking booleans must be quoted if they must remain strings.
+# 如果字符串形式的布尔值必须保持字符串，应加引号。
+# Example form: string-value uses the quote function with the text true.
+# 示例形式：string-value 使用 quote 函数输出文本 true。
+
+# YAML-sensitive string examples should be quoted.
+# 对 YAML 敏感的字符串示例应加引号。
+# Quote values containing colon, hash, brackets, or newlines.
+# 包含冒号、井号、方括号或换行的值应使用 quote。
+
+# Execute one program directly with parsed arguments.
+# 直接执行一个程序，并解析其参数。
+# The command is not passed through a shell in this form.
+# 这种形式不会经过 shell。
+# Example form: command-value uses cmd with printf and then quote.
+# 示例形式：command-value 使用 cmd 执行 printf 后再使用 quote。
+
+# A normal command can contain several arguments.
+# 普通命令可以包含多个参数。
+# Example form: command-value uses cmd with a program and multiple arguments.
+# 示例形式：command-value 使用 cmd 执行带多个参数的程序。
+
+# Single or double quotes preserve spaces inside one argument.
+# 单引号或双引号可以保留单个参数中的空格。
+# Example form: quote the executable path when its path contains spaces.
+# 示例形式：可执行文件路径包含空格时使用引号包裹路径。
+
+# Use cmd results in if for host or tool detection.
+# 可以在 if 中使用 cmd 结果检测主机或工具。
+# Example form: use if, eq, cmd, and trim to detect a Linux host.
+# 示例形式：使用 if、eq、cmd 和 trim 检测 Linux 主机。
+
+# An unquoted pipe activates the platform shell.
+# 未被引号包裹的管道符会启用当前平台 shell。
+# Example form: use cmd with a parenthesized pipeline and then trim and quote.
+# 示例形式：使用 cmd 执行带括号的管道，再使用 trim 和 quote。
+
+# Linux and macOS use /bin/sh for pipeline commands.
+# Linux 和 macOS 的管道命令使用 /bin/sh。
+# Windows uses cmd.exe for pipeline commands.
+# Windows 的管道命令使用 cmd.exe。
+
+# Commands run again when the main config is reloaded.
+# 主配置热重载时命令会再次执行。
+# File SIGHUP rereads the file before rendering it again.
+# 文件模式的 SIGHUP 会重新读取文件后再次渲染。
+# Stdin and base64 sources rerender their retained source bytes.
+# stdin 和 base64 来源会重新渲染启动时保留的源字节。
+
+# A command failure stops template execution before YAML decoding.
+# 命令失败会在 YAML 解码前终止模板执行。
+# A command timeout is reported after thirty seconds.
+# 命令超过三十秒会返回超时错误。
+# Command stdout is limited to the template output limit.
+# 命令标准输出受模板输出上限限制。
+
+# The template command never applies this configuration to mihomo.
+# template 子命令不会把配置应用到 mihomo 运行时。
+# It only decrypts, renders, and writes the resulting YAML bytes.
+# 它只负责解密、渲染并写出最终 YAML 字节。
+
+# Whitespace trimming must be used carefully around YAML structure.
+# YAML 结构周围必须谨慎使用空白裁剪。
+# A left trim marker removes whitespace before a template action.
+# 左侧裁剪标记会删除模板动作之前的空白。
+# A right trim marker removes whitespace after a template action.
+# 右侧裁剪标记会删除模板动作之后的空白。
+# Do not trim the newline immediately after a mapping key.
+# 不要删除映射键后面的换行。
+
+# Providers themselves are not rendered by the main-config template stage.
+# provider 文件本身不会经过主配置模板阶段渲染。
+# Only the main configuration containing these provider definitions is rendered.
+# 只有包含 provider 定义的主配置会被渲染。
+
+# Complete Sprig support also includes date, random, path, encoding, and crypto helpers.
+# 完整 Sprig 还包括日期、随机数、路径、编码和加密函数。
+# Such functions can make reload results depend on host state or current time.
+# 这些函数可能使热重载结果依赖主机状态或当前时间。
+
+# Use the template subcommand to inspect the exact generated YAML.
+# 使用 template 子命令可以查看准确生成的 YAML。
