@@ -66,7 +66,7 @@ tls:
 
 external-controller: 0.0.0.0:9093 # RESTful API 监听地址
 external-controller-tls: 0.0.0.0:9443 # RESTful API HTTPS 监听地址，需要配置 tls 部分配置文件
-# secret: "123456" # `Authorization:Bearer ${secret}`
+# secret: "123456" # use `Authorization: Bearer <secret>` when enabled
 
 # RESTful API CORS标头配置
 external-controller-cors:

@@ -1,0 +1,118 @@
+# mihomo main configuration template example
+#
+# Start, validate, or render this file with:
+#   mihomo -f ./template_config.yaml
+#   mihomo -t -f ./template_config.yaml
+#   mihomo template -o ./rendered.yaml ./template_config.yaml
+#
+# The template is rendered before the normal YAML parser runs. The rendered
+# output must still be valid mihomo YAML.
+#
+# Required environment variables used by this example:
+#   MIHOMO_MIXED_PORT
+#   MIHOMO_API_SECRET
+#   MIHOMO_PROXY_SERVER
+#   MIHOMO_PROXY_PORT
+#   MIHOMO_PROXY_PASSWORD
+#   MIHOMO_LOG_LEVEL
+#   MIHOMO_DEBUG (set to true or false)
+
+{{- $baseURL := "https://testing.com/rules" -}}
+{{- $ruleSets := tuple "google" "youtube" "telegram" "github" "openai" -}}
+
+# .System exposes values from the running mihomo process.
+# Available fields in this example:
+#   .System.OS
+#   .System.Arch
+#   .System.Version
+#
+# Do not put these explanatory fields into the configuration itself. Use them
+# in a real mihomo field, for example:
+external-controller: 127.0.0.1:9093
+external-controller-cors:
+  allow-origins:
+    - "*"
+  allow-private-network: true
+
+mixed-port: {{ env "MIHOMO_MIXED_PORT" }}
+allow-lan: true
+bind-address: "*"
+ipv6: true
+mode: rule
+find-process-mode: strict
+
+# env and expandenv fail when a referenced variable is not set. An explicitly
+# set empty value remains empty. Quote string-valued results when needed.
+secret: {{ env "MIHOMO_API_SECRET" | quote }}
+
+# text/template conditionals and Sprig string helpers can be combined.
+# Set MIHOMO_LOG_LEVEL before using this example.
+log-level: {{ env "MIHOMO_LOG_LEVEL" | lower | trim | quote }}
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+# Generate several providers from one tuple. Keep the newline after the YAML
+# key before the range block; whitespace trimming can remove it and produce
+# invalid YAML.
+rule-providers:
+{{ range $ruleSets }}
+  {{ . }}:
+    type: http
+    behavior: domain
+    format: yaml
+    url: {{ printf "%s/%s.yaml" $baseURL . | quote }}
+    path: "./rules/{{ . }}.yaml"
+    interval: 86400
+{{ end }}
+
+rules:
+{{ range $ruleSets }}
+  - RULE-SET,{{ . }},节点选择
+{{ end }}
+  - MATCH,节点选择
+
+# A conditional section. MIHOMO_DEBUG must be set to "true" or "false" for
+# this example because env is intentionally strict for missing variables.
+{{ if eq (env "MIHOMO_DEBUG") "true" }}
+tcp-concurrent: true
+{{ end }}
+
+proxies:
+  - name: "主代理"
+    type: socks5
+    server: {{ env "MIHOMO_PROXY_SERVER" | quote }}
+    port: {{ env "MIHOMO_PROXY_PORT" }}
+    password: {{ env "MIHOMO_PROXY_PASSWORD" | quote }}
+
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - 主代理
+      - DIRECT
+
+# The following comments describe commonly useful Sprig forms without placing
+# executable template actions in YAML comments:
+#
+# default "DIRECT" ""
+# upper "linux"
+# quote (env "MIHOMO_PROXY_PASSWORD")
+# printf "%s-%s" .System.OS .System.Arch
+# expandenv "$HOME/.config/mihomo"
+# if eq .System.OS "linux" ... end
+# range tuple "one" "two" ... end
+
+# Example of a system-aware value in a valid configuration field:
+# external-ui-name can include the system OS and architecture through the
+# normal field expression syntax.

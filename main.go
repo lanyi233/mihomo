@@ -98,6 +98,14 @@ func main() {
 
 	_, _ = maxprocs.Set(maxprocs.Logger(func(string, ...any) {}))
 
+	if ageSecretKey != "" {
+		if err := age.VeritySecretKeys(ageSecretKey); err != nil {
+			log.Errorln("Parse age-secret-key error: %s", err.Error())
+		} else {
+			age.SetGlobalSecretKeys(ageSecretKey)
+		}
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "convert-ruleset" {
 		provider.ConvertMain(os.Args[2:])
 		return
@@ -111,6 +119,10 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "age" {
 		age.Main(os.Args[2:])
 		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "template" {
+		os.Exit(templateMain(os.Args[2:]))
 	}
 
 	if version {
@@ -133,13 +145,6 @@ func main() {
 
 	if geodataMode {
 		geodata.SetGeodataMode(true)
-	}
-
-	if ageSecretKey != "" {
-		if err := age.VeritySecretKeys(ageSecretKey); err != nil {
-			log.Errorln("Parse age-secret-key error: %s", err.Error())
-		}
-		age.SetGlobalSecretKeys(ageSecretKey)
 	}
 
 	if configString != "" {
