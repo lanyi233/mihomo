@@ -1,3 +1,6 @@
+// LICENSE: GPL 3.0
+// Co: [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
 package main
 
 import (
