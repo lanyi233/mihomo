@@ -1,6 +1,6 @@
 <h1 align="center">
   <img src="Meta.png" alt="Meta Kernel" width="200">
-  <br>mihomo · smart + eBPF + Tailscale<br>
+  <br>mihomo · smart + eBPF + Tailscale + <a href="docs/template_config.yaml">Template Config</a><br>
 </h1>
 
 <p align="center">
