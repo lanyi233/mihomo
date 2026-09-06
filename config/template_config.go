@@ -13,7 +13,6 @@ import (
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/metacubex/mihomo/component/age"
-	C "github.com/metacubex/mihomo/constant"
 )
 
 const maxTemplateOutput = 8 << 20
@@ -27,16 +26,14 @@ type TemplateData struct {
 }
 
 type SystemTemplateData struct {
-	OS      string
-	Arch    string
-	Version string
+	OS   string
+	Arch string
 }
 
 func newTemplateData() TemplateData {
 	return TemplateData{System: SystemTemplateData{
-		OS:      runtime.GOOS,
-		Arch:    runtime.GOARCH,
-		Version: C.Version,
+		OS:   runtime.GOOS,
+		Arch: runtime.GOARCH,
 	}}
 }
 

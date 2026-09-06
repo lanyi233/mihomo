@@ -97,7 +97,7 @@ func TestRenderTemplateBytes(t *testing.T) {
 }
 
 func TestTemplateSystemData(t *testing.T) {
-	buf, err := renderTemplate([]byte(`{{ .System.OS }} {{ .System.Arch }} {{ .System.Version }}`))
+	buf, err := renderTemplate([]byte(`{{ .System.OS }} {{ .System.Arch }}`))
 	require.NoError(t, err)
 	require.Contains(t, string(buf), runtime.GOOS)
 	require.Contains(t, string(buf), runtime.GOARCH)

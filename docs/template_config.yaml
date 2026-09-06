@@ -38,8 +38,6 @@
 # .System.OS 是操作系统名称，例如 linux。
 # .System.Arch is the CPU architecture, such as amd64.
 # .System.Arch 是 CPU 架构名称，例如 amd64。
-# .System.Version is the compiled mihomo version.
-# .System.Version 是编译时写入的 mihomo 版本。
 
 # Environment values should be quoted when they are strings.
 # 环境变量作为字符串使用时应进行 YAML 引号转义。
