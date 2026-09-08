@@ -55,6 +55,12 @@ func applyLegacyOptions(options LC.EBPF) (LC.EBPF, []string, error) {
 		// New reports the mode error itself; there is nothing to fold.
 		return options, nil, nil
 	}
+	// Discard inactive shared settings before legacy conversion and validation.
+	// Configuration generators may populate this block in local-only mode.
+	// Keep Enabled because it participates in mode selection on the next pass.
+	if !sharedEnabled {
+		options.Shared = LC.EBPFShared{Enabled: options.Shared.Enabled}
+	}
 	if options.DNSMode != "" {
 		if localEnabled && options.Local.DNSMode == "" {
 			options.Local.DNSMode = options.DNSMode

@@ -3,6 +3,7 @@
 package sing_ebpf
 
 import (
+	"reflect"
 	"testing"
 
 	LC "github.com/metacubex/mihomo/listener/config"
@@ -61,10 +62,62 @@ func TestValidateSharedDisabledNoConfig(t *testing.T) {
 	}
 }
 
-func TestValidateSharedDisabledWithIPv6(t *testing.T) {
-	// mode=local but shared.ipv6 set -> error (matches upstream intent)
-	shared := LC.EBPFShared{IPv6: boolPtr(true)}
-	if err := validateSharedOptions(false, shared); err == nil {
-		t.Fatal("shared.ipv6 with shared disabled should error")
+// Box may inject shared options even when only local interception is selected.
+func TestLocalIgnoresSharedOptions(t *testing.T) {
+	for _, mode := range []string{"local", "", "enabled"} {
+		t.Run(mode, func(t *testing.T) {
+			options := LC.EBPF{Mode: mode, Shared: LC.EBPFShared{
+				IPv6: boolPtr(true), DNSMode: "invalid", Interface: []string{"lo"},
+				DataPlane: "invalid", IPv6Mode: "invalid", StateCapacity: maximumStateCapacity + 1,
+				BypassPortRange: []string{"invalid"}, IncludeMACAddress: []string{"invalid"},
+				Advanced: LC.EBPFSharedAdvanced{TCPriority: 99, DataPlane: "invalid"},
+			}}
+			if mode == "enabled" {
+				options.Mode = ""
+				options.Local.Enabled = boolPtr(true)
+				options.Shared.Enabled = boolPtr(false)
+			}
+			normalized, notes, err := applyLegacyOptions(options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(normalized.Shared, LC.EBPFShared{Enabled: options.Shared.Enabled}) {
+				t.Fatalf("disabled shared options retained: %+v", normalized.Shared)
+			}
+			if normalized.TCPriority != 0 || len(notes) != 0 {
+				t.Fatalf("disabled shared options affected legacy conversion: %+v %v", normalized, notes)
+			}
+			selection, err := normalizeDataPlanes(normalized)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !selection.localEnabled || selection.sharedEnabled {
+				t.Fatalf("unexpected selection: %+v", selection)
+			}
+			if err := validateSharedOptions(false, normalized.Shared); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestActiveSharedOptionsRemainValidated(t *testing.T) {
+	for _, mode := range []string{"shared", "hybrid"} {
+		t.Run(mode, func(t *testing.T) {
+			options, _, err := applyLegacyOptions(LC.EBPF{Mode: mode, Shared: LC.EBPFShared{IPv6: boolPtr(true)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if options.Shared.IPv6 == nil {
+				t.Fatal("active shared options were discarded")
+			}
+			if _, err := normalizeSharedOptions(options.Shared); err == nil {
+				t.Fatal("missing shared.interface accepted")
+			}
+			options.Shared.IPv6Mode = "invalid"
+			if _, _, err := applyLegacyOptions(options); err == nil {
+				t.Fatal("invalid active shared legacy option accepted")
+			}
+		})
 	}
 }

@@ -126,7 +126,8 @@ Field behavior:
 - `mode`: `local` intercepts sockets created on this host, `shared` intercepts
   traffic forwarded from the `shared.interface` list, `hybrid` runs both. The
   explicit `local.enabled` / `shared.enabled` booleans are accepted instead of
-  `mode`, not together with it.
+  `mode`, not together with it. When shared interception is disabled (including
+  `mode: local`), shared settings other than the enablement selector are ignored.
 - `network`: `tcp`, `udp`, or both. Defaults to both when omitted.
 - `udp-timeout`: UDP session timeout in seconds. Defaults to 300, floor 5.
 - `tc-priority`: priority of the TC filters. With the default `1` the inbound
