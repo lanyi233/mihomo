@@ -7,8 +7,74 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/component/power"
 	"github.com/metacubex/mihomo/component/smart"
 )
+
+func TestSmartTaskReadinessStopsPollingWhilePaused(t *testing.T) {
+	power.SetDevicePaused(true)
+	defer power.SetDevicePaused(false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var checks atomic.Int32
+	var ready atomic.Bool
+	done := make(chan struct{})
+	ran := make(chan struct{}, 1)
+	go func() {
+		defer close(done)
+		runSmartTaskSchedule(ctx, []smartScheduledTask{{runOnce: true, run: func() { ran <- struct{}{} }}}, func() bool { checks.Add(1); return ready.Load() }, time.Millisecond, func() time.Duration { return 0 })
+	}()
+	time.Sleep(30 * time.Millisecond)
+	if n := checks.Load(); n > 1 {
+		t.Fatalf("readiness polled %d times while paused", n)
+	}
+	ready.Store(true)
+	power.SetDevicePaused(false)
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("readiness did not resume")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not exit")
+	}
+}
+
+func TestSmartTaskSchedulePausesBackgroundWork(t *testing.T) {
+	power.SetDevicePaused(true)
+	defer power.SetDevicePaused(false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runs := make(chan struct{}, 10)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runSmartTaskSchedule(ctx, []smartScheduledTask{{
+			initialDelay: time.Millisecond, interval: 5 * time.Millisecond,
+			run: func() { runs <- struct{}{} },
+		}}, func() bool { return true }, time.Millisecond, func() time.Duration { return 0 })
+	}()
+	select {
+	case <-runs:
+		t.Fatal("maintenance ran while device paused")
+	case <-time.After(20 * time.Millisecond):
+	}
+	power.SetDevicePaused(false)
+	select {
+	case <-runs:
+	case <-time.After(time.Second):
+		t.Fatal("maintenance did not resume")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop")
+	}
+}
 
 func TestSmartTaskSchedulePreventsOverlap(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

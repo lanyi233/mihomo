@@ -107,7 +107,7 @@ func (bp *baseProvider) setProxies(proxies []C.Proxy) {
 	bp.version += 1
 	bp.healthCheck.setProxies(proxies)
 	if bp.healthCheck.auto() {
-		go bp.healthCheck.check()
+		bp.healthCheck.scheduleCheck()
 	}
 }
 

@@ -4,6 +4,7 @@ package power
 
 import (
 	"runtime"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -60,13 +61,14 @@ func NewEventListener(cb func(Type)) (func(), error) {
 	//  [in]  HANDLE        Recipient,
 	//  [out] PHPOWERNOTIFY RegistrationHandle
 	//);
-	_, _, err := powerRegisterSuspendResumeNotification.Call(
+	status, _, _ := powerRegisterSuspendResumeNotification.Call(
 		_DEVICE_NOTIFY_CALLBACK,
 		uintptr(unsafe.Pointer(&params)),
 		uintptr(unsafe.Pointer(&handle)),
 	)
-	if err != nil {
-		return nil, err
+	// This API returns a Win32 status directly; GetLastError is not its result.
+	if status != 0 {
+		return nil, syscall.Errno(status)
 	}
 
 	return func() {

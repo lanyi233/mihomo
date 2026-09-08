@@ -11,6 +11,8 @@ import (
 
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/component/power"
+	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/listener/sing_tun"
 	"github.com/metacubex/mihomo/log"
 	"github.com/sagernet/netlink"
@@ -30,8 +32,10 @@ type tcInterfaceMonitor struct {
 	defaultInterfaceOwned    bool
 	defaultInterfaceCallback *list.Element[tun.DefaultInterfaceUpdateCallback]
 	defaultInterfaceName     string
+	backgroundNetwork        *power.NetworkSource
 	cancel                   context.CancelFunc
 	updates                  chan struct{}
+	done                     chan struct{}
 }
 
 func (i *Inbound) InterfaceUpdated() {
@@ -57,9 +61,14 @@ func (i *Inbound) startTCInterfaceMonitor() error {
 		}
 		return E.Cause(err, "create TC eBPF default interface monitor")
 	}
-	defaultInterfaceOwned := true
+	return i.startTCInterfaceMonitors(networkMonitor, defaultInterfaceMonitor)
+}
+
+func (i *Inbound) startTCInterfaceMonitors(networkMonitor tun.NetworkUpdateMonitor, defaultInterfaceMonitor tun.DefaultInterfaceMonitor) error {
+	networkOwned, defaultInterfaceOwned := true, true
 	monitorContext, cancel := context.WithCancel(context.Background())
 	updates := make(chan struct{}, 1)
+	done := make(chan struct{})
 	state := &i.interfaceMonitor
 	state.access.Lock()
 	if state.network != nil {
@@ -79,11 +88,16 @@ func (i *Inbound) startTCInterfaceMonitor() error {
 	state.defaultInterfaceOwned = defaultInterfaceOwned
 	state.cancel = cancel
 	state.updates = updates
+	state.done = done
+	state.backgroundNetwork = power.NewNetworkSource()
 	state.networkCallback = networkMonitor.RegisterCallback(i.notifyTCInterfaceUpdate)
 	state.defaultInterfaceCallback = defaultInterfaceMonitor.RegisterCallback(i.defaultInterfaceUpdated)
 	state.defaultInterfaceName = interfaceName(defaultInterfaceMonitor.DefaultInterface())
 	state.access.Unlock()
-	go i.runTCInterfaceUpdates(monitorContext, updates)
+	go func() {
+		defer close(done)
+		i.runTCInterfaceUpdates(monitorContext, updates)
+	}()
 	if networkOwned {
 		if err := networkMonitor.Start(); err != nil {
 			return E.Errors(E.Cause(err, "start TC eBPF network monitor"), i.stopTCInterfaceMonitor())
@@ -94,7 +108,7 @@ func (i *Inbound) startTCInterfaceMonitor() error {
 			return E.Errors(E.Cause(err, "start TC eBPF default interface monitor"), i.stopTCInterfaceMonitor())
 		}
 	}
-	i.notifyTCInterfaceUpdate()
+	i.setDefaultInterfaceName(i.currentDefaultInterfaceName())
 	return nil
 }
 
@@ -108,6 +122,9 @@ func (i *Inbound) stopTCInterfaceMonitor() error {
 	defaultInterfaceOwned := state.defaultInterfaceOwned
 	defaultInterfaceCallback := state.defaultInterfaceCallback
 	cancel := state.cancel
+	done := state.done
+	_ = state.backgroundNetwork.Close()
+	state.backgroundNetwork = nil
 	state.network = nil
 	state.networkOwned = false
 	state.networkCallback = nil
@@ -117,6 +134,7 @@ func (i *Inbound) stopTCInterfaceMonitor() error {
 	state.defaultInterfaceName = ""
 	state.cancel = nil
 	state.updates = nil
+	state.done = nil
 	state.access.Unlock()
 	if networkMonitor == nil {
 		return nil
@@ -129,6 +147,9 @@ func (i *Inbound) stopTCInterfaceMonitor() error {
 	}
 	if cancel != nil {
 		cancel()
+	}
+	if done != nil {
+		<-done
 	}
 	var closeErr error
 	if defaultInterfaceOwned {
@@ -165,11 +186,17 @@ func (i *Inbound) currentDefaultInterfaceName() string {
 func (i *Inbound) setDefaultInterfaceName(interfaceName string) {
 	state := &i.interfaceMonitor
 	state.access.Lock()
+	changed := state.defaultInterfaceName != interfaceName
 	state.defaultInterfaceName = interfaceName
+	state.backgroundNetwork.SetAvailable(interfaceName != "")
 	updates := state.updates
 	active := state.network != nil && updates != nil
 	state.access.Unlock()
 	if active {
+		if changed {
+			iface.FlushCache()
+			resolver.ResetConnection()
+		}
 		notifyTCInterfaceUpdate(updates)
 	}
 }

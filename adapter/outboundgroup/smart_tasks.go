@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/power"
 	"github.com/metacubex/mihomo/component/smart"
 	"github.com/metacubex/mihomo/component/smart/lightgbm"
 	"github.com/metacubex/mihomo/log"
@@ -50,7 +51,19 @@ func runSmartTaskSchedule(
 	readyTimer := time.NewTimer(readyPoll)
 	defer readyTimer.Stop()
 	for !isRunning() {
+		paused, changed := power.BackgroundState()
+		if paused {
+			readyTimer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-changed:
+				readyTimer.Reset(readyPoll)
+			}
+			continue
+		}
 		select {
+		case <-changed:
 		case <-ctx.Done():
 			return
 		case <-readyTimer.C:
@@ -86,7 +99,35 @@ func runSmartTaskSchedule(
 		taskWG.Wait()
 	}()
 
+	wasPaused := false
 	for {
+		paused, changed := power.BackgroundState()
+		if paused {
+			wasPaused = true
+			timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case idx := <-done:
+				states[idx].running = false
+			case <-changed:
+			}
+			continue
+		}
+		if wasPaused {
+			now = time.Now()
+			for idx := range states {
+				state := &states[idx]
+				if !state.finished && !state.next.After(now) {
+					delay := state.period
+					if state.runOnce {
+						delay = max(state.initialDelay, time.Millisecond)
+					}
+					state.next = now.Add(delay + spread)
+				}
+			}
+			wasPaused = false
+		}
 		var earliest time.Time
 		unfinished := 0
 		for i := range states {
@@ -117,11 +158,16 @@ func runSmartTaskSchedule(
 		select {
 		case <-ctx.Done():
 			return
+		case <-changed:
+			continue
 		case idx := <-done:
 			states[idx].running = false
 		case now = <-timer.C:
 			if ctx.Err() != nil {
 				return
+			}
+			if paused, _ := power.BackgroundState(); paused {
+				continue
 			}
 			for i := range states {
 				state := &states[i]

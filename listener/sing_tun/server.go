@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/component/power"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -51,6 +52,7 @@ type Listener struct {
 
 	networkUpdateMonitor    tun.NetworkUpdateMonitor
 	defaultInterfaceMonitor tun.DefaultInterfaceMonitor
+	backgroundNetwork       *power.NetworkSource
 	packageManager          tun.PackageManager
 	autoRedirect            tun.AutoRedirect
 	autoRedirectOutputMark  int32
@@ -362,7 +364,10 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			return
 		}
 		l.defaultInterfaceMonitor = defaultInterfaceMonitor
+		backgroundNetwork := power.NewNetworkSource()
+		l.backgroundNetwork = backgroundNetwork
 		defaultInterfaceMonitor.RegisterCallback(func(defaultInterface *control.Interface, event int) {
+			backgroundNetwork.SetAvailable(defaultInterface != nil)
 			if defaultInterface != nil {
 				log.Warnln("[TUN] default interface changed by monitor, => %s", defaultInterface.Name)
 			} else {
@@ -376,6 +381,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			err = E.Cause(err, "start DefaultInterfaceMonitor")
 			return
 		}
+		l.backgroundNetwork.SetAvailable(defaultInterfaceMonitor.DefaultInterface() != nil)
 
 		if options.AutoDetectInterface {
 			l.cDialerInterfaceFinder = &cDialerInterfaceFinder{
@@ -674,6 +680,7 @@ func parseRange[T constraints.Integer](uidRanges []ranges.Range[T], rangeList []
 
 func (l *Listener) Close() error {
 	l.closed = true
+	_ = l.backgroundNetwork.Close()
 	clearTunRouteClaim()
 	resolver.RemoveSystemDnsBlacklist(l.dnsServerIp...)
 	if l.autoRedirectOutputMark != 0 {

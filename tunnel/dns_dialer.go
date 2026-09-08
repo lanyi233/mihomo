@@ -126,7 +126,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 
 		packetConn = statistic.NewUDPTracker(packetConn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
-		return N.NewBindPacketConn(packetConn, metadata.UDPAddr()), nil
+		return N.NewDNSBindPacketConn(packetConn, metadata.UDPAddr()), nil
 	}
 
 }
