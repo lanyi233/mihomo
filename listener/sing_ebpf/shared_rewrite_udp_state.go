@@ -22,11 +22,13 @@ type sharedUDPClientTable struct {
 const sharedUDPClientShardCount = 16
 
 type sharedUDPClientShard struct {
+	sweep   udpSweepQueue
 	access  sync.RWMutex
 	clients map[netip.AddrPort]*sharedUDPClientState
 }
 
 type sharedUDPClientState struct {
+	sweep                udpSweepEntry
 	activity             udpActivity
 	access               sync.RWMutex
 	connectedBinding     atomic.Pointer[sharedUDPRedirectBinding]
@@ -104,6 +106,7 @@ func (s *sharedUDPClientShard) loadOrCreateLocked(client netip.AddrPort) *shared
 	}
 	clientState.activity.touch()
 	s.clients[client] = clientState
+	s.sweep.add(&clientState.sweep, client)
 	return clientState
 }
 
@@ -374,6 +377,7 @@ func (t *sharedUDPClientTable) deleteClient(client netip.AddrPort, expectedState
 		return nil
 	}
 	delete(shard.clients, client)
+	shard.sweep.remove(&expectedState.sweep)
 
 	expectedState.access.Lock()
 	defer expectedState.access.Unlock()

@@ -1555,25 +1555,29 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 				})
 			}
 		}
+
+		retryHosts := make(map[string]string)
+		codeSet, ok := cacheHS.Codes[2]
+		if ok && codeSet != nil && codeSet.NodeHosts != nil {
+			for nodeName, nodeEntry := range codeSet.Nodes {
+				if nodeEntry == 0 || nodeEntry-now > int64((HostFailureNodeTTL-hostStatusRetryAfter).Seconds()) {
+					continue
+				}
+				if host := codeSet.NodeHosts[nodeName]; host != "" {
+					retryHosts[nodeName] = host
+				}
+			}
+		}
 		cacheHS.mu.Unlock()
 
-		codeSet, ok := cacheHS.Codes[2]
-		if !ok || codeSet == nil || codeSet.NodeHosts == nil {
+		if len(retryHosts) == 0 {
 			continue
 		}
-
-		for nodeName, nodeEntry := range codeSet.Nodes {
-			if nodeEntry == 0 || nodeEntry-now > int64((HostFailureNodeTTL-hostStatusRetryAfter).Seconds()) {
-				continue
-			}
-			h, ok2 := codeSet.NodeHosts[nodeName]
-			if !ok2 || h == "" {
-				continue
-			}
-			if _, ok := result[wildcardTarget]; !ok {
-				result[wildcardTarget] = make(map[string]string)
-			}
-			result[wildcardTarget][nodeName] = h
+		if _, ok := result[wildcardTarget]; !ok {
+			result[wildcardTarget] = make(map[string]string, len(retryHosts))
+		}
+		for nodeName, host := range retryHosts {
+			result[wildcardTarget][nodeName] = host
 		}
 	}
 

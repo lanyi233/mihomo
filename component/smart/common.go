@@ -3,6 +3,7 @@ package smart
 import (
 	"errors"
 	"math"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -380,6 +381,13 @@ func GetBatchSaveThreshold() int {
 
 // 获取系统内存使用情况
 func GetSystemMemoryUsage() float64 {
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		if usage, ok := readProcMemoryUsage(os.ReadFile); ok {
+			return usage
+		}
+		return 0.5
+	}
+
 	var total float64 = 0.0
 	var available float64 = 0.0
 	var output string
@@ -392,19 +400,6 @@ func GetSystemMemoryUsage() float64 {
 			lines := strings.Split(output, "\n")
 			if len(lines) >= 2 {
 				memStr := strings.TrimSpace(lines[1])
-				memKB, parseErr := strconv.ParseFloat(memStr, 64)
-				if parseErr == nil {
-					total = memKB / 1024.0
-				}
-			}
-		}
-	} else if runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" {
-		output, err = cmd.ExecCmd("grep MemTotal /proc/meminfo")
-		if err == nil {
-			parts := strings.Fields(output)
-			if len(parts) >= 2 {
-				memStr := strings.TrimSuffix(parts[1], "kB")
-				memStr = strings.TrimSpace(memStr)
 				memKB, parseErr := strconv.ParseFloat(memStr, 64)
 				if parseErr == nil {
 					total = memKB / 1024.0
@@ -426,26 +421,52 @@ func GetSystemMemoryUsage() float64 {
 				}
 			}
 		}
-	} else if runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" {
-		output, err = cmd.ExecCmd("grep MemAvailable /proc/meminfo")
-		if err == nil {
-			parts := strings.Fields(output)
-			if len(parts) >= 2 {
-				memStr := strings.TrimSuffix(parts[1], "kB")
-				memStr = strings.TrimSpace(memStr)
-				memKB, parseErr := strconv.ParseFloat(memStr, 64)
-				if parseErr == nil {
-					available = memKB / 1024.0
-				}
-			}
-		}
 	}
 
 	if total > 0 {
 		used := total - available
-		return math.Min(used/total, 1.0)
+		return math.Max(0, math.Min(used/total, 1.0))
 	}
 	return 0.5
+}
+
+func readProcMemoryUsage(readFile func(string) ([]byte, error)) (float64, bool) {
+	data, err := readFile("/proc/meminfo")
+	if err != nil {
+		return 0, false
+	}
+
+	var totalKB, availableKB uint64
+	var foundTotal, foundAvailable bool
+	for _, line := range strings.Split(string(data), "\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok || (name != "MemTotal" && name != "MemAvailable") {
+			continue
+		}
+		fields := strings.Fields(value)
+		if len(fields) == 0 {
+			continue
+		}
+		memoryKB, parseErr := strconv.ParseUint(fields[0], 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		if name == "MemTotal" {
+			totalKB = memoryKB
+			foundTotal = true
+		} else {
+			availableKB = memoryKB
+			foundAvailable = true
+		}
+	}
+
+	if !foundTotal || !foundAvailable || totalKB == 0 {
+		return 0, false
+	}
+	if availableKB >= totalKB {
+		return 0, true
+	}
+	return float64(totalKB-availableKB) / float64(totalKB), true
 }
 
 func InitQueue()  {

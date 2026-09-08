@@ -57,6 +57,15 @@ func (o *Observable[T]) UnSubscribe(sub Subscription[T]) {
 	subscriber.Close()
 }
 
+// HasSubscribers reports whether publishing an item can currently be observed.
+// It is intended for callers that can avoid expensive, optional event
+// construction when nobody is listening.
+func (o *Observable[T]) HasSubscribers() bool {
+	o.mux.Lock()
+	defer o.mux.Unlock()
+	return !o.done && len(o.listener) != 0
+}
+
 func NewObservable[T any](iter Iterable[T]) *Observable[T] {
 	observable := &Observable[T]{
 		iterable: iter,

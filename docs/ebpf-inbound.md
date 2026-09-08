@@ -59,16 +59,23 @@ it performs transient feature probes; without `bpftool` it reports
 
 ## Build
 
-The eBPF build requires a Linux build host (or Android NDK for Android) and
-clang for the BPF object:
+The repository ships the BPF objects. Building the core does not require
+clang, the NDK, or cgo:
 
 ```bash
-make ebpf_generate
-CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags "with_gvisor with_ebpf" -o mihomo-ebpf .
+CGO_ENABLED=0 go build -tags "with_gvisor with_ebpf" -o mihomo-ebpf .
+CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -tags "with_gvisor with_ebpf" -o mihomo-android-arm64 .
 ```
 
-Android ARM64 uses the NDK clang as `CC`; see
-`.github/workflows/androidarm64.yml` and `.github/workflows/build-ebpf.yml`.
+Only regenerating the BPF objects requires the pinned Android NDK r29
+Clang 21 toolchain:
+
+```bash
+make -C common/ebpf generate ANDROID_NDK_HOME=/path/to/android-ndk-r29
+make -C common/ebpf check ANDROID_NDK_HOME=/path/to/android-ndk-r29
+```
+
+See [validation results](ebpf-validation.md) for the tested kernels and limits.
 
 ## Configuration
 
@@ -133,7 +140,8 @@ Field behavior:
   cgroup and rewrites destinations to an internal redirect address on
   loopback. `tc` attaches an egress program to the default interface and
   delivers selected packets to the internal listeners over a veth pair with
-  `bpf_sk_assign`, which needs a newer kernel (5.6+) and policy routing.
+  `bpf_sk_assign` (introduced in upstream Linux 5.7) and policy routing.
+  Availability is checked at runtime.
 - `local.cgroup-path`: absolute cgroup v2 directory for the cgroup data plane.
   Empty means auto-detect.
 - `dns-mode` (per role): `hijack` intercepts every port-53 flow before any
@@ -153,7 +161,8 @@ Field behavior:
 - `shared.data-plane`: `packet_rewrite` rewrites the destination at ingress
   and restores it at egress and needs Ethernet framing; `socket_assign`
   preserves the original tuple and assigns packets to the listener with
-  `bpf_sk_assign` (5.6+) plus policy routing, and also works on raw-IP links.
+  `bpf_sk_assign` (upstream Linux 5.7+, subject to runtime helper support)
+  plus policy routing, and also works on raw-IP links.
 - `shared.interface`: downstream interfaces. An interface that is currently
   the default upstream is skipped until it returns to a downstream role.
 - `include-source-cidr`, `exclude-source-cidr`, `include-mac-address`,
@@ -166,8 +175,25 @@ to every enabled role that does not set its own; `local.ipv6-mode` and
 `shared.ipv6-mode` (`always`/`off`, and `auto` for local, which now means
 enabled) map to `ipv6`; `local.state-capacity` and `shared.state-capacity`
 size the kernel state maps; `shared.advanced.tc-priority` becomes
-`tc-priority`. `tcp-splice` and `shared.advanced.routing-mark` /
+`tc-priority`, and known `shared.advanced.data-plane` values map to
+`shared.data-plane`. `tcp-splice` and `shared.advanced.routing-mark` /
 `routing-table` no longer do anything and are reported once at startup.
+
+## Resource limits
+
+The recent performance changes add no required configuration keys. They reuse
+`udp-timeout` to expire idle UDP clients and transparent reply sockets. Each
+pass examines at most 1024 clients per table, releasing the ingress/reply
+lifecycle lock after batches of at most 32. A resumable cursor continues large
+rounds once per second, then returns to the normal idle-sweep interval. Active
+destination bindings are not hard-capped. Outstanding packets, DNS work and
+replies retain activity.
+
+TCP and UDP DNS relays share a fixed 256-task limit per inbound. Excess UDP
+queries are dropped; excess TCP connections are closed. Transparent UDP reply
+sockets have 16 shards with a limit of 64 live sockets each, including retired
+sockets still leased by writers. A full shard with every socket leased rejects
+the reply. These limits are internal constants, not YAML options.
 
 ## IPv4 and IPv6 behavior
 

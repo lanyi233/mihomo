@@ -75,6 +75,7 @@ func TestObservable_SubscribeClosedSource(t *testing.T) {
 	case <-time.After(time.Second):
 		assert.Fail(t, "timeout not stop")
 	}
+	assert.False(t, src.HasSubscribers())
 }
 
 func TestObservable_UnSubscribeWithNotExistSubscription(t *testing.T) {

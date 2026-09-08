@@ -28,7 +28,7 @@ Passed:
 
 Regression evidence: running the new tests against baseline objects reproduces both IPv4 UDP zero-checksum corruption (ingress and egress) and the local TC IPv6 verifier rejection. Both pass with the regenerated objects.
 
-Three unified TC socket-assignment integration tests explicitly skip after the helper probe reports that `bpf_sk_assign` is unavailable. This helper requires Linux 5.9 or a backport; the shared packet-rewrite tests do not depend on it. A passing local classifier load does not imply the full socket-assignment data plane can operate on this device.
+Three unified TC socket-assignment integration tests explicitly skip after the helper probe reports that `bpf_sk_assign` is unavailable. For TC programs this helper was introduced in [upstream Linux 5.7](https://github.com/torvalds/linux/blob/v5.7/include/uapi/linux/bpf.h) (or requires a backport); the shared packet-rewrite tests do not depend on it. A passing local classifier load does not imply the full socket-assignment data plane can operate on this device.
 
 These are kernel loading, attachment and packet tests, not a router throughput benchmark or a deployment to 192.168.0.1. No production interfaces/routes were reconfigured. Non-linear skb parsing behavior is unchanged: replacing a parse failure with unconditional bypass needs separate non-linear skb coverage and must not leak token-address traffic or evade policy.
 
@@ -95,3 +95,19 @@ The three userspace resource findings above are addressed in the next change:
 Tests cover 10,000-client churn, queued-packet and downstream activity retention, stale writer rejection, exactly-once Drop/release, DNS admission/cancellation/start-close races, idle TCP reader cancellation, socket capacity/idle eviction, leased writes during reset/close, and concurrent writes during sweeping. The listener suite also runs as a static arm64 test binary on the Android device.
 
 This improves resource bounds, not the theoretical throughput of the same short session. Host forwarding microbenchmarks remain at 2 allocations per packet; the socket cache hit/lease/release benchmark has zero allocations (about 76–82 ns on the test host). Actively used UDP bindings can still grow with the number of destinations in an active session; the janitor bounds idle retention rather than imposing a hard cap on valid active traffic.
+
+## Bounded UDP sweep follow-up
+
+The userspace client sweep now keeps an intrusive ring cursor in each shard.
+A pass examines at most 1024 clients per table, including active clients, and
+releases the ingress/reply lifecycle lock after each batch of at most 32.
+Large snapshots continue once per second; once covered, the janitor returns
+to its normal interval. This prevents an active prefix from starving later
+idle clients and avoids scanning an entire large table under one lock.
+
+Regression tests cover a long active prefix in a single shard, exact scan
+budgets, continuation completion, concurrent deletion/recreation, and full
+purge. The listener suite passed three repeated race runs on the host and
+three native arm64 runs on the Android 5.4 device. Forwarding still uses two
+allocations per packet; an active-client sweep allocates no heap memory. BPF
+source and objects are unchanged by this follow-up.

@@ -19,10 +19,10 @@ import (
 )
 
 const (
-	udpClientShardCount          = 16
-	udpReplyAliasLimit           = 64
-	udpReplySocketShardCapacity  = 64
-	udpReplySocketTotalCapacity  = udpClientShardCount * udpReplySocketShardCapacity
+	udpClientShardCount         = 16
+	udpReplyAliasLimit          = 64
+	udpReplySocketShardCapacity = 64
+	udpReplySocketTotalCapacity = udpClientShardCount * udpReplySocketShardCapacity
 )
 
 var errUDPReplySocketPoolBusy = errors.New("eBPF UDP reply socket pool has no idle slot")
@@ -32,11 +32,13 @@ type udpClientTable struct {
 }
 
 type udpClientShard struct {
+	sweep   udpSweepQueue
 	access  sync.RWMutex
 	clients map[netip.AddrPort]*udpClientState
 }
 
 type udpClientState struct {
+	sweep           udpSweepEntry
 	activity        udpActivity
 	access          sync.RWMutex
 	sourceMAC       net.HardwareAddr
@@ -85,6 +87,7 @@ func (t *udpClientTable) loadOrCreate(client netip.AddrPort) *udpClientState {
 	}
 	state.activity.touch()
 	shard.clients[client] = state
+	shard.sweep.add(&state.sweep, client)
 	return state
 }
 
@@ -192,6 +195,7 @@ func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState)
 		return nil
 	}
 	delete(shard.clients, client)
+	shard.sweep.remove(&expected.sweep)
 	expected.access.Lock()
 	redirects := make([]netip.Addr, 0, len(expected.cgroupOriginals))
 	for address := range expected.cgroupOriginals {

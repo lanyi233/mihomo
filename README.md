@@ -165,7 +165,7 @@ listeners:
     local:
       # 数据面，默认 cgroup
       #   cgroup = connect()/sendmsg() 时改写目的地址，5.4 内核就能跑
-      #   tc     = 默认网卡 egress 选包 + veth + bpf_sk_assign，需要 5.6+ 内核
+      #   tc     = 默认网卡 egress 选包 + veth + bpf_sk_assign，需要 5.7+ 内核及实际 helper 支持
       data-plane: cgroup
 
       # cgroup v2 挂载点，一般不用填，会自动找（只对 data-plane: cgroup 有意义）
@@ -204,7 +204,7 @@ listeners:
     shared:
       # 数据面，默认 packet_rewrite
       #   packet_rewrite = ingress 改写目的地址、egress 还原，要以太网帧，5.4 内核就能跑
-      #   socket_assign  = 保留原始五元组，bpf_sk_assign + 策略路由，需要 5.6+ 内核，
+      #   socket_assign  = 保留原始五元组，bpf_sk_assign + 策略路由，需要 5.7+ 内核及实际 helper 支持，
       #                    支持 rmnet / PPP 这类没有以太头的网卡
       data-plane: packet_rewrite
 
@@ -229,23 +229,23 @@ listeners:
       bypass-port-range: []
 ```
 
-**旧版参数照旧能用，不用改配置。** 顶层的 `dns-mode` / `bypass-private-address` 会套用到所有启用的角色上（角色自己写了的以自己的为准）；`local.ipv6-mode` / `shared.ipv6-mode`（`always` / `off`，local 的 `auto` 现在等于开，不再探测）映射成 `ipv6`；`local.state-capacity` / `shared.state-capacity` 仍然决定内核状态表容量（上限 1048576）；`shared.advanced.tc-priority` 等于顶层 `tc-priority`。`tcp-splice` 和 `shared.advanced.routing-mark` / `routing-table` 已经没有作用，启动时会提示一次。
+**最近的性能与资源回收优化没有新增必填配置，旧版参数仍可解析。** 顶层的 `dns-mode` / `bypass-private-address` 会套用到所有启用的角色上（角色自己写了的以自己的为准）；`local.ipv6-mode` / `shared.ipv6-mode`（`always` / `off`，local 的 `auto` 现在等于开，不再探测）映射成 `ipv6`；`local.state-capacity` / `shared.state-capacity` 仍然决定内核状态表容量（上限 1048576）；`shared.advanced.tc-priority` 等于顶层 `tc-priority`，`shared.advanced.data-plane` 的已知值映射到 `shared.data-plane`。`tcp-splice` 和 `shared.advanced.routing-mark` / `routing-table` 已经没有作用，启动时会提示一次。
 
 ## 对内核版本的要求
 
-能跑起来的最低要求不高，但内核越新，回收状态越及时：
+版本号只能作为参考，实际还取决于内核配置、厂商回移补丁、权限及所选数据面：
 
 | 内核 | 影响 |
 | --- | --- |
-| 5.4 及以上 | 默认数据面（local 走 cgroup、shared 走 packet_rewrite）可以正常工作 |
-| 5.5 及以上 | socket 关闭时能立刻回收状态，否则只能等 LRU 淘汰 |
-| 5.6 及以上 | 才能选 `local.data-plane: tc` 和 `shared.data-plane: socket_assign`（要 `bpf_sk_assign`） |
-| 5.14 及以上 | 用户态可以主动清理过期的重定向表项，否则同样只靠 LRU |
-| 6.6 及以上 | 用 TCX 挂载，不依赖 qdisc；更早的内核自动回退到 clsact |
+| 5.4 及以上 | 默认数据面（local 走 cgroup、shared 走 packet_rewrite）的目标兼容范围；仍需相应 BPF、cgroup / TC 支持 |
+| 5.5 及以上 | 可提供 `sock_release` 关闭回收能力，是否可用以探测和挂载结果为准 |
+| 5.7 及以上 | 上游引入 `bpf_sk_assign`；`local.data-plane: tc` 和 `shared.data-plane: socket_assign` 需要该 helper 及相关 socket lookup 能力 |
+| 5.14 及以上 | hash map 可支持 `BPF_MAP_LOOKUP_AND_DELETE_ELEM`，缺失时按具体表使用兼容路径 |
+| 6.6 及以上 | 可用 TCX 挂载；默认优先级为 1 时尝试，不能使用则退回 clsact |
 
-低于上述版本不会报错也不会不工作，只是回收慢一些。启动时会在日志里列出当前内核缺哪些能力、各自意味着什么，不用自己猜。
+缺少可选能力时会降级；缺少所选数据面的必需能力时会启动失败，不会自动换成另一种数据面。已连接的 Android 5.4 设备通过了 cgroup 和 shared packet_rewrite 的加载及包测试，但不支持 `bpf_sk_assign`，对应测试明确跳过。完整结果与复现方法见 [验证记录](docs/ebpf-validation.md)。
 
-**唯一一个会直接报错的情况：Linux 6.6.0 ～ 6.6.46。** 这段内核的 LPM trie 在 UBSAN 下会 panic，所以核心拒绝往里写任何基于网段的策略，`bypass-rule-set`、`local.include-uid`、`shared.include-source-cidr` 都会失败并给出明确报错。升到 6.6.47+，或者用已经回合 `bpf_lpm_trie_key_u8` 修复的内核（核心会读 BTF 自动识别，回合过的不受影响）。
+**Linux 6.6.0 ～ 6.6.46 另有 LPM trie 保护。** 对这段可能触发 UBSAN 缺陷的内核，未在 BTF 中识别到 `bpf_lpm_trie_key_u8` 修复时，核心拒绝写入非空 LPM 策略，例如 bypass CIDR、UID 和源网段策略。可升级到 6.6.47+，或使用包含该修复且可被识别的内核。
 
 ---
 
@@ -296,6 +296,16 @@ UDP 用 STUN 探测，IPv6 用一个只有 v6 的端点探连通性。探测走�
 有一类节点延迟探测永远合格，但真实流量一进去就死——连接表里的特征是"握手成功、发出去几个字节、一个字节都没回来、几秒后关闭"。url-test 永远发现不了这种。
 
 开了 `penalize-unstable` 之后，这类连接会被记进 10 分钟滑动窗口，每次事件加 150 ms 罚时，最多 1.5 秒。同样是降权不是摘除，全网都不行的时候还能兜底；窗口过期后节点自己恢复。
+
+## smart 的健康检查与采样配置
+
+策略组的健康检查参数是同级的 `url`、`interval`、`lazy`；嵌套的 `health-check: {enable, url, interval, lazy}` 属于 `proxy-providers`，放在 smart 策略组里不会按该格式生效。使用 `use` 引用订阅时，也要检查对应 provider 自己的健康检查配置：组级 `lazy` 不会覆盖 provider 的设置。
+
+smart 另有 `collectdata`、`uselightgbm`、`sample-rate` 参数。前两项默认关闭；`sample-rate` 默认 1，有效值为大于 0 且不超过 1，**只控制开启 `collectdata` 后的训练样本采集比例**，不控制连接统计、节点测速或后台主机恢复探测，不能把它当成省电开关。当前也没有控制 smart 全部后台任务的统一省电参数；`lazy: true` 只作用于相应健康检查。
+
+smart 的异常主机恢复探测另有内置限制：仅在该组最近 15 分钟有业务连接活动时执行，每轮最多 8 个候选；失败后从 1 小时开始指数退避，最长 8 小时。普通节点健康检查仍按组/provider 的配置运行。这些限制减少空闲和连续失败时的请求，也意味着大量异常目标可能需要更久才能完成恢复检查；目前没有新增 YAML 参数。
+
+后台维护改为共享全局调度器和每组一个调度器，同一任务不会重叠执行。重载时新旧组共享全局任务，最后一个组关闭才停止；关闭会等待已接收的连接统计，再刷盘并关闭采样文件。关闭 debug 且无人订阅日志时，不再构造完整连接统计日志；面板日志订阅仍能接收 debug 事件。
 
 ## 缓存说明
 
@@ -379,10 +389,9 @@ use: &use
   prefer-udp: true
   prefer-ipv6: true
   policy-priority: '\[备用机场\]:0.3'    # smart 内核原生选项，<1 降权
-  health-check:
-    enable: true
-    url: https://cp.cloudflare.com
-    interval: 300
+  url: https://cp.cloudflare.com
+  interval: 300
+  lazy: true
 
 proxies:
   - name: TS
@@ -482,15 +491,16 @@ CN IP 直连是把规则集里的网段编译进两个 LPM trie（IPv4 一个、
 
 ## 状态表与回收
 
-内核里维护若干张状态表，主要是重定向表（cookie/token → 原始目标）和流表。大部分是 LRU，满了会淘汰最久没用的表项，不会拒绝新连接。
+状态回收按数据面和表的用途区分，不能概括为「5.4 完全依赖 LRU」：
 
-回收有三条路：
+- **cgroup 重定向状态**：具备相应能力时通过 socket 关闭钩子清理；用户态消费和释放也会删除对应记录。缺少原子 lookup-and-delete 时，UDP 恢复表保留记录交给 LRU，避免删除并发写入的新值。
+- **shared 流状态**：用户态跟踪流引用和代次，连接释放及定期清扫共同回收；表占用超过 70% 时加速清扫，回落到 50% 以下退出压力模式。
+- **用户态 UDP 状态**：按 `udp-timeout` 回收空闲客户端，排队中的包、正在解析的 DNS 和下行回包都会参与保活。每次每张表最多检查 1024 个客户端，每批最多检查 32 个后释放收发锁；大表按游标每秒续扫，完整一轮结束后恢复常规间隔。这不是活跃客户端或目的地址绑定的总量上限。
+- **LRU 表**：容量满时可淘汰记录，但并不保证只淘汰已关闭连接；高压力下仍可能影响存量流量，不能把 LRU 当成无限容量保证。
 
-1. **BPF 侧**：`sock_release` 在 socket 关闭时删掉对应表项——需要内核 5.5+。
-2. **用户态定期清扫**：扫描过期表项并删除。删除用 `BPF_MAP_LOOKUP_AND_DELETE_ELEM` 保证原子性，避免和内核里的刷新竞争——这个操作对 hash map 需要内核 5.14+。低于这个版本时清扫会主动放弃，不走有竞态的 lookup-then-delete。
-3. **LRU 淘汰**：上面两条都没有时的兜底。
+当前还有两项固定资源限制，无需也没有对应 YAML 开关：每个入站的 TCP / UDP DNS 中继共用 256 个并发名额，超限 UDP 查询丢弃、TCP 连接关闭；透明 UDP 回包 socket 缓存分成 16 个分片，每片最多 64 个存活 socket（总上限 1024，包含等待在途写入完成才关闭的 socket）。单片满且全部被占用时，该次回包会失败。
 
-所以在 5.4 这种老内核上，回收完全依赖 LRU。这不影响正确性（LRU 优先淘汰的正是已关闭连接的死表项，活跃表项每次访问都会刷新位置），但安全余量会小很多。启动时的能力报告会明确说明当前内核处于哪种情况。
+这些优化复用现有 `udp-timeout`（默认 300 秒、最小 5 秒）。若设备内存紧张，可结合业务调整空闲超时；过短可能打断长时间无收发的 UDP 会话。内核与设备测试范围见 [验证记录](docs/ebpf-validation.md)，其中的分类器微基准不代表整机吞吐或耗电收益。
 
 ## 已修的问题
 

@@ -87,6 +87,22 @@ func (c *LruCache[K, V]) Clear() {
 	c.cache = make(map[K]*list.Element[*entry[K, V]])
 }
 
+// Resize changes the maximum number of entries without replacing the cache.
+// Shrinking evicts the least recently used entries immediately. A non-positive
+// size keeps the existing convention of disabling the size limit.
+func (c *LruCache[K, V]) Resize(maxSize int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.maxSize = maxSize
+	if maxSize <= 0 {
+		return
+	}
+	for c.lru.Len() > maxSize {
+		c.deleteElement(c.lru.Front())
+	}
+}
+
 // Get returns any representation of a cached response and a bool
 // set to true if the key was found.
 func (c *LruCache[K, V]) Get(key K) (V, bool) {
