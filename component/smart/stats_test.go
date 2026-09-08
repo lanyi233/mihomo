@@ -32,20 +32,22 @@ func TestCheckHostStatusConcurrentUpdate(t *testing.T) {
 	data, err := json.Marshal(&initial)
 	require.NoError(t, err)
 
-	store := &Store{}
-	store.AppendToGlobalQueue(StoreOperation{
-		Type:   OpSaveHostFailures,
-		Group:  group,
-		Config: config,
-		Target: wildcardTarget,
-		Data:   data,
+	// Seed the caches directly: AdjustCacheParameters can leave asynchronous
+	// flushes running, so the global write queue is not a stable test fixture.
+	cachePath := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
+	initial.initOnce.Do(func() {})
+	hostStatusCache.Set(cachePath, &initial)
+	dbResultCache.Set(FormatDBKey(KeyTypeHostFailures, config, group), map[string][]byte{
+		cachePath: data,
 	})
+
+	store := &Store{}
 	_, err = store.CheckHostStatus(group, config, 1_000)
 	require.NoError(t, err)
 
-	cachePath := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
 	cached, ok := hostStatusCache.Get(cachePath)
 	require.True(t, ok)
+	require.NotNil(t, cached.Codes[2])
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
