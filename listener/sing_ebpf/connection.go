@@ -90,7 +90,7 @@ func (i *Inbound) newCgroupTCPConnection(conn net.Conn, listenerDestination neti
 		return
 	}
 	if i.hijackDNS(original.Destination) {
-		go i.relayTCPDNS(conn)
+		i.startTCPDNSRelay(conn)
 		return
 	}
 	metadata := &C.Metadata{
@@ -118,7 +118,7 @@ func (i *Inbound) newTCConnection(backend *ECommon.TCBackend, conn net.Conn, des
 		return
 	}
 	if i.hijackDNS(destination) {
-		go i.relayTCPDNS(conn)
+		i.startTCPDNSRelay(conn)
 		return
 	}
 	metadata := &C.Metadata{
@@ -138,6 +138,8 @@ func (i *Inbound) newTCConnection(backend *ECommon.TCBackend, conn net.Conn, des
 // must never wait on the network: a stall stops every UDP client of the
 // inbound at once.
 func (i *Inbound) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
+	i.lifecycleAccess.RLock()
+	defer i.lifecycleAccess.RUnlock()
 	// One pass over the control messages serves both data planes; the cgroup
 	// path only needs the packet address and the TC path the original
 	// destination, and both come out of the same walk.
@@ -189,7 +191,7 @@ func (i *Inbound) newCgroupPacket(data []byte, redirectAddress netip.Addr, sourc
 		clientState := i.udpClientTable.loadOrCreate(client)
 		// Resolving may take a network round trip; never do that on the read
 		// loop. The DNS goroutine owns and returns the payload to the pool.
-		go i.relayUDPDNS(data, client, clientState, original.Destination)
+		i.startUDPDNSRelay(data, client, clientState, original.Destination)
 		return
 	}
 	i.forwardLocalUDP(data, client, original.Destination, original.ConnectedUDP)
@@ -223,7 +225,7 @@ func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, destinati
 	}
 	if i.hijackDNS(destination) {
 		clientState := i.udpClientTable.loadOrCreate(client)
-		go i.relayUDPDNS(data, client, clientState, destination)
+		i.startUDPDNSRelay(data, client, clientState, destination)
 		return
 	}
 	i.forwardLocalUDP(data, client, destination, false)
@@ -244,6 +246,7 @@ func (i *Inbound) forwardLocalUDP(data []byte, client netip.AddrPort, destinatio
 	inbound.ApplyAdditions(metadata, i.additions...)
 
 	clientState := i.udpClientTable.loadOrCreate(client)
+	clientState.activity.retain()
 	packet := &udpPacket{
 		inbound:     i,
 		client:      client,
@@ -295,6 +298,7 @@ func (i *Inbound) writeUDPReply(client netip.AddrPort, clientState *udpClientSta
 	// every UDP reply of the inbound through one lock, syscall included.
 	i.lifecycleAccess.RLock()
 	defer i.lifecycleAccess.RUnlock()
+	clientState.activity.touch()
 	binding, loaded, cgroupPlane := clientState.replyBinding(destinationAddress)
 	if !loaded {
 		if cgroupPlane {
@@ -335,11 +339,12 @@ func (i *Inbound) writeUDPReply(client netip.AddrPort, clientState *udpClientSta
 	if cgroupPlane {
 		return i.listeners.writeUDP(payload, binding.packetInfo, client, binding.redirectAddress)
 	}
-	socket, err := i.udpReplySockets.get(destinationAddress, i.newTCUDPReplySocket)
+	lease, err := i.udpReplySockets.lease(destinationAddress, i.newTCUDPReplySocket)
 	if err != nil {
 		return err
 	}
-	_, err = socket.WriteToUDPAddrPort(payload, client)
+	defer lease.release()
+	_, err = lease.entry.socket.WriteToUDPAddrPort(payload, client)
 	return err
 }
 
@@ -348,6 +353,9 @@ func (i *Inbound) writeUDPReply(client netip.AddrPort, clientState *udpClientSta
 // Drop once the outbound has written it. Without this every packet's buffer
 // became garbage, and the pool never had anything to hand back.
 func (p *udpPacket) Drop() {
+	if p.data != nil && p.clientState != nil {
+		p.clientState.activity.release()
+	}
 	data := p.data
 	if data == nil {
 		return

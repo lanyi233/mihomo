@@ -27,6 +27,7 @@ type sharedUDPClientShard struct {
 }
 
 type sharedUDPClientState struct {
+	activity             udpActivity
 	access               sync.RWMutex
 	connectedBinding     atomic.Pointer[sharedUDPRedirectBinding]
 	connected            bool
@@ -101,6 +102,7 @@ func (s *sharedUDPClientShard) loadOrCreateLocked(client netip.AddrPort) *shared
 		bindings:  make(map[netip.AddrPort]sharedUDPRedirectBinding),
 		originals: make(map[netip.Addr]sharedUDPOriginalDestination),
 	}
+	clientState.activity.touch()
 	s.clients[client] = clientState
 	return clientState
 }

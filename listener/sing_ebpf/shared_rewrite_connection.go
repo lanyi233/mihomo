@@ -3,7 +3,6 @@
 package sing_ebpf
 
 import (
-	"context"
 	"errors"
 	"net"
 	"net/netip"
@@ -12,7 +11,6 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	"github.com/metacubex/mihomo/common/pool"
-	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 
 	E "github.com/metacubex/sing/common/exceptions"
@@ -48,7 +46,7 @@ func (s *sharedRewrite) NewConnection(conn net.Conn) {
 		return
 	}
 	if s.inbound.hijackDNS(original.Destination) {
-		go s.relayTCPDNS(conn, flow)
+		s.inbound.startTCPDNSRelay(&sharedRewriteConn{Conn: conn, shared: s, flow: flow})
 		return
 	}
 	wrapped := &sharedRewriteConn{Conn: conn, shared: s, flow: flow}
@@ -96,6 +94,8 @@ func (c *sharedRewriteConn) WriterReplaceable() bool {
 }
 
 func (s *sharedRewrite) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
+	s.lifecycleAccess.RLock()
+	defer s.lifecycleAccess.RUnlock()
 	backend := s.sharedBackendInstance()
 	if backend == nil {
 		_ = pool.Put(data)
@@ -133,7 +133,7 @@ func (s *sharedRewrite) NewPacket(data []byte, oob []byte, source netip.AddrPort
 		clientState := s.sharedUDPClientTable.loadOrCreate(client)
 		// Resolving may take a network round trip; never do that on the read
 		// loop, which every UDP client of the shared interfaces shares.
-		go s.relaySharedUDPDNS(data, client, clientState, original.Destination)
+		s.startUDPDNSRelay(data, client, clientState, original.Destination)
 		return
 	}
 	s.forwardSharedUDP(data, client, original.Destination, flow)
@@ -150,6 +150,7 @@ func (s *sharedRewrite) forwardSharedUDP(data []byte, client netip.AddrPort, des
 	}
 	inbound.ApplyAdditions(metadata, s.inbound.additions...)
 	clientState := s.sharedUDPClientTable.loadOrCreate(client)
+	clientState.activity.retain()
 	packet := &sharedRewritePacket{
 		shared:      s,
 		client:      client,
@@ -158,13 +159,6 @@ func (s *sharedRewrite) forwardSharedUDP(data []byte, client netip.AddrPort, des
 		lAddr:       clientState.localAddr(client),
 	}
 	s.inbound.tunnel.HandleUDPPacket(packet, metadata)
-}
-
-func (s *sharedRewrite) relayTCPDNS(conn net.Conn, flow *ECommon.SharedNetworkFlowHandle) {
-	wrapped := &sharedRewriteConn{Conn: conn, shared: s, flow: flow}
-	if err := resolver.RelayDnsConn(context.Background(), wrapped, resolver.DefaultDnsReadTimeout); err != nil {
-		s.udpWarnings.cleanup.warn(s.inbound.logWarn, "relay hijacked shared TCP DNS: ", err)
-	}
 }
 
 func (s *sharedRewrite) releaseFlows(releases []sharedUDPRedirectRelease) {
@@ -208,6 +202,7 @@ func (p *sharedRewritePacket) WriteBack(b []byte, addr net.Addr) (int, error) {
 	if p.clientState == nil {
 		return 0, E.New("missing shared-network UDP state for ", p.client)
 	}
+	p.clientState.activity.touch()
 	destinationAddress := destination.AddrPort()
 	binding, loaded := p.clientState.redirectBinding(destinationAddress)
 	if !loaded {
@@ -260,6 +255,9 @@ func (p *sharedRewritePacket) reserveReplyBinding(destination netip.AddrPort) (s
 // Drop returns the payload to the pool once the tunnel is done with it; see
 // udpPacket.Drop.
 func (p *sharedRewritePacket) Drop() {
+	if p.data != nil && p.clientState != nil {
+		p.clientState.activity.release()
+	}
 	data := p.data
 	if data == nil {
 		return

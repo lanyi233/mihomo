@@ -165,11 +165,12 @@ func (s *sharedRewrite) Close() error {
 	s.lifecycleAccess.Lock()
 	defer s.lifecycleAccess.Unlock()
 	var closeErr error
+	s.stopFlowJanitor()
 	if s.dataPlane != nil {
 		closeErr = s.dataPlane.Close()
 		s.dataPlane = nil
 	}
-	s.stopFlowJanitor()
+	s.purgeUDP()
 	backend := s.takeSharedBackend()
 	var backendErr error
 	if backend != nil {
@@ -220,6 +221,7 @@ func (s *sharedRewrite) setSharedBackend(backend *ECommon.SharedNetworkBackend) 
 
 // purgeUDP resets client-facing UDP state after the attachment set changes.
 func (s *sharedRewrite) purgeUDP() {
+	s.releaseFlows(s.sharedUDPClientTable.expire(0, true))
 }
 
 func (s *sharedRewrite) acceptWarn(message ...any) {

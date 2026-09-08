@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	commonEBPF "github.com/metacubex/mihomo/common/ebpf"
 	N "github.com/metacubex/mihomo/common/net"
@@ -18,9 +19,13 @@ import (
 )
 
 const (
-	udpClientShardCount = 16
-	udpReplyAliasLimit  = 64
+	udpClientShardCount          = 16
+	udpReplyAliasLimit           = 64
+	udpReplySocketShardCapacity  = 64
+	udpReplySocketTotalCapacity  = udpClientShardCount * udpReplySocketShardCapacity
 )
+
+var errUDPReplySocketPoolBusy = errors.New("eBPF UDP reply socket pool has no idle slot")
 
 type udpClientTable struct {
 	clientShards [udpClientShardCount]udpClientShard
@@ -32,6 +37,7 @@ type udpClientShard struct {
 }
 
 type udpClientState struct {
+	activity        udpActivity
 	access          sync.RWMutex
 	sourceMAC       net.HardwareAddr
 	socketCookie    uint64
@@ -77,6 +83,7 @@ func (t *udpClientTable) loadOrCreate(client netip.AddrPort) *udpClientState {
 		bindings:        make(map[netip.AddrPort]udpRedirectBinding),
 		cgroupOriginals: make(map[netip.Addr]commonEBPF.OriginalDestination),
 	}
+	state.activity.touch()
 	shard.clients[client] = state
 	return state
 }
@@ -221,40 +228,172 @@ type udpReplySocketPool struct {
 }
 
 type udpReplySocketShard struct {
-	access  sync.Mutex
-	sockets map[netip.AddrPort]*net.UDPConn
+	access sync.Mutex
+	// live includes retired sockets which still have an active lease. Keeping
+	// those in the count makes the descriptor bound strict even when every
+	// cached socket is concurrently writing.
+	live    int
+	sockets map[netip.AddrPort]*udpReplySocketEntry
+	newest  *udpReplySocketEntry
+	oldest  *udpReplySocketEntry
 }
 
-func (p *udpReplySocketPool) get(
+type udpReplySocketEntry struct {
+	source   netip.AddrPort
+	socket   *net.UDPConn
+	newer    *udpReplySocketEntry
+	older    *udpReplySocketEntry
+	lastUsed time.Time
+	leases   int
+	retired  bool
+}
+
+// udpReplySocketLease pins an entry until the caller finishes its sendmsg.
+// Eviction, idle sweeping, reset, and close can unlink a leased entry, but its
+// socket is closed only after the last lease is released.
+type udpReplySocketLease struct {
+	shard *udpReplySocketShard
+	entry *udpReplySocketEntry
+}
+
+func (p *udpReplySocketPool) lease(
 	source netip.AddrPort,
 	create func(netip.AddrPort) (*net.UDPConn, error),
-) (*net.UDPConn, error) {
+) (udpReplySocketLease, error) {
 	if p.closed.Load() {
-		return nil, net.ErrClosed
+		return udpReplySocketLease{}, net.ErrClosed
 	}
 	shard := &p.shards[p.shardIndex(source)]
 	shard.access.Lock()
 	defer shard.access.Unlock()
 	if p.closed.Load() {
-		return nil, net.ErrClosed
+		return udpReplySocketLease{}, net.ErrClosed
 	}
-	if socket := shard.sockets[source]; socket != nil {
-		return socket, nil
+	if entry := shard.sockets[source]; entry != nil {
+		entry.leases++
+		return udpReplySocketLease{shard: shard, entry: entry}, nil
+	}
+	if shard.live >= udpReplySocketShardCapacity {
+		entry := shard.oldest
+		for entry != nil && entry.leases != 0 {
+			entry = entry.newer
+		}
+		if entry == nil {
+			return udpReplySocketLease{}, errUDPReplySocketPoolBusy
+		}
+		socket := shard.retireLocked(entry)
+		// The entry has no lease, so closing under the shard lock cannot block a
+		// writer and prevents a replacement bind from racing the old socket.
+		_ = socket.Close()
 	}
 	socket, err := create(source)
 	if err != nil {
-		return nil, err
+		return udpReplySocketLease{}, err
 	}
 	if shard.sockets == nil {
-		shard.sockets = make(map[netip.AddrPort]*net.UDPConn)
+		shard.sockets = make(map[netip.AddrPort]*udpReplySocketEntry)
 	}
-	shard.sockets[source] = socket
-	return socket, nil
+	entry := &udpReplySocketEntry{
+		source:   source,
+		socket:   socket,
+		lastUsed: time.Now(),
+		leases:   1,
+	}
+	shard.sockets[source] = entry
+	shard.live++
+	shard.insertNewestLocked(entry)
+	return udpReplySocketLease{shard: shard, entry: entry}, nil
 }
 
 func (p *udpReplySocketPool) shardIndex(source netip.AddrPort) int {
-	port := source.Port()
-	return int((port ^ port>>8) & (udpClientShardCount - 1))
+	address := source.Addr().As16()
+	hash := uint32(source.Port()) * 0x9e3779b1
+	for offset := 0; offset < len(address); offset += 4 {
+		hash ^= uint32(address[offset])<<24 |
+			uint32(address[offset+1])<<16 |
+			uint32(address[offset+2])<<8 |
+			uint32(address[offset+3])
+		hash *= 0x85ebca6b
+	}
+	hash ^= hash >> 16
+	return int(hash & (udpClientShardCount - 1))
+}
+
+func (l udpReplySocketLease) release() {
+	if l.entry == nil {
+		return
+	}
+	shard := l.shard
+	shard.access.Lock()
+	entry := l.entry
+	if entry.leases == 0 {
+		shard.access.Unlock()
+		return
+	}
+	entry.leases--
+	if !entry.retired {
+		entry.lastUsed = time.Now()
+		shard.moveNewestLocked(entry)
+		shard.access.Unlock()
+		return
+	}
+	if entry.leases == 0 {
+		socket := entry.socket
+		entry.socket = nil
+		shard.live--
+		_ = socket.Close()
+	}
+	shard.access.Unlock()
+}
+
+func (s *udpReplySocketShard) insertNewestLocked(entry *udpReplySocketEntry) {
+	entry.newer = nil
+	entry.older = s.newest
+	if s.newest != nil {
+		s.newest.newer = entry
+	} else {
+		s.oldest = entry
+	}
+	s.newest = entry
+}
+
+func (s *udpReplySocketShard) moveNewestLocked(entry *udpReplySocketEntry) {
+	if s.newest == entry {
+		return
+	}
+	s.unlinkLocked(entry)
+	s.insertNewestLocked(entry)
+}
+
+func (s *udpReplySocketShard) unlinkLocked(entry *udpReplySocketEntry) {
+	if entry.newer != nil {
+		entry.newer.older = entry.older
+	} else {
+		s.newest = entry.older
+	}
+	if entry.older != nil {
+		entry.older.newer = entry.newer
+	} else {
+		s.oldest = entry.newer
+	}
+	entry.newer = nil
+	entry.older = nil
+}
+
+// retireLocked removes an entry from the reusable cache. The caller may close
+// the returned socket immediately; a nil return means an active lease owns the
+// eventual close.
+func (s *udpReplySocketShard) retireLocked(entry *udpReplySocketEntry) *net.UDPConn {
+	delete(s.sockets, entry.source)
+	s.unlinkLocked(entry)
+	entry.retired = true
+	if entry.leases != 0 {
+		return nil
+	}
+	socket := entry.socket
+	entry.socket = nil
+	s.live--
+	return socket
 }
 
 func (p *udpReplySocketPool) close() error {
@@ -273,15 +412,41 @@ func (p *udpReplySocketPool) reset() error {
 	return p.closeSockets()
 }
 
+// sweepIdle closes sockets which have not completed a write within maxIdle.
+// A leased socket is never considered idle even if its sendmsg is long-lived.
+func (p *udpReplySocketPool) sweepIdle(now time.Time, maxIdle time.Duration) error {
+	if p == nil || p.closed.Load() || maxIdle <= 0 {
+		return nil
+	}
+	cutoff := now.Add(-maxIdle)
+	var closeErr error
+	for index := range p.shards {
+		shard := &p.shards[index]
+		shard.access.Lock()
+		for entry := shard.oldest; entry != nil; {
+			next := entry.newer
+			if entry.leases == 0 && !entry.lastUsed.After(cutoff) {
+				socket := shard.retireLocked(entry)
+				closeErr = errors.Join(closeErr, socket.Close())
+			}
+			entry = next
+		}
+		shard.access.Unlock()
+	}
+	return closeErr
+}
+
 func (p *udpReplySocketPool) closeSockets() error {
 	var closeErr error
 	for index := range p.shards {
 		shard := &p.shards[index]
 		shard.access.Lock()
-		for source, socket := range shard.sockets {
-			closeErr = errors.Join(closeErr, socket.Close())
-			delete(shard.sockets, source)
+		for _, entry := range shard.sockets {
+			if socket := shard.retireLocked(entry); socket != nil {
+				closeErr = errors.Join(closeErr, socket.Close())
+			}
 		}
+		shard.sockets = nil
 		shard.access.Unlock()
 	}
 	return closeErr

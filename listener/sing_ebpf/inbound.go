@@ -36,17 +36,23 @@ type Listener interface {
 }
 
 type Inbound struct {
-	ctx             context.Context
-	tunnel          C.Tunnel
-	additions       []inbound.Addition
-	mode            string
-	localEnabled    bool
-	localDataPlane  string
-	cgroupPath      string
-	sharedEnabled   bool
-	sharedDataPlane string
-	enableTCP       bool
-	enableUDP       bool
+	dnsRelayAccess sync.Mutex
+	dnsRelays      *dnsRelayLimiter
+	dnsRelayClosed bool
+
+	udpJanitorCancel context.CancelFunc
+	udpJanitorDone   chan struct{}
+	ctx              context.Context
+	tunnel           C.Tunnel
+	additions        []inbound.Addition
+	mode             string
+	localEnabled     bool
+	localDataPlane   string
+	cgroupPath       string
+	sharedEnabled    bool
+	sharedDataPlane  string
+	enableTCP        bool
+	enableUDP        bool
 
 	localDNSMode        string
 	sharedDNSMode       string
@@ -316,6 +322,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		_ = inbound.Close()
 		return nil, err
 	}
+	inbound.startUDPJanitor()
 	return inbound, nil
 }
 
@@ -747,6 +754,8 @@ func (i *Inbound) isCgroupRedirectAddress(address netip.Addr) bool {
 func (i *Inbound) Close() error {
 	var closeErr error
 	i.closeOnce.Do(func() {
+		i.stopUDPJanitor()
+		i.stopDNSRelays()
 		if i.protectRegistered {
 			dialer.UnregisterSocketProtectFunc()
 			i.protectRegistered = false
@@ -770,6 +779,9 @@ func (i *Inbound) Close() error {
 			cgroupErr = cgroupBackend.Close()
 		}
 		listenerErr := i.listeners.close()
+		i.lifecycleAccess.Lock()
+		i.udpClientTable.expire(0, true)
+		i.lifecycleAccess.Unlock()
 		udpReplySocketErr := i.udpReplySockets.close()
 		dataPlaneErr := dataPlane.Close()
 		routeErr := i.removeLocalRoutes()

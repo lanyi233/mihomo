@@ -79,6 +79,8 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 	if d == nil {
 		return nil
 	}
+	d.owner.lifecycleAccess.Lock()
+	defer d.owner.lifecycleAccess.Unlock()
 	d.access.Lock()
 	defer d.access.Unlock()
 

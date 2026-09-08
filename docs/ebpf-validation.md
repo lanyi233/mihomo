@@ -82,3 +82,16 @@ Remaining audit findings, not changed in this follow-up:
 - Transparent reply sockets are cached by remote address/port until reset/close. Many distinct destinations can increase descriptor usage; bounded idle eviction must synchronize with in-flight writes.
 - DNS goroutines are not concurrency-bounded. Limits require an explicit overload policy so slow upstream DNS does not create either unlimited work or a blocked UDP read loop.
 - Non-linear skb behavior and router throughput still require dedicated traffic tests.
+
+## UDP lifetime and bounded DNS/socket resources
+
+The three userspace resource findings above are addressed in the next change:
+
+- UDP client state records monotonic activity and outstanding packet/DNS ownership. Successful forwarding keeps a reference until `Drop`; DNS keeps one until resolution/write-back completes. Replies refresh activity, so downstream-only sessions remain live. An inbound-owned janitor uses `udp-timeout` and expires at most 1024 idle clients per table each round. It releases shared flow references and cgroup redirect records. Active clients are not evicted to meet this cleanup budget.
+- Shared topology reconciliation now excludes UDP ingress/replies while resetting client caches; stale writers cannot install aliases into a replacement client. Shutdown stops janitors before changing their backend pointers, cancels DNS, and clears client state.
+- Transparent reply sockets use 16 shards with 64 live descriptors per shard (1024 total), including retired sockets still leased by writers. The key hash includes the IP address as well as the port. Capacity evicts the least recently used unleased socket; if the shard is entirely leased, admission returns an error. Idle sockets expire using `udp-timeout`. Reset/close defer closing a leased socket until its final writer releases it. Sendmsg runs outside the shard lock.
+- Local and shared DNS, TCP and UDP, share a 256-task cap per inbound. Admission never waits for a task slot: excess UDP queries are dropped with their buffer returned, and excess TCP connections are closed. Upstream requests inherit inbound cancellation; shutdown closes idle TCP DNS readers and waits for accepted work before closing backends.
+
+Tests cover 10,000-client churn, queued-packet and downstream activity retention, stale writer rejection, exactly-once Drop/release, DNS admission/cancellation/start-close races, idle TCP reader cancellation, socket capacity/idle eviction, leased writes during reset/close, and concurrent writes during sweeping. The listener suite also runs as a static arm64 test binary on the Android device.
+
+This improves resource bounds, not the theoretical throughput of the same short session. Host forwarding microbenchmarks remain at 2 allocations per packet; the socket cache hit/lease/release benchmark has zero allocations (about 76–82 ns on the test host). Actively used UDP bindings can still grow with the number of destinations in an active session; the janitor bounds idle retention rather than imposing a hard cap on valid active traffic.
