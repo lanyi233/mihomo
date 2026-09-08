@@ -30,6 +30,10 @@ func requireEBPFIntegration(t testing.TB, action string) {
 
 func runTCProgram(t *testing.T, program *CiliumEBPF.Program, packet []byte) (uint32, []byte) {
 	t.Helper()
+	if program == nil {
+		t.Fatal("requested TC program was not loaded by the test configuration")
+	}
+	t.Helper()
 	output := make([]byte, len(packet)+256)
 	options := &CiliumEBPF.RunOptions{Data: packet, DataOut: output, Repeat: 1}
 	action, err := program.Run(options)

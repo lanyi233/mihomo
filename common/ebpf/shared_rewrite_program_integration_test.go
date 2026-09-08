@@ -360,6 +360,9 @@ func TestSharedRewritePolicyIntegration(t *testing.T) {
 	if err = backend.Enable(); err != nil {
 		t.Fatal(err)
 	}
+	if backend.control.Flags&sharedNetworkFlagBypassFlowCache != 0 {
+		t.Fatal("bypass-port-only policy unexpectedly enabled the bypass-flow cache")
+	}
 	if err = backend.UpdateHostAddresses([]netip.Addr{netip.MustParseAddr("10.123.0.1"), netip.MustParseAddr("fd12:3456::1")}); err != nil {
 		t.Fatal(err)
 	}
@@ -386,5 +389,14 @@ func TestSharedRewritePolicyIntegration(t *testing.T) {
 				t.Fatalf("proxy action=%d changed=%v", action, !bytes.Equal(out, packet))
 			}
 		})
+	}
+	bypassIterator := backend.runtime.maps["shared_bypass_flow"].Iterate()
+	var bypassKey sharedNetworkOriginalKey
+	var bypassValue [16]byte
+	if bypassIterator.Next(&bypassKey, &bypassValue) {
+		t.Fatalf("cache-disabled bypass-port policy wrote a bypass-flow entry: %+v", bypassKey)
+	}
+	if err = bypassIterator.Err(); err != nil {
+		t.Fatal(err)
 	}
 }

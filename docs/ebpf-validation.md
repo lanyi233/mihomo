@@ -58,3 +58,27 @@ exec /data/local/tmp/mihomo-ebpf.test -test.v -test.run Integration -test.timeou
 ```
 
 Host checks: full `go test -tags with_ebpf ./...`; `go vet` and `go test -race` for `./common/ebpf ./listener/sing_ebpf`; Linux amd64, Android arm64 and Darwin arm64 builds with `with_ebpf`. The Android binary also executes successfully on the device.
+
+## Follow-up: host coverage and remaining performance (2026-09-08)
+
+Host kernel: NixOS `7.1.10-zen1`, Intel Core Ultra 9 275HX. Running the privileged test binary with `sudo -A` completed all integration tests, including the socket-assignment, IPv6 isolation, and fragment cases skipped on Android. The IPv6 isolation fixture previously selected a program for a disabled data plane; enabling both planes while varying only their IPv6 flags fixes the fixture. The packet runner now reports missing programs instead of panicking.
+
+A bypass-port-only configuration disables the bypass-flow cache, but the BPF producer still wrote that cache on every bypassed packet. Guarding the producer with the same enable flag removes an unused timestamp helper and map update. The regression asserts that the disabled cache stays empty. All existing host integration tests pass five consecutive runs; Android 5.4 also passes its supported tests with the new objects.
+
+`BenchmarkSharedBypassPortIntegration`, 100,000 kernel repetitions, five samples per binary:
+
+| Objects | Kernel ns/packet |
+| --- | --- |
+| Before | 109, 110, 110, 117, 111 |
+| After | 35, 36, 37, 38, 36 |
+
+Median reduction: 110 to 36 ns (about 67%) for this bypass-only classifier path. This is not an end-to-end throughput measurement. Go forwarding baseline remains roughly 660–725 ns/packet with 2 allocations; OOB parsing is about 7 ns without allocations.
+
+UDP receive rejection paths now return their pooled payloads on absent backend, invalid destination/control messages, and failed original-destination lookups. Successful forwarding and asynchronous DNS retain their existing ownership. Tests intercept the allocator to verify exactly one return for rejected packets; no extra hot-path wrapper or allocation was added.
+
+Remaining audit findings, not changed in this follow-up:
+
+- Userspace UDP client tables have no production caller for their per-client deletion helpers; the shared topology `purgeUDP` callback is empty. Client/binding/flow-reference accumulation and stale entries need a dedicated lifetime fix coordinated with tunnel NAT ownership. A timer that expires clients without observing downstream activity can interrupt valid UDP sessions.
+- Transparent reply sockets are cached by remote address/port until reset/close. Many distinct destinations can increase descriptor usage; bounded idle eviction must synchronize with in-flight writes.
+- DNS goroutines are not concurrency-bounded. Limits require an explicit overload policy so slow upstream DNS does not create either unlimited work or a blocked UDP read loop.
+- Non-linear skb behavior and router throughput still require dedicated traffic tests.

@@ -203,8 +203,10 @@ NOINLINE bool load_cached_bypass(
 
 NOINLINE void cache_bypass(
     struct sb_shared_scratch *scratch,
+    const struct sb_shared_control *control,
     __u8 protocol,
     __u32 tcp_sequence) {
+    if ((control->flags & SB_SHARED_FLAG_BYPASS_FLOW_CACHE) == 0U) return;
     __builtin_memset(&scratch->bypass_flow, 0, sizeof(scratch->bypass_flow));
     scratch->bypass_flow.last_seen_ns = ktime_get_ns();
     if (protocol == IPPROTO_TCP_VALUE) scratch->bypass_flow.tcp_sequence = tcp_sequence;

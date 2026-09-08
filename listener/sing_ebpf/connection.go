@@ -144,6 +144,7 @@ func (i *Inbound) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
 	packetAddress, destination, interfaceIndex, err := packetDestinationsFromOOB(oob)
 	if err != nil {
 		i.udpWarnings.packetInfo.warn(i.logWarn, "read eBPF UDP packet info: ", err)
+		_ = pool.Put(data)
 		return
 	}
 	if i.localCgroupEnabled() && i.isCgroupRedirectAddress(packetAddress) {
@@ -152,6 +153,7 @@ func (i *Inbound) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
 	}
 	backend := i.tcBackend()
 	if backend == nil {
+		_ = pool.Put(data)
 		return
 	}
 	i.newTCPacket(backend, data, destination, interfaceIndex, source)
@@ -161,6 +163,7 @@ func (i *Inbound) newCgroupPacket(data []byte, redirectAddress netip.Addr, sourc
 	backend := i.cgroupBackendInstance()
 	if backend == nil {
 		i.udpWarnings.originalDestination.warn(i.logWarn, "cgroup eBPF backend is closed; dropping packet redirected to ", redirectAddress)
+		_ = pool.Put(data)
 		return
 	}
 	client := source
@@ -177,6 +180,7 @@ func (i *Inbound) newCgroupPacket(data []byte, redirectAddress netip.Addr, sourc
 		}
 		if err != nil {
 			i.udpWarnings.originalDestination.warn(i.logWarn, "lookup cgroup eBPF UDP original destination: ", err)
+			_ = pool.Put(data)
 			return
 		}
 		i.udpClientTable.setCgroupBinding(client, original, redirectAddress)
@@ -184,8 +188,7 @@ func (i *Inbound) newCgroupPacket(data []byte, redirectAddress netip.Addr, sourc
 	if i.hijackDNS(original.Destination) {
 		clientState := i.udpClientTable.loadOrCreate(client)
 		// Resolving may take a network round trip; never do that on the read
-		// loop. The payload is owned by this packet and never returned to the
-		// pool, so handing it to another goroutine is safe.
+		// loop. The DNS goroutine owns and returns the payload to the pool.
 		go i.relayUDPDNS(data, client, clientState, original.Destination)
 		return
 	}
@@ -195,6 +198,7 @@ func (i *Inbound) newCgroupPacket(data []byte, redirectAddress netip.Addr, sourc
 func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, destination netip.AddrPort, interfaceIndex uint32, source netip.AddrPort) {
 	if !destination.IsValid() {
 		i.udpWarnings.packetInfo.warn(i.logWarn, "TC eBPF UDP original destination is missing")
+		_ = pool.Put(data)
 		return
 	}
 	client := source
@@ -208,6 +212,7 @@ func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, destinati
 		}
 		if err != nil {
 			i.udpWarnings.originalDestination.warn(i.logWarn, "lookup TC eBPF UDP assignment: ", err)
+			_ = pool.Put(data)
 			return
 		}
 		var sourceMAC net.HardwareAddr

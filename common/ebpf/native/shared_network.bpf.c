@@ -173,12 +173,12 @@ NOINLINE int ingress_ipv4(
                 scratch->source_mac.address,
                 (const __u8 *)&ip->source,
                 control)) {
-            cache_bypass(scratch, ip->protocol, tcp_sequence);
+            cache_bypass(scratch, control, ip->protocol, tcp_sequence);
             return SB_SHARED_ACT_CONTINUE;
         }
         if (!respect_source) {
             if (shared_port_bypassed(ip->protocol, destination_port, control)) {
-                cache_bypass(scratch, ip->protocol, tcp_sequence);
+                cache_bypass(scratch, control, ip->protocol, tcp_sequence);
                 return SB_SHARED_ACT_CONTINUE;
             }
             __u8 policy = ipv4_policy(
@@ -189,7 +189,7 @@ NOINLINE int ingress_ipv4(
                 control);
             if (policy != SB_SHARED_POLICY_PROXY) {
                 if (policy == SB_SHARED_POLICY_CACHE_BYPASS) {
-                    cache_bypass(scratch, ip->protocol, tcp_sequence);
+                    cache_bypass(scratch, control, ip->protocol, tcp_sequence);
                 }
                 return SB_SHARED_ACT_CONTINUE;
             }
@@ -414,12 +414,12 @@ NOINLINE int ingress_ipv6(
             return SB_SHARED_ACT_CONTINUE;
         }
         if (!ipv6_client_selected(scratch->source_mac.address, ip->source, control)) {
-            cache_bypass(scratch, protocol, tcp_sequence);
+            cache_bypass(scratch, control, protocol, tcp_sequence);
             return SB_SHARED_ACT_CONTINUE;
         }
         if (!respect_source) {
             if (shared_port_bypassed(protocol, destination_port, control)) {
-                cache_bypass(scratch, protocol, tcp_sequence);
+                cache_bypass(scratch, control, protocol, tcp_sequence);
                 return SB_SHARED_ACT_CONTINUE;
             }
             __u8 policy = ipv6_policy(
@@ -430,7 +430,7 @@ NOINLINE int ingress_ipv6(
                 control);
             if (policy != SB_SHARED_POLICY_PROXY) {
                 if (policy == SB_SHARED_POLICY_CACHE_BYPASS) {
-                    cache_bypass(scratch, protocol, tcp_sequence);
+                    cache_bypass(scratch, control, protocol, tcp_sequence);
                 }
                 return SB_SHARED_ACT_CONTINUE;
             }

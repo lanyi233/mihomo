@@ -98,11 +98,13 @@ func (c *sharedRewriteConn) WriterReplaceable() bool {
 func (s *sharedRewrite) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
 	backend := s.sharedBackendInstance()
 	if backend == nil {
+		_ = pool.Put(data)
 		return
 	}
 	tokenAddress, _, _, err := packetDestinationsFromOOB(oob)
 	if err != nil {
 		s.udpWarnings.packetInfo.warn(s.inbound.logWarn, "read shared-network UDP token address: ", err)
+		_ = pool.Put(data)
 		return
 	}
 	client := source
@@ -115,6 +117,7 @@ func (s *sharedRewrite) NewPacket(data []byte, oob []byte, source netip.AddrPort
 		original, flow, err = backend.LookupFlow(ECommon.ProtocolUDP, client, tokenDestination)
 		if err != nil {
 			s.udpWarnings.originalDestination.warn(s.inbound.logWarn, "lookup shared-network UDP original destination: ", err)
+			_ = pool.Put(data)
 			return
 		}
 		retainedFlow = true
