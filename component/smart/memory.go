@@ -236,7 +236,9 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 
 	// SmartTarget (same ruleset = same node)
 	targetKey := FormatDBKey(config, group, target)
-	unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
+	if existing, expireTime, found := unwrapCache.GetWithExpire(targetKey); !found || len(existing.Proxies) == 0 || expireTime.Before(time.Now()) {
+		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
+	}
 
 	// ASN sharing (CDN excluded): first-writer-wins
 	if asnNumber != "" && !CdnASNs[asnNumber] {
@@ -252,20 +254,19 @@ func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcar
 		return nil, false
 	}
 
-	targetKey := FormatDBKey(config, group, target)
-	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
-		if len(value.Proxies) > 0 {
-			return value.Proxies, expireTime.Before(time.Now())
-		}
-	}
-
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
 		if value, expireTime, found := unwrapCache.GetWithExpire(asnKey); found {
 			if len(value.Proxies) > 0 {
-				unwrapCache.Set(targetKey, UnwrapMap{Proxies: value.Proxies})
 				return value.Proxies, expireTime.Before(time.Now())
 			}
+		}
+	}
+
+	targetKey := FormatDBKey(config, group, target)
+	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
+		if len(value.Proxies) > 0 {
+			return value.Proxies, expireTime.Before(time.Now())
 		}
 	}
 

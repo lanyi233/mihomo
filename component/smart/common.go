@@ -575,6 +575,21 @@ func filterQueueByGroup(group, config string) {
 	})
 }
 
+func (s *Store) ClearFloodRecordsByGroup(group, config string) {
+	removeFromGlobalQueue(func(op StoreOperation) bool {
+		if op.Group == group && op.Config == config {
+			switch op.Type {
+			case OpSaveStats, OpSaveHostFailures, OpSaveNodeState:
+				return true
+			}
+		}
+		return false
+	})
+
+	blockedNodesCache.Delete(FormatDBKey(config, group))
+	hostStatusCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeHostFailures, config, group) + "/")
+}
+
 func removeNodesFromQueue(group, config string, nodes []string) {
 	nodeSet := make(map[string]struct{}, len(nodes))
 	for _, n := range nodes {
