@@ -91,7 +91,7 @@ type Inbound struct {
 	tcDataPlane         *tcDataPlane
 	tcDataPlaneAccess   sync.RWMutex
 	interfaceMonitor    tcInterfaceMonitor
-	lifecycleAccess     sync.Mutex
+	lifecycleAccess     sync.RWMutex
 	localRoutes         []*localRoute
 
 	sharedRewrite *sharedRewrite

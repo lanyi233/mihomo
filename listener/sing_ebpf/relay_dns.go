@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/resolver"
 )
 
@@ -21,11 +22,13 @@ func (i *Inbound) relayTCPDNS(conn net.Conn) {
 // relayUDPDNS relays a hijacked UDP DNS query into mihomo's resolver pipeline
 // and writes the reply back to the client through the client's data plane
 // (cgroup redirect write-back or the TC reply socket).
+//
+// It runs on its own goroutine: resolving can take a network round trip, and
+// the read loop that received the query must not wait for it. The query
+// buffer belongs to this call and goes back to the pool once it is unpacked.
 func (i *Inbound) relayUDPDNS(data []byte, client netip.AddrPort, clientState *udpClientState, destination netip.AddrPort) {
-	ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDnsRelayTimeout)
-	defer cancel()
-	buff := make([]byte, resolver.SafeDnsPacketSize)
-	reply, err := resolver.RelayDnsPacket(ctx, data, buff)
+	reply, buff, err := relayHijackedDNS(data)
+	defer pool.Put(buff)
 	if err != nil {
 		i.udpWarnings.originalDestination.warn(i.logWarn, "relay hijacked UDP DNS: ", err)
 		return
@@ -36,12 +39,11 @@ func (i *Inbound) relayUDPDNS(data []byte, client netip.AddrPort, clientState *u
 }
 
 // relaySharedUDPDNS relays a hijacked shared-network UDP DNS query and writes
-// the reply back through the shared rewrite reply path.
+// the reply back through the shared rewrite reply path. See relayUDPDNS for
+// the goroutine and buffer contract.
 func (s *sharedRewrite) relaySharedUDPDNS(data []byte, client netip.AddrPort, clientState *sharedUDPClientState, destination netip.AddrPort) {
-	ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDnsRelayTimeout)
-	defer cancel()
-	buff := make([]byte, resolver.SafeDnsPacketSize)
-	reply, err := resolver.RelayDnsPacket(ctx, data, buff)
+	reply, buff, err := relayHijackedDNS(data)
+	defer pool.Put(buff)
 	if err != nil {
 		s.udpWarnings.originalDestination.warn(s.inbound.logWarn, "relay hijacked shared UDP DNS: ", err)
 		return
@@ -57,4 +59,16 @@ func (s *sharedRewrite) relaySharedUDPDNS(data []byte, client netip.AddrPort, cl
 	if err := s.listeners.writeUDP(reply, binding.packetInfo, client, binding.address); err != nil {
 		s.udpWarnings.cleanup.warn(s.inbound.logWarn, "write hijacked shared UDP DNS reply: ", err)
 	}
+}
+
+// relayHijackedDNS resolves one hijacked query. The query buffer is returned to
+// the pool as soon as the resolver has unpacked it; the reply is built into a
+// pooled buffer the caller returns after writing it.
+func relayHijackedDNS(query []byte) ([]byte, []byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDnsRelayTimeout)
+	defer cancel()
+	buff := pool.Get(resolver.SafeDnsPacketSize)
+	reply, err := resolver.RelayDnsPacket(ctx, query, buff)
+	_ = pool.Put(query)
+	return reply, buff, err
 }

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 
 	commonEBPF "github.com/metacubex/mihomo/common/ebpf"
+	N "github.com/metacubex/mihomo/common/net"
+	C "github.com/metacubex/mihomo/constant"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -38,6 +40,9 @@ type udpClientState struct {
 	closed          bool
 	cgroupDataPlane bool
 	cgroupOriginals map[netip.Addr]commonEBPF.OriginalDestination
+	// lAddr is the address the tunnel keys its NAT table on, built once per
+	// client instead of formatted for every packet.
+	lAddr net.Addr
 }
 
 type udpRedirectBinding struct {
@@ -313,4 +318,51 @@ func (s *udpClientState) processSocketCookie() uint64 {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	return s.socketCookie
+}
+
+// localAddr returns the address the tunnel keys its NAT table on. It is the
+// same for every packet of a client, so it is built once: formatting the
+// client address and allocating a net.UDPAddr per packet was pure overhead on
+// the read loop.
+func (s *udpClientState) localAddr(client netip.AddrPort) net.Addr {
+	s.access.RLock()
+	lAddr := s.lAddr
+	s.access.RUnlock()
+	if lAddr != nil {
+		return lAddr
+	}
+	s.access.Lock()
+	if s.lAddr == nil {
+		s.lAddr = N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client))
+	}
+	lAddr = s.lAddr
+	s.access.Unlock()
+	return lAddr
+}
+
+// hasDirectBinding reports whether a TC client already has a validated
+// binding for destination, so the per-flow assignment lookup can be skipped
+// for the packets that follow the first one. Reply aliases do not count: they
+// were installed for a remote that answered, not for a flow the kernel
+// assigned.
+func (t *udpClientTable) hasDirectBinding(client netip.AddrPort, destination netip.AddrPort) bool {
+	state, loaded := t.load(client)
+	if !loaded {
+		return false
+	}
+	state.access.RLock()
+	binding, loaded := state.bindings[destination]
+	ready := loaded && !binding.replyAlias && !state.closed && !state.cgroupDataPlane
+	state.access.RUnlock()
+	return ready
+}
+
+// replyBinding reads the reply binding and the data plane of the client in one
+// critical section; the reply path needs both for every packet it writes.
+func (s *udpClientState) replyBinding(destination netip.AddrPort) (udpRedirectBinding, bool, bool) {
+	s.access.RLock()
+	binding, loaded := s.bindings[destination]
+	cgroupDataPlane := s.cgroupDataPlane
+	s.access.RUnlock()
+	return binding, loaded, cgroupDataPlane
 }

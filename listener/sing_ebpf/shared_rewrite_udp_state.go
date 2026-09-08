@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
+	N "github.com/metacubex/mihomo/common/net"
+	C "github.com/metacubex/mihomo/constant"
 )
 
 type sharedUDPClientTable struct {
@@ -33,6 +35,9 @@ type sharedUDPClientState struct {
 	bindings             map[netip.AddrPort]sharedUDPRedirectBinding
 	originals            map[netip.Addr]sharedUDPOriginalDestination
 	replyAliasCount      uint16
+	// lAddr is the address the tunnel keys its NAT table on, built once per
+	// client instead of formatted for every packet.
+	lAddr net.Addr
 }
 
 type sharedUDPRedirectBinding struct {
@@ -98,6 +103,25 @@ func (s *sharedUDPClientShard) loadOrCreateLocked(client netip.AddrPort) *shared
 	}
 	s.clients[client] = clientState
 	return clientState
+}
+
+// localAddr returns the address the tunnel keys its NAT table on. It is the
+// same for every packet of a client, so it is built once rather than
+// formatted and allocated per packet on the read loop.
+func (s *sharedUDPClientState) localAddr(client netip.AddrPort) net.Addr {
+	s.access.RLock()
+	lAddr := s.lAddr
+	s.access.RUnlock()
+	if lAddr != nil {
+		return lAddr
+	}
+	s.access.Lock()
+	if s.lAddr == nil {
+		s.lAddr = N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client))
+	}
+	lAddr = s.lAddr
+	s.access.Unlock()
+	return lAddr
 }
 
 func (t *sharedUDPClientTable) clientShard(client netip.AddrPort) *sharedUDPClientShard {

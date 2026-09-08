@@ -11,7 +11,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
-	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 
@@ -26,13 +26,13 @@ func (s *sharedRewrite) NewConnection(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	client, err := netip.ParseAddrPort(conn.RemoteAddr().String())
-	if err != nil {
+	client, ok := addrPortOf(conn.RemoteAddr())
+	if !ok {
 		_ = conn.Close()
 		return
 	}
-	tokenDestination, err := netip.ParseAddrPort(conn.LocalAddr().String())
-	if err != nil {
+	tokenDestination, ok := addrPortOf(conn.LocalAddr())
+	if !ok {
 		_ = conn.Close()
 		return
 	}
@@ -78,6 +78,23 @@ func (c *sharedRewriteConn) Close() error {
 	return c.Conn.Close()
 }
 
+// The wrapper exists only to release the kernel flow on Close; it adds
+// nothing to reads or writes. Saying so lets the relay unwrap it down to the
+// accepted TCP socket, where sing can hand the copy to the kernel (splice)
+// when the other side is a plain socket too, instead of pumping bytes through
+// userspace buffers.
+func (c *sharedRewriteConn) Upstream() any {
+	return c.Conn
+}
+
+func (c *sharedRewriteConn) ReaderReplaceable() bool {
+	return true
+}
+
+func (c *sharedRewriteConn) WriterReplaceable() bool {
+	return true
+}
+
 func (s *sharedRewrite) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
 	backend := s.sharedBackendInstance()
 	if backend == nil {
@@ -89,12 +106,12 @@ func (s *sharedRewrite) NewPacket(data []byte, oob []byte, source netip.AddrPort
 		return
 	}
 	client := source
-	tokenDestination := netip.AddrPortFrom(tokenAddress, s.listeners.selectedPort())
 	cached, bindingReady, loaded := s.sharedUDPClientTable.cachedPacketState(client, tokenAddress)
 	original := cached.original
 	flow := cached.sharedFlow
 	retainedFlow := false
 	if !loaded {
+		tokenDestination := netip.AddrPortFrom(tokenAddress, s.listeners.selectedPort())
 		original, flow, err = backend.LookupFlow(ECommon.ProtocolUDP, client, tokenDestination)
 		if err != nil {
 			s.udpWarnings.originalDestination.warn(s.inbound.logWarn, "lookup shared-network UDP original destination: ", err)
@@ -111,7 +128,9 @@ func (s *sharedRewrite) NewPacket(data []byte, oob []byte, source netip.AddrPort
 	}
 	if s.inbound.hijackDNS(original.Destination) {
 		clientState := s.sharedUDPClientTable.loadOrCreate(client)
-		s.relaySharedUDPDNS(data, client, clientState, original.Destination)
+		// Resolving may take a network round trip; never do that on the read
+		// loop, which every UDP client of the shared interfaces shares.
+		go s.relaySharedUDPDNS(data, client, clientState, original.Destination)
 		return
 	}
 	s.forwardSharedUDP(data, client, original.Destination, flow)
@@ -133,7 +152,7 @@ func (s *sharedRewrite) forwardSharedUDP(data []byte, client netip.AddrPort, des
 		client:      client,
 		clientState: clientState,
 		data:        data,
-		lAddr:       N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client)),
+		lAddr:       clientState.localAddr(client),
 	}
 	s.inbound.tunnel.HandleUDPPacket(packet, metadata)
 }
@@ -235,7 +254,15 @@ func (p *sharedRewritePacket) reserveReplyBinding(destination netip.AddrPort) (s
 	return sharedUDPRedirectBinding{}, E.New("shared-network UDP session closed or reply alias was rejected")
 }
 
+// Drop returns the payload to the pool once the tunnel is done with it; see
+// udpPacket.Drop.
 func (p *sharedRewritePacket) Drop() {
+	data := p.data
+	if data == nil {
+		return
+	}
+	p.data = nil
+	_ = pool.Put(data)
 }
 
 func (p *sharedRewritePacket) LocalAddr() net.Addr {

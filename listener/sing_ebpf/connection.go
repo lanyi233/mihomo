@@ -11,7 +11,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
-	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/pool"
 	C "github.com/metacubex/mihomo/constant"
 
 	E "github.com/metacubex/sing/common/exceptions"
@@ -19,33 +19,60 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// addrPortOf reads the address of an accepted connection without formatting
+// it to text and parsing it back. The internal listeners only ever hand out
+// *net.TCPAddr / *net.UDPAddr; anything else takes the slow path. IPv4
+// addresses are unmapped so the result matches what the text round trip used
+// to produce.
+func addrPortOf(addr net.Addr) (netip.AddrPort, bool) {
+	var addrPort netip.AddrPort
+	switch typed := addr.(type) {
+	case *net.TCPAddr:
+		addrPort = typed.AddrPort()
+	case *net.UDPAddr:
+		addrPort = typed.AddrPort()
+	case nil:
+		return netip.AddrPort{}, false
+	default:
+		parsed, err := netip.ParseAddrPort(addr.String())
+		if err != nil {
+			return netip.AddrPort{}, false
+		}
+		addrPort = parsed
+	}
+	if !addrPort.IsValid() {
+		return netip.AddrPort{}, false
+	}
+	if address := addrPort.Addr(); address.Is4In6() {
+		addrPort = netip.AddrPortFrom(address.Unmap(), addrPort.Port())
+	}
+	return addrPort, true
+}
+
 // NewConnection handles a TCP connection accepted by the internal listeners.
 // It dispatches between the cgroup and TC data planes by the redirect address
 // the connection was steered into.
 func (i *Inbound) NewConnection(conn net.Conn) {
-	if i.localCgroupEnabled() {
-		localAddr, err := netip.ParseAddrPort(conn.LocalAddr().String())
-		if err == nil && i.isCgroupRedirectAddress(localAddr.Addr()) {
-			i.newCgroupTCPConnection(conn)
-			return
-		}
+	localAddr, ok := addrPortOf(conn.LocalAddr())
+	if !ok {
+		_ = conn.Close()
+		return
+	}
+	if i.localCgroupEnabled() && i.isCgroupRedirectAddress(localAddr.Addr()) {
+		i.newCgroupTCPConnection(conn, localAddr)
+		return
 	}
 	backend := i.tcBackend()
 	if backend == nil {
 		_ = conn.Close()
 		return
 	}
-	i.newTCConnection(backend, conn)
+	i.newTCConnection(backend, conn, localAddr)
 }
 
-func (i *Inbound) newCgroupTCPConnection(conn net.Conn) {
+func (i *Inbound) newCgroupTCPConnection(conn net.Conn, listenerDestination netip.AddrPort) {
 	backend := i.cgroupBackendInstance()
 	if backend == nil {
-		_ = conn.Close()
-		return
-	}
-	listenerDestination, err := netip.ParseAddrPort(conn.LocalAddr().String())
-	if err != nil {
 		_ = conn.Close()
 		return
 	}
@@ -57,8 +84,8 @@ func (i *Inbound) newCgroupTCPConnection(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	source, err := netip.ParseAddrPort(conn.RemoteAddr().String())
-	if err != nil {
+	source, ok := addrPortOf(conn.RemoteAddr())
+	if !ok {
 		_ = conn.Close()
 		return
 	}
@@ -78,18 +105,13 @@ func (i *Inbound) newCgroupTCPConnection(conn net.Conn) {
 	i.tunnel.HandleTCPConn(conn, metadata)
 }
 
-func (i *Inbound) newTCConnection(backend *ECommon.TCBackend, conn net.Conn) {
-	source, err := netip.ParseAddrPort(conn.RemoteAddr().String())
-	if err != nil {
+func (i *Inbound) newTCConnection(backend *ECommon.TCBackend, conn net.Conn, destination netip.AddrPort) {
+	source, ok := addrPortOf(conn.RemoteAddr())
+	if !ok {
 		_ = conn.Close()
 		return
 	}
-	destination, err := netip.ParseAddrPort(conn.LocalAddr().String())
-	if err != nil {
-		_ = conn.Close()
-		return
-	}
-	_, err = backend.LookupAssignment(ECommon.ProtocolTCP, source, destination, 0, true)
+	_, err := backend.LookupAssignment(ECommon.ProtocolTCP, source, destination, 0, true)
 	if err != nil {
 		i.udpWarnings.cleanup.warn(i.logWarn, "lookup TC eBPF TCP assignment: ", err)
 		_ = conn.Close()
@@ -111,36 +133,41 @@ func (i *Inbound) newTCConnection(backend *ECommon.TCBackend, conn net.Conn) {
 	i.tunnel.HandleTCPConn(conn, metadata)
 }
 
-// NewPacket handles a UDP datagram received by the internal listeners.
+// NewPacket handles a UDP datagram received by the internal listeners. It runs
+// on the listener's single read loop, so everything here has to be cheap and
+// must never wait on the network: a stall stops every UDP client of the
+// inbound at once.
 func (i *Inbound) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
-	if i.localCgroupEnabled() {
-		if redirectAddress, err := redirectAddressFromOOB(oob); err == nil && i.isCgroupRedirectAddress(redirectAddress) {
-			i.newCgroupPacket(data, oob, source)
-			return
-		}
+	// One pass over the control messages serves both data planes; the cgroup
+	// path only needs the packet address and the TC path the original
+	// destination, and both come out of the same walk.
+	packetAddress, destination, interfaceIndex, err := packetDestinationsFromOOB(oob)
+	if err != nil {
+		i.udpWarnings.packetInfo.warn(i.logWarn, "read eBPF UDP packet info: ", err)
+		return
+	}
+	if i.localCgroupEnabled() && i.isCgroupRedirectAddress(packetAddress) {
+		i.newCgroupPacket(data, packetAddress, source)
+		return
 	}
 	backend := i.tcBackend()
 	if backend == nil {
 		return
 	}
-	i.newTCPacket(backend, data, oob, source)
+	i.newTCPacket(backend, data, destination, interfaceIndex, source)
 }
 
-func (i *Inbound) newCgroupPacket(data []byte, oob []byte, source netip.AddrPort) {
-	redirectAddress, _, _, err := packetDestinationsFromOOB(oob)
-	if err != nil {
-		i.udpWarnings.packetInfo.warn(i.logWarn, "read cgroup eBPF UDP redirect address: ", err)
-		return
-	}
+func (i *Inbound) newCgroupPacket(data []byte, redirectAddress netip.Addr, source netip.AddrPort) {
 	backend := i.cgroupBackendInstance()
-	if backend == nil || !i.isCgroupRedirectAddress(redirectAddress) {
-		i.udpWarnings.originalDestination.warn(i.logWarn, "cgroup eBPF UDP redirect address is not owned: ", redirectAddress)
+	if backend == nil {
+		i.udpWarnings.originalDestination.warn(i.logWarn, "cgroup eBPF backend is closed; dropping packet redirected to ", redirectAddress)
 		return
 	}
 	client := source
-	redirectDestination := netip.AddrPortFrom(redirectAddress, i.listeners.selectedPort())
 	original, loaded := i.udpClientTable.cachedCgroupOriginal(client, redirectAddress)
 	if !loaded {
+		redirectDestination := netip.AddrPortFrom(redirectAddress, i.listeners.selectedPort())
+		var err error
 		original, err = backend.LookupOriginal(ECommon.ProtocolUDP, redirectDestination)
 		if errors.Is(err, unix.ENOENT) {
 			original, err = backend.RecoverUDPOriginal(redirectDestination)
@@ -156,39 +183,42 @@ func (i *Inbound) newCgroupPacket(data []byte, oob []byte, source netip.AddrPort
 	}
 	if i.hijackDNS(original.Destination) {
 		clientState := i.udpClientTable.loadOrCreate(client)
-		i.relayUDPDNS(data, client, clientState, original.Destination)
+		// Resolving may take a network round trip; never do that on the read
+		// loop. The payload is owned by this packet and never returned to the
+		// pool, so handing it to another goroutine is safe.
+		go i.relayUDPDNS(data, client, clientState, original.Destination)
 		return
 	}
 	i.forwardLocalUDP(data, client, original.Destination, original.ConnectedUDP)
 }
 
-func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, oob []byte, source netip.AddrPort) {
-	_, destination, interfaceIndex, err := packetDestinationsFromOOB(oob)
-	if err != nil {
-		i.udpWarnings.packetInfo.warn(i.logWarn, "read TC eBPF UDP destination: ", err)
-		return
-	}
+func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, destination netip.AddrPort, interfaceIndex uint32, source netip.AddrPort) {
 	if !destination.IsValid() {
 		i.udpWarnings.packetInfo.warn(i.logWarn, "TC eBPF UDP original destination is missing")
 		return
 	}
 	client := source
-	assignment, err := backend.LookupAssignment(ECommon.ProtocolUDP, client, destination, interfaceIndex, false)
-	if err != nil && interfaceIndex != 0 {
-		assignment, err = backend.LookupAssignment(ECommon.ProtocolUDP, client, destination, 0, false)
+	// The assignment record only carries per-flow facts (source MAC, socket
+	// cookie, path), so it is read once per client/destination pair. Every
+	// later packet of the flow skips the map syscall and the state write.
+	if !i.udpClientTable.hasDirectBinding(client, destination) {
+		assignment, err := backend.LookupAssignment(ECommon.ProtocolUDP, client, destination, interfaceIndex, false)
+		if err != nil && interfaceIndex != 0 {
+			assignment, err = backend.LookupAssignment(ECommon.ProtocolUDP, client, destination, 0, false)
+		}
+		if err != nil {
+			i.udpWarnings.originalDestination.warn(i.logWarn, "lookup TC eBPF UDP assignment: ", err)
+			return
+		}
+		var sourceMAC net.HardwareAddr
+		if assignment.Path == ECommon.TCPathShared && assignment.SourceMACValid != 0 {
+			sourceMAC = net.HardwareAddr(assignment.SourceMAC[:])
+		}
+		i.udpClientTable.setDirectBinding(client, destination, sourceMAC, assignment.SocketCookie)
 	}
-	if err != nil {
-		i.udpWarnings.originalDestination.warn(i.logWarn, "lookup TC eBPF UDP assignment: ", err)
-		return
-	}
-	var sourceMAC net.HardwareAddr
-	if assignment.Path == ECommon.TCPathShared && assignment.SourceMACValid != 0 {
-		sourceMAC = net.HardwareAddr(assignment.SourceMAC[:])
-	}
-	i.udpClientTable.setDirectBinding(client, destination, sourceMAC, assignment.SocketCookie)
 	if i.hijackDNS(destination) {
 		clientState := i.udpClientTable.loadOrCreate(client)
-		i.relayUDPDNS(data, client, clientState, destination)
+		go i.relayUDPDNS(data, client, clientState, destination)
 		return
 	}
 	i.forwardLocalUDP(data, client, destination, false)
@@ -214,7 +244,7 @@ func (i *Inbound) forwardLocalUDP(data []byte, client netip.AddrPort, destinatio
 		client:      client,
 		clientState: clientState,
 		data:        data,
-		lAddr:       N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client)),
+		lAddr:       clientState.localAddr(client),
 	}
 	i.tunnel.HandleUDPPacket(packet, metadata)
 }
@@ -254,11 +284,15 @@ func (p *udpPacket) WriteBack(b []byte, addr net.Addr) (int, error) {
 // the redirect address as source (the kernel restores the reply path), while
 // TC clients use a transparent reply socket bound to the original destination.
 func (i *Inbound) writeUDPReply(client netip.AddrPort, clientState *udpClientState, destinationAddress netip.AddrPort, payload []byte) error {
-	i.lifecycleAccess.Lock()
-	defer i.lifecycleAccess.Unlock()
-	binding, loaded := clientState.redirectBinding(destinationAddress)
+	// Read-locked: replies for different clients flow concurrently, and only a
+	// topology update -- which purges the UDP state and resets the reply
+	// sockets -- has to exclude them. Holding a plain mutex here serialised
+	// every UDP reply of the inbound through one lock, syscall included.
+	i.lifecycleAccess.RLock()
+	defer i.lifecycleAccess.RUnlock()
+	binding, loaded, cgroupPlane := clientState.replyBinding(destinationAddress)
 	if !loaded {
-		if clientState.isCgroupDataPlane() {
+		if cgroupPlane {
 			backend := i.cgroupBackendInstance()
 			if backend == nil {
 				return E.New("cgroup eBPF backend is closed")
@@ -293,7 +327,7 @@ func (i *Inbound) writeUDPReply(client netip.AddrPort, clientState *udpClientSta
 			return E.New("eBPF UDP reply binding is unavailable")
 		}
 	}
-	if clientState.isCgroupDataPlane() {
+	if cgroupPlane {
 		return i.listeners.writeUDP(payload, binding.packetInfo, client, binding.redirectAddress)
 	}
 	socket, err := i.udpReplySockets.get(destinationAddress, i.newTCUDPReplySocket)
@@ -304,7 +338,17 @@ func (i *Inbound) writeUDPReply(client netip.AddrPort, clientState *udpClientSta
 	return err
 }
 
+// Drop returns the payload to the pool. The read loop copied the datagram
+// into a pooled buffer and handed ownership to this packet; the tunnel calls
+// Drop once the outbound has written it. Without this every packet's buffer
+// became garbage, and the pool never had anything to hand back.
 func (p *udpPacket) Drop() {
+	data := p.data
+	if data == nil {
+		return
+	}
+	p.data = nil
+	_ = pool.Put(data)
 }
 
 func (p *udpPacket) LocalAddr() net.Addr {
@@ -390,9 +434,4 @@ func packetDestinationsFromOOB(oob []byte) (netip.Addr, netip.AddrPort, uint32, 
 		return netip.Addr{}, netip.AddrPort{}, 0, E.New("IP packet info is missing")
 	}
 	return packetAddress, originalDestination, interfaceIndex, nil
-}
-
-func redirectAddressFromOOB(oob []byte) (netip.Addr, error) {
-	address, _, _, err := packetDestinationsFromOOB(oob)
-	return address, err
 }

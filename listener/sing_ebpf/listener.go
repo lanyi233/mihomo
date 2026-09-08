@@ -41,7 +41,10 @@ type internalListener struct {
 }
 
 type internalListenerSet struct {
-	access sync.Mutex
+	// access is write-locked only while listeners are started or closed; the
+	// per-packet readers (selectedPort, udpConn) take the read lock so the
+	// receive loop and the reply writers do not queue behind one another.
+	access sync.RWMutex
 	tcp4   *internalListener
 	tcp6   *internalListener
 	udp4   *internalListener
@@ -148,8 +151,8 @@ func (s *internalListenerSet) isClosed() bool {
 }
 
 func (s *internalListenerSet) selectedPort() uint16 {
-	s.access.Lock()
-	defer s.access.Unlock()
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return s.port
 }
 
@@ -198,8 +201,8 @@ func (s *internalListenerSet) registerTCTCPListeners(backend *ebpf.TCBackend) er
 }
 
 func (s *internalListenerSet) udpConn(ipv6 bool) *net.UDPConn {
-	s.access.Lock()
-	defer s.access.Unlock()
+	s.access.RLock()
+	defer s.access.RUnlock()
 	var current *internalListener
 	if ipv6 {
 		current = s.udp6
