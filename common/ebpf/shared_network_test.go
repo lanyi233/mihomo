@@ -10,14 +10,8 @@ import (
 )
 
 func TestSharedNetworkABI(t *testing.T) {
-	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 88 {
+	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 80 {
 		t.Fatalf("unexpected shared-network control size: %d", size)
-	}
-	if size := unsafe.Sizeof(sharedNetworkAssignKey{}); size != 40 {
-		t.Fatalf("unexpected shared-network assignment key size: %d", size)
-	}
-	if size := unsafe.Sizeof(sharedNetworkAssignValue{}); size != 12 {
-		t.Fatalf("unexpected shared-network assignment value size: %d", size)
 	}
 	if size := unsafe.Sizeof(sharedNetworkListenerKey{}); size != 40 {
 		t.Fatalf("unexpected shared-network listener key size: %d", size)

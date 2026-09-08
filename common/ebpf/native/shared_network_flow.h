@@ -1,4 +1,3 @@
-// Copyright 2026, Asterisk4Magisk contributors
 // Copyright 2026, sing-box contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -116,7 +115,6 @@ NOINLINE int reserve_token_attempt(
     scratch->token.generation = now ^ ((__u64)hash << 32U);
     scratch->token.last_seen_ns = now;
     if (!publish_token(scratch, control, BPF_NOEXIST)) {
-        record_shared_stat(SB_SHARED_STAT_TOKEN_PUBLISH_RETRY);
         return SB_SHARED_TOKEN_RETRY;
     }
     if (map_update(
@@ -134,7 +132,6 @@ NOINLINE int reserve_token_attempt(
         __builtin_memcpy(&scratch->token, existing, sizeof(scratch->token));
         return SB_SHARED_TOKEN_RESERVED;
     }
-    record_shared_stat(SB_SHARED_STAT_ORIGINAL_PUBLISH_FAILURE);
     return SB_SHARED_TOKEN_RETRY;
 }
 

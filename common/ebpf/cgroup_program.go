@@ -3,79 +3,20 @@
 package ebpf
 
 import (
+	"errors"
 	"unsafe"
 
 	E "github.com/metacubex/sing/common/exceptions"
 
 	CiliumEBPF "github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/asm"
 	"golang.org/x/sys/unix"
 )
 
 func (b *CgroupBackend) LoadPrograms(listenerPort uint16) error {
-	selfTGID, err := b.probeSelfTGID()
-	if err != nil {
-		return err
-	}
-	return b.loadPrograms(listenerPort, selfTGID)
+	return b.loadPrograms(listenerPort)
 }
 
-func (b *CgroupBackend) probeSelfTGID() (uint32, error) {
-	if b == nil {
-		return 0, errBackendClosed
-	}
-	b.access.Lock()
-	defer b.access.Unlock()
-	if err := b.health.requireUsable(b.runtime != nil); err != nil {
-		return 0, err
-	}
-	probeMap, err := newRuntimeMap("sb_tgid_probe", CiliumEBPF.Array, 4, 4, 1, 0)
-	if err != nil {
-		return 0, nil
-	}
-	defer probeMap.Close()
-	program, err := CiliumEBPF.NewProgram(&CiliumEBPF.ProgramSpec{
-		Name:       "sb_tgid_probe",
-		Type:       CiliumEBPF.CGroupSockAddr,
-		AttachType: CiliumEBPF.AttachCGroupInet4Connect,
-		License:    "GPL",
-		Instructions: asm.Instructions{
-			asm.StoreImm(asm.RFP, -4, 0, asm.Word),
-			asm.LoadMapPtr(asm.R1, probeMap.FD()),
-			asm.Mov.Reg(asm.R2, asm.RFP),
-			asm.Add.Imm(asm.R2, -4),
-			asm.FnMapLookupElem.Call(),
-			asm.JEq.Imm(asm.R0, 0, "exit"),
-			asm.Mov.Reg(asm.R6, asm.R0),
-			asm.FnGetCurrentPidTgid.Call(),
-			asm.RSh.Imm(asm.R0, 32),
-			asm.StoreMem(asm.R6, 0, asm.R0, asm.Word),
-			asm.Mov.Imm(asm.R0, 1).WithSymbol("exit"),
-			asm.Return(),
-		},
-	})
-	if err != nil {
-		return 0, nil
-	}
-	defer program.Close()
-	cgroupFD := int(b.runtime.cgroupFile.Fd())
-	if err = attachProgramRaw(cgroupFD, program, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
-		return 0, nil
-	}
-	socketFD, socketErr := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
-	if socketErr == nil {
-		_ = unix.Connect(socketFD, &unix.SockaddrInet4{Port: 9, Addr: [4]byte{127, 0, 0, 1}})
-		_ = unix.Close(socketFD)
-	}
-	var selfTGID uint32
-	_ = probeMap.Lookup(uint32(0), &selfTGID)
-	if err = rawDetachProgram(cgroupFD, program, CiliumEBPF.AttachCGroupInet4Connect); err != nil {
-		return 0, eBPFOperationError("detach BPF-visible self TGID probe", err)
-	}
-	return selfTGID, nil
-}
-
-func (b *CgroupBackend) loadPrograms(listenerPort uint16, selfTGID uint32) error {
+func (b *CgroupBackend) loadPrograms(listenerPort uint16) error {
 	if b == nil {
 		return errBackendClosed
 	}
@@ -92,53 +33,21 @@ func (b *CgroupBackend) loadPrograms(listenerPort uint16, selfTGID uint32) error
 	if listenerPort == 0 {
 		return E.New("missing eBPF redirect listener port")
 	}
-	tryTGID := selfTGID != 0
-	if err := b.updateCgroupControl(listenerPort, func() uint32 {
-		if tryTGID {
-			return selfTGID
-		}
-		return 0
-	}()); err != nil {
+	b.listenerPort = listenerPort
+	if err := b.updateCgroupControl(listenerPort); err != nil {
+		b.listenerPort = 0
 		return E.Cause(err, "update cgroup control map")
 	}
-	if tryTGID {
-		programs, err := b.loadCgroupObjectPrograms(true)
-		if err == nil {
-			b.runtime.programs = programs
-			b.runtime.self_bypass_tgid = true
-			b.selfBypassTGID.Store(true)
-			b.pendingSocketCookies = nil
-			return nil
-		}
-	}
-	socketBypass, err := newRuntimeMap("sb_cg_sock_byp", CiliumEBPF.LRUHash, 8, 1, b.runtime.socket_bypass_capacity, 0)
+	programs, err := b.loadCgroupObjectPrograms()
 	if err != nil {
-		return err
-	}
-	b.runtime.maps["cgroup_socket_bypass"] = socketBypass
-	b.runtime.bypass_socket_cookie_map_fd = socketBypass.FD()
-	b.socketBypassMapFD = socketBypass.FD()
-	if err = b.updateCgroupControl(listenerPort, 0); err != nil {
-		return E.Cause(err, "update cgroup control map fallback")
-	}
-	programs, err := b.loadCgroupObjectPrograms(false)
-	if err != nil {
+		b.listenerPort = 0
 		return eBPFBackendOperationError("load eBPF inbound programs", verifierErrorStage(err), err)
 	}
 	b.runtime.programs = programs
-	b.runtime.self_bypass_tgid = false
-	value := uint8(1)
-	for cookie := range b.pendingSocketCookies {
-		cookie := cookie
-		if err = updateMap(b.socketBypassMapFD, unsafe.Pointer(&cookie), unsafe.Pointer(&value)); err != nil {
-			return E.Cause(err, "register pending eBPF bypass socket")
-		}
-	}
-	b.pendingSocketCookies = nil
 	return nil
 }
 
-func (b *CgroupBackend) loadCgroupObjectPrograms(tgidMode bool) ([]*CiliumEBPF.Program, error) {
+func (b *CgroupBackend) loadCgroupObjectPrograms() ([]*CiliumEBPF.Program, error) {
 	selections := make([]programSelection, 0, cgroupProgramCount)
 	slots := make([]int, 0, cgroupProgramCount)
 	for slot, definition := range cgroupProgramDefinitions {
@@ -146,24 +55,90 @@ func (b *CgroupBackend) loadCgroupObjectPrograms(tgidMode bool) ([]*CiliumEBPF.P
 			continue
 		}
 		selections = append(selections, programSelection{
-			section: b.cgroupProgramSection(slot, tgidMode),
+			section: b.cgroupProgramSection(slot),
 			name:    definition.name,
 		})
 		slots = append(slots, slot)
 	}
-	loaded, err := loadObjectPrograms(loadCgroup, b.runtime.maps, selections)
+	normalSelections := selections
+	normalSlots := slots
+	storageSelections := make([]programSelection, 0, 2)
+	storageSlots := make([]int, 0, 2)
+	if b.runtime.socket_storage_supported {
+		normalSelections = make([]programSelection, 0, len(selections))
+		normalSlots = make([]int, 0, len(slots))
+		for index, slot := range slots {
+			if slot == cgroupProgramUDP4Sendmsg || slot == cgroupProgramUDP6Sendmsg {
+				storageSelections = append(storageSelections, selections[index])
+				storageSlots = append(storageSlots, slot)
+			} else {
+				normalSelections = append(normalSelections, selections[index])
+				normalSlots = append(normalSlots, slot)
+			}
+		}
+	}
+	loadSpec := loadCgroup
+	if b.runtime.coarse_time_supported {
+		loadSpec = loadCgroupCoarse
+	}
+	normalMaps := b.runtime.maps
+	if b.runtime.socket_storage_supported {
+		normalMaps = make(map[string]*CiliumEBPF.Map, len(b.runtime.maps)-1)
+		for name, mapInstance := range b.runtime.maps {
+			if name != "cgroup_udp_socket_storage" {
+				normalMaps[name] = mapInstance
+			}
+		}
+	}
+	loaded, err := loadObjectPrograms(loadSpec, normalMaps, normalSelections)
+	if err != nil && b.runtime.coarse_time_supported && coarseTimeUnavailable(err) {
+		b.runtime.coarse_time_supported = false
+		loadSpec = loadCgroup
+		loaded, err = loadObjectPrograms(loadSpec, normalMaps, normalSelections)
+	}
 	if err != nil {
 		return nil, err
 	}
 	programs := make([]*CiliumEBPF.Program, cgroupProgramCount)
-	for index, slot := range slots {
+	for index, slot := range normalSlots {
 		programs[slot] = loaded[index]
+	}
+	if b.runtime.socket_storage_supported {
+		storagePrograms, storageErr := loadObjectPrograms(loadCgroupStorage, b.runtime.maps, storageSelections)
+		if storageErr != nil {
+			_ = closePrograms(programs)
+			// SK_STORAGE is an optional fast path. A vendor verifier may reject
+			// the object even after the helper and map probes succeed, so fall
+			// back to the regular cgroup object for any load failure.
+			b.disableSocketStorage()
+			return b.loadCgroupObjectPrograms()
+		}
+		for index, slot := range storageSlots {
+			programs[slot] = storagePrograms[index]
+		}
 	}
 	if err = b.validateCgroupProgramSet(programs); err != nil {
 		_ = closePrograms(programs)
 		return nil, err
 	}
 	return programs, nil
+}
+
+func (b *CgroupBackend) disableSocketStorage() {
+	if b.runtime == nil {
+		return
+	}
+	if storageMap := b.runtime.maps["cgroup_udp_socket_storage"]; storageMap != nil {
+		_ = storageMap.Close()
+		delete(b.runtime.maps, "cgroup_udp_socket_storage")
+	}
+	b.runtime.socket_storage_supported = false
+}
+
+func coarseTimeUnavailable(err error) bool {
+	return errors.Is(err, CiliumEBPF.ErrNotSupported) ||
+		errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOSYS) ||
+		errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP)
 }
 
 func (b *CgroupBackend) validateCgroupProgramSet(programs []*CiliumEBPF.Program) error {
@@ -202,11 +177,7 @@ func (b *CgroupBackend) cgroupProgramEnabled(slot int) bool {
 	}
 }
 
-func (b *CgroupBackend) cgroupProgramSection(slot int, tgidMode bool) string {
-	mode := "cookie"
-	if tgidMode {
-		mode = "tgid"
-	}
+func (b *CgroupBackend) cgroupProgramSection(slot int) string {
 	protocolSuffix := ""
 	if b.runtime.enable_tcp && !b.runtime.enable_udp {
 		protocolSuffix = "_tcp"
@@ -215,79 +186,53 @@ func (b *CgroupBackend) cgroupProgramSection(slot int, tgidMode bool) string {
 	}
 	switch slot {
 	case cgroupProgramConnect4:
-		return "cgroup/connect4_" + mode + protocolSuffix
+		return "cgroup/connect4_cookie" + protocolSuffix
 	case cgroupProgramUDP4Sendmsg:
-		return "cgroup/sendmsg4_" + mode
+		return "cgroup/sendmsg4_cookie"
 	case cgroupProgramUDP4Recvmsg:
 		return "cgroup/recvmsg4"
 	case cgroupProgramConnect6:
 		if !b.enableIPv6 {
-			return "cgroup/connect6_mapped_" + mode + protocolSuffix
+			return "cgroup/connect6_mapped_cookie" + protocolSuffix
 		}
-		return "cgroup/connect6_" + mode + protocolSuffix
+		return "cgroup/connect6_cookie" + protocolSuffix
 	case cgroupProgramUDP6Sendmsg:
 		if !b.enableIPv6 {
-			return "cgroup/sendmsg6_mapped_" + mode
+			return "cgroup/sendmsg6_mapped_cookie"
 		}
-		return "cgroup/sendmsg6_" + mode
+		return "cgroup/sendmsg6_cookie"
 	case cgroupProgramUDP6Recvmsg:
 		if !b.enableIPv6 {
 			return "cgroup/recvmsg6_mapped"
 		}
 		return "cgroup/recvmsg6"
 	case cgroupProgramSocketRelease:
-		return "cgroup/sock_release_" + mode
+		return "cgroup/sock_release_cookie"
 	default:
 		return ""
 	}
 }
 
-func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32) error {
-	var flags uint32
-	if b.runtime.enable_tcp {
-		flags |= cgroupFlagTCP
-	}
-	if b.runtime.enable_udp {
-		flags |= cgroupFlagUDP
-	}
-	if b.redirectIPv4.IsValid() {
-		flags |= cgroupFlagIPv4
-	}
-	if b.enableIPv6 {
-		flags |= cgroupFlagIPv6
-	}
-	if b.bypassPrivateAddress {
-		flags |= cgroupFlagBypassPrivateAddress
-	}
-	if b.runtime.uid_policy {
-		flags |= cgroupFlagUIDPolicy
-	}
-	if b.runtime.uid_default_bypass {
-		flags |= cgroupFlagUIDDefaultBypass
-	}
-	if b.runtime.bypass_ipv4_policy {
-		flags |= cgroupFlagBypassIPv4
-	}
-	if b.runtime.bypass_ipv6_policy {
-		flags |= cgroupFlagBypassIPv6
-	}
-	flags |= b.hostAddressFlags()
-	if b.runtime.auto_ipv6 {
-		flags |= cgroupFlagAutoIPv6
-	}
-	if b.runtime.enable_udp && b.runtime.socket_release_supported {
-		flags |= cgroupFlagUDPFlow
-	}
-	if b.fakeIPIPv4.IsValid() {
-		flags |= cgroupFlagFakeIPIPv4
-	}
-	if b.fakeIPIPv6.IsValid() {
-		flags |= cgroupFlagFakeIPIPv6
-	}
+func (b *CgroupBackend) updateCgroupControl(listenerPort uint16) error {
+	flags := policyVector{
+		EnableTCP:          b.runtime.enable_tcp,
+		EnableUDP:          b.runtime.enable_udp,
+		EnableIPv4:         b.redirectIPv4.IsValid(),
+		EnableLocalIPv6:    b.enableIPv6,
+		UIDPolicy:          b.runtime.uid_policy,
+		UIDDefaultBypass:   b.runtime.uid_default_bypass,
+		LocalBypassPrivate: b.bypassPrivateAddress,
+		BypassIPv4:         b.runtime.bypass_ipv4_policy,
+		BypassIPv6:         b.runtime.bypass_ipv6_policy,
+		HostIPv4:           len(b.hostIPv4) > 0,
+		HostIPv6:           b.enableIPv6 && len(b.hostIPv6) > 0,
+		LocalBypassPort:    b.runtime.bypass_port_policy,
+		FakeIPIPv4:         b.fakeIPIPv4.IsValid(),
+		FakeIPIPv6:         b.fakeIPIPv6.IsValid(),
+	}.cgroupFlags()
 	ipv4Prefix, ipv4HostMask := cgroupIPv4Redirect(b.redirectIPv4)
 	control := cgroupControl{
 		Flags:                flags,
-		SelfTGID:             selfTGID,
 		UDPTimeoutSeconds:    b.udpTimeoutSeconds,
 		DNSMode:              b.dnsMode,
 		RedirectIPv4Prefix:   ipv4Prefix,
@@ -308,46 +253,4 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32
 	}
 	key := uint32(0)
 	return updateMap(b.runtime.control_map_fd, unsafe.Pointer(&key), unsafe.Pointer(&control))
-}
-
-func (b *CgroupBackend) hostAddressFlags() uint32 {
-	var flags uint32
-	if len(b.hostIPv4) > 0 {
-		flags |= cgroupFlagHostIPv4
-	}
-	if b.enableIPv6 && len(b.hostIPv6) > 0 {
-		flags |= cgroupFlagHostIPv6
-	}
-	return flags
-}
-
-func (b *CgroupBackend) UpdateIPv6Available(available bool) (bool, error) {
-	if b == nil {
-		return false, errBackendClosed
-	}
-	b.access.Lock()
-	defer b.access.Unlock()
-	return b.updateIPv6AvailableLocked(available)
-}
-
-func (b *CgroupBackend) updateIPv6AvailableLocked(available bool) (bool, error) {
-	if err := b.health.requireUsable(b.runtime != nil); err != nil {
-		return false, err
-	}
-	if !b.autoIPv6 || b.ipv6AvailableMapFD < 0 {
-		return false, nil
-	}
-	if b.ipv6Available == available {
-		return false, nil
-	}
-	key := uint32(0)
-	value := uint32(0)
-	if available {
-		value = 1
-	}
-	if err := updateMap(b.ipv6AvailableMapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
-		return false, E.Cause(err, "update IPv6 availability eBPF map")
-	}
-	b.ipv6Available = available
-	return true, nil
 }

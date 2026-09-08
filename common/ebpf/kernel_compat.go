@@ -9,14 +9,19 @@ import (
 	"strings"
 	"sync"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	E "github.com/metacubex/sing/common/exceptions"
 )
 
-const lpmTrieFlexibleKeyFix = "896880ff30866f386ebed14ab81ce1ad3710cfc4"
+// Linux 6.6.0 through 6.6.46 may report an UBSAN out-of-bounds access when
+// an LPM trie key is updated. The upstream fix adds this BTF type name.
+const lpmTrieFlexibleKeyFix = "bpf_lpm_trie_key_u8"
 
 var (
 	lpmTrieSafetyOnce sync.Once
 	lpmTrieSafety     lpmTrieKernelSafety
+	lpmTrieProbeOnce  sync.Once
+	lpmTrieProbeErr   error
 )
 
 type lpmTrieKernelSafety struct {
@@ -28,17 +33,35 @@ func checkLPMTriePolicyCompatibility(scope string, entries int) error {
 	if entries == 0 {
 		return nil
 	}
-	lpmTrieSafetyOnce.Do(func() {
-		lpmTrieSafety = detectLPMTrieKernelSafety()
-	})
-	if !lpmTrieSafety.unsafe {
-		return nil
+	lpmTrieSafetyOnce.Do(func() { lpmTrieSafety = detectLPMTrieKernelSafety() })
+	if lpmTrieSafety.unsafe {
+		return E.New(
+			"refusing to update ", scope, " LPM trie on kernel ", lpmTrieSafety.release,
+			": this release may panic under the Linux LPM trie UBSAN defect; update to 6.6.47 or a kernel containing ",
+			lpmTrieFlexibleKeyFix,
+		)
 	}
-	return E.New(
-		"refusing to populate ", scope, " LPM trie policy on kernel ", lpmTrieSafety.release,
-		": Linux 6.6.0-6.6.46 can panic under UBSAN; update to 6.6.47+ or a kernel containing ",
-		lpmTrieFlexibleKeyFix,
-	)
+	lpmTrieProbeOnce.Do(func() { lpmTrieProbeErr = probeLPMTrieUpdate() })
+	if lpmTrieProbeErr != nil {
+		return E.Cause(lpmTrieProbeErr, "probe ", scope, " LPM trie update")
+	}
+	return nil
+}
+
+func probeLPMTrieUpdate() error {
+	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Name: "sb_lpm_probe", Type: CiliumEBPF.LPMTrie, KeySize: 8, ValueSize: 1, MaxEntries: 1, Flags: 1,
+	})
+	if err != nil {
+		return err
+	}
+	defer mapInstance.Close()
+	key := struct {
+		PrefixLength uint32
+		Address      [4]byte
+	}{PrefixLength: 32, Address: [4]byte{192, 0, 2, 1}}
+	value := uint8(1)
+	return mapInstance.Update(&key, &value, CiliumEBPF.UpdateAny)
 }
 
 func detectLPMTrieKernelSafety() lpmTrieKernelSafety {
@@ -47,14 +70,18 @@ func detectLPMTrieKernelSafety() lpmTrieKernelSafety {
 		return lpmTrieKernelSafety{}
 	}
 	release := strings.TrimSpace(string(releaseBytes))
+	safety := lpmTrieKernelSafety{release: release}
 	if !knownUnsafeLPMTrieRelease(release) {
-		return lpmTrieKernelSafety{release: release}
+		return safety
 	}
-	btfData, err := os.ReadFile("/sys/kernel/btf/vmlinux")
-	if err == nil && bytes.Contains(btfData, []byte("bpf_lpm_trie_key_u8")) {
-		return lpmTrieKernelSafety{release: release}
+	// BTF is a positive signal for the upstream flexible-key fix. If BTF is
+	// unavailable on a kernel in the affected range, fail closed before any
+	// LPM update can reach the vulnerable code.
+	btfData, btfErr := os.ReadFile("/sys/kernel/btf/vmlinux")
+	if btfErr != nil || !bytes.Contains(btfData, []byte(lpmTrieFlexibleKeyFix)) {
+		safety.unsafe = true
 	}
-	return lpmTrieKernelSafety{release: release, unsafe: true}
+	return safety
 }
 
 func knownUnsafeLPMTrieRelease(release string) bool {

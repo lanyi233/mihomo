@@ -1,4 +1,3 @@
-// Copyright 2026, Asterisk4Magisk contributors
 // Copyright 2026, sing-box contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -83,41 +82,6 @@ INLINE int rewrite_ipv6(
     }
     return TC_ACT_OK;
 }
-
-INLINE int rewrite_ipv4_fragment(
-    struct __sk_buff *skb,
-    __u32 l3_offset,
-    bool source,
-    __be32 old_address,
-    __be32 new_address) {
-    __u32 address_offset = l3_offset + (source
-        ? __builtin_offsetof(struct ipv4_header, source)
-        : __builtin_offsetof(struct ipv4_header, destination));
-    if (l3_csum_replace(
-            skb,
-            l3_offset + __builtin_offsetof(struct ipv4_header, checksum),
-            old_address,
-            new_address,
-            4U) != 0 ||
-        skb_store_bytes(skb, address_offset, &new_address, sizeof(new_address), 0U) != 0) {
-        return TC_ACT_SHOT;
-    }
-    return TC_ACT_OK;
-}
-
-INLINE int rewrite_ipv6_fragment(
-    struct __sk_buff *skb,
-    __u32 l3_offset,
-    bool source,
-    const __u8 new_address[16]) {
-    __u32 address_offset = l3_offset + (source
-        ? __builtin_offsetof(struct ipv6_header, source)
-        : __builtin_offsetof(struct ipv6_header, destination));
-    return skb_store_bytes(skb, address_offset, new_address, 16U, 0U) == 0
-        ? TC_ACT_OK
-        : TC_ACT_SHOT;
-}
-
 
 INLINE bool ipv4_token_address(__be32 address, const struct sb_shared_control *control) {
     __u32 host = swap32(address);

@@ -1,9 +1,13 @@
 # eBPF transparent inbound
 
-This document covers the Linux/Android cgroup eBPF transparent inbound and the
-optional shared-network TC data path. The feature is enabled only in builds
-with cgo and the `with_ebpf` build tag on Linux or Android. Other platforms
-compile with a stub that returns an explicit unsupported error.
+This document covers the Linux/Android eBPF transparent inbound: a local role
+that intercepts the host's own sockets (cgroup socket-address programs by
+default, or a TC egress program on the default interface) and a shared role
+that intercepts traffic forwarded from downstream interfaces (TC packet rewrite
+by default, or socket assignment). The feature is enabled only in builds with
+the `with_ebpf` build tag on Linux or Android; cgo is not required because the
+BPF objects are shipped pre-compiled. Other platforms compile with a stub that
+returns an explicit unsupported error.
 
 ## Supported environments
 
@@ -68,60 +72,117 @@ Android ARM64 uses the NDK clang as `CC`; see
 
 ## Configuration
 
-Add an `ebpf` listener to the `listeners` section:
+Add an `ebpf` listener to the `listeners` section. `mode` selects which roles
+run; each role then carries its own policy block:
 
 ```yaml
 listeners:
   - name: ebpf-inbound
     type: ebpf
+    mode: hybrid              # local | shared | hybrid, default local
     network: [tcp, udp]
-    cgroup-path: /sys/fs/cgroup
-    redirect-address:
-      - 127.128.0.0/9
-    dns-mode: hijack
-    cgroup-ipv6-mode: auto
-    udp-timeout: 300
-    map-capacity:
-      tcp-redirect: 65536
-      udp-redirect: 65536
-      socket-bypass: 65536
-    bypass-rule-set: []
-    include-uid: []
-    exclude-uid: []
-    shared-network:
-      enabled: false
+    udp-timeout: 300          # seconds
+    tc-priority: 1            # TC filter priority; 1 also enables TCX
+    bypass-rule-set: []       # rule providers (behavior: ipcidr) bypassed in kernel
+    bypass-tun-direct: true   # see "Coexisting with TUN"
+    local:
+      data-plane: cgroup      # cgroup (default) | tc
+      cgroup-path: ""         # cgroup v2 directory, empty = auto-detect (cgroup only)
+      dns-mode: hijack        # hijack (default) | respect_policy | off
+      ipv6: true
+      bypass-private-address: true
+      include-uid: []
+      include-uid-range: []   # "start:end"
+      exclude-uid: []
+      exclude-uid-range: []
+      include-android-user: []  # Android only
+      include-package: []       # Android only
+      exclude-package: []       # Android only
+      bypass-port: []
+      bypass-port-range: []   # "start:end"
+    shared:
+      data-plane: packet_rewrite  # packet_rewrite (default) | socket_assign
+      dns-mode: hijack
+      interface: [br0]        # downstream interfaces, required when shared runs
+      ipv6: true
+      bypass-private-address: true
+      include-source-cidr: []
+      exclude-source-cidr: []
+      include-mac-address: []
+      exclude-mac-address: []
+      bypass-port: []
+      bypass-port-range: []
 ```
 
 Field behavior:
 
+- `mode`: `local` intercepts sockets created on this host, `shared` intercepts
+  traffic forwarded from the `shared.interface` list, `hybrid` runs both. The
+  explicit `local.enabled` / `shared.enabled` booleans are accepted instead of
+  `mode`, not together with it.
 - `network`: `tcp`, `udp`, or both. Defaults to both when omitted.
-- `cgroup-path`: absolute cgroup v2 directory. Empty means auto-detect.
-- `redirect-address`: at most one IPv4 prefix and one IPv6 prefix. The default
-  is IPv4 `127.128.0.0/9` with IPv6 disabled.
-- `dns-mode`: `hijack` or `off`. Defaults to `hijack`.
-- `cgroup-ipv6-mode`: `always`, `auto`, or `off`. Defaults to `always`.
-- `udp-timeout`: UDP NAT mapping timeout in seconds. Defaults to 300.
-- `map-capacity`: maximum entries for the redirect and bypass maps. Values are
-  capped at `1 << 20`; zero uses the built-in default.
-- `bypass-rule-set`: rule provider tags whose CIDRs populate the bypass map.
+- `udp-timeout`: UDP session timeout in seconds. Defaults to 300, floor 5.
+- `tc-priority`: priority of the TC filters. With the default `1` the inbound
+  attaches through TCX on kernels that support it and falls back to clsact
+  filters otherwise; any other value always uses clsact filters.
+- `bypass-rule-set`: rule provider tags whose CIDRs populate the bypass LPM
+  maps. Only `behavior: ipcidr` providers contribute; others are skipped.
+- `bypass-tun-direct`: whether a destination this inbound bypasses is
+  connected directly when a TUN listener claims it anyway. Defaults to true.
+- `local.data-plane`: `cgroup` attaches connect/sendmsg/recvmsg programs to the
+  cgroup and rewrites destinations to an internal redirect address on
+  loopback. `tc` attaches an egress program to the default interface and
+  delivers selected packets to the internal listeners over a veth pair with
+  `bpf_sk_assign`, which needs a newer kernel (5.6+) and policy routing.
+- `local.cgroup-path`: absolute cgroup v2 directory for the cgroup data plane.
+  Empty means auto-detect.
+- `dns-mode` (per role): `hijack` intercepts every port-53 flow before any
+  bypass policy, `respect_policy` applies the UID/source policy first, `off`
+  leaves DNS alone. `respect_bypass` is accepted as an alias of
+  `respect_policy`.
+- `ipv6` (per role): whether IPv6 flows are intercepted. Defaults to true.
+- `bypass-private-address` (per role): let private destinations (10/8,
+  172.16/12, 192.168/16, 100.64/10, 169.254/16, fc00::/7, fe80::/10) past the
+  redirect. Defaults to true. Turn it off on a gateway that should see LAN
+  traffic in its connection list.
 - `include-uid`, `include-uid-range`, `exclude-uid`, `exclude-uid-range`:
-  UID-based interception policy. Ranges use `start:end` syntax.
+  UID-based interception policy for the local role. Ranges use `start:end`.
 - Android only: `include-android-user`, `include-package`, `exclude-package`.
-- `shared-network`: enables hotspot/TC forwarding on the named interfaces.
+- `bypass-port`, `bypass-port-range` (per role): destination ports that are
+  never intercepted.
+- `shared.data-plane`: `packet_rewrite` rewrites the destination at ingress
+  and restores it at egress and needs Ethernet framing; `socket_assign`
+  preserves the original tuple and assigns packets to the listener with
+  `bpf_sk_assign` (5.6+) plus policy routing, and also works on raw-IP links.
+- `shared.interface`: downstream interfaces. An interface that is currently
+  the default upstream is skipped until it returns to a downstream role.
+- `include-source-cidr`, `exclude-source-cidr`, `include-mac-address`,
+  `exclude-mac-address`: shared source policy. MAC policy needs Ethernet
+  framing.
+
+Keys from the previous configuration surface are still accepted and mapped to
+the fields above: a top-level `dns-mode` or `bypass-private-address` applies
+to every enabled role that does not set its own; `local.ipv6-mode` and
+`shared.ipv6-mode` (`always`/`off`, and `auto` for local, which now means
+enabled) map to `ipv6`; `local.state-capacity` and `shared.state-capacity`
+size the kernel state maps; `shared.advanced.tc-priority` becomes
+`tc-priority`. `tcp-splice` and `shared.advanced.routing-mark` /
+`routing-table` no longer do anything and are reported once at startup.
 
 ## IPv4 and IPv6 behavior
 
 The internal TCP and UDP listeners are created with explicit address families
 (`tcp4`, `tcp6`, `udp4`, `udp6`) and IPv6 listeners set `IPV6_V6ONLY`. This
 avoids implicit dual-stack listener behavior and keeps the BPF lookup keys
-deterministic. With `cgroup-ipv6-mode: auto`, IPv6 interception is enabled only
-when the host appears to provide IPv6 connectivity; the probe result is logged.
+deterministic. `local.ipv6` and `shared.ipv6` decide per role whether IPv6
+flows are intercepted at all; both default to on.
 
-The redirect address must not overlap routable local traffic. For IPv4 the
-default `127.128.0.0/9` is a loopback range that is not normally used by
-clients. For IPv6 supply a ULA or local-use prefix such as
-`fd00:ebpf::/64`; the IPv6 mode must not be `off` when an IPv6 prefix is
-configured.
+The cgroup and packet-rewrite data planes redirect to an internal address the
+inbound picks itself: `127.128.0.0/9` (falling back to `127.64.0.0/10`) for
+IPv4 and `fd53:696e:672d:626f::/64` (falling back to `fd53:696e:672d:6270::/64`)
+for IPv6. A candidate that overlaps a local route, an interface address, or a
+fake-ip range is skipped, and the routes the inbound adds for the chosen prefix
+are removed again on shutdown.
 
 ## Android differences
 

@@ -146,23 +146,16 @@ listeners:
     # 要接管的协议，默认两个都接管
     network: [tcp, udp]
 
-    # DNS 处理方式，默认 hijack
-    #   hijack         = 所有 53 端口无条件劫持进核心（推荐，广告拦截/分流都靠它）
-    #   respect_bypass = 劫持，但命中 bypass 的 DNS 放行直连
-    #   off            = 完全不管 DNS
-    dns-mode: hijack
-
     # UDP 会话保活时间，单位秒。默认 300，最小 5
     udp-timeout: 300
+
+    # TC filter 优先级，默认 1。为 1 时内核支持就用 TCX 挂载，否则退回 clsact
+    tc-priority: 1
 
     # 命中这些规则集的目标 IP 直接在内核放行，不进核心
     # 只认 behavior: ipcidr 的规则集
     bypass-rule-set:
       - CN-IP
-
-    # 是否放行私网地址（10/8、192.168/16 等），默认 true
-    # 做旁路网关时通常设 false，否则下联互访会被放行、拿不到统计
-    bypass-private-address: false
 
     # TUN 也开着时，被 TUN 的 auto-route 抓进来的 bypass 目标是否直接直连，
     # 不再进规则引擎。默认 true。见上面「和 TUN 共存」
@@ -170,14 +163,25 @@ listeners:
 
     # ---- local：本机进程 ----
     local:
-      # cgroup v2 挂载点，一般不用填，会自动找
+      # 数据面，默认 cgroup
+      #   cgroup = connect()/sendmsg() 时改写目的地址，5.4 内核就能跑
+      #   tc     = 默认网卡 egress 选包 + veth + bpf_sk_assign，需要 5.6+ 内核
+      data-plane: cgroup
+
+      # cgroup v2 挂载点，一般不用填，会自动找（只对 data-plane: cgroup 有意义）
       cgroup-path: /sys/fs/cgroup
 
-      # IPv6 处理
-      #   auto   = 探测到本机有可用 IPv6 出口才接管（默认）
-      #   always = 总是接管
-      #   off    = 不接管
-      ipv6-mode: auto
+      # DNS 处理方式，默认 hijack
+      #   hijack         = 所有 53 端口无条件劫持进核心（推荐，广告拦截/分流都靠它）
+      #   respect_policy = 先过 UID 策略再劫持（旧名 respect_bypass 也认）
+      #   off            = 完全不管 DNS
+      dns-mode: hijack
+
+      # 是否接管 IPv6，默认 true
+      ipv6: true
+
+      # 是否放行私网地址（10/8、192.168/16 等），默认 true
+      bypass-private-address: true
 
       # 只接管这些 UID 的流量（不填 = 全部接管）
       include-uid: [0, 1000]
@@ -192,17 +196,26 @@ listeners:
       include-package: [com.android.chrome]     # 只接管这些应用
       exclude-package: [com.tencent.mm]         # 排除这些应用
 
-      # 内核状态表容量，默认 32768，上限 1048576
-      # 日志里出现 "map ... is 85.0% full" 之类的告警时调大它
-      state-capacity: 32768
+      # 这些目标端口不接管
+      bypass-port: [22]
+      bypass-port-range: ["6000:6100"]
 
     # ---- shared：下联转发 ----
     shared:
-      # 下联网卡，必填。可以填多个
+      # 数据面，默认 packet_rewrite
+      #   packet_rewrite = ingress 改写目的地址、egress 还原，要以太网帧，5.4 内核就能跑
+      #   socket_assign  = 保留原始五元组，bpf_sk_assign + 策略路由，需要 5.6+ 内核，
+      #                    支持 rmnet / PPP 这类没有以太头的网卡
+      data-plane: packet_rewrite
+
+      # 下联网卡，必填。可以填多个；正在当上联出口的那张会自动跳过，等它变回下联再挂上
       interface: [br0]
 
-      # IPv6 处理，always（默认）/ off
-      ipv6-mode: always
+      dns-mode: hijack
+      ipv6: true
+
+      # 做旁路网关时通常设 false，否则下联互访会被放行、拿不到统计
+      bypass-private-address: false
 
       # 只接管来自这些网段的客户端（不填 = 全部）
       include-source-cidr: [192.168.0.0/24]
@@ -212,13 +225,11 @@ listeners:
       include-mac-address: ["aa:bb:cc:dd:ee:ff"]
       exclude-mac-address: ["11:22:33:44:55:66"]
 
-      # 状态表容量，默认 32768
-      state-capacity: 32768
-
-      advanced:
-        # TC filter 优先级，默认 1，和别的 TC 程序冲突时才需要改
-        tc-priority: 1
+      bypass-port: []
+      bypass-port-range: []
 ```
+
+**旧版参数照旧能用，不用改配置。** 顶层的 `dns-mode` / `bypass-private-address` 会套用到所有启用的角色上（角色自己写了的以自己的为准）；`local.ipv6-mode` / `shared.ipv6-mode`（`always` / `off`，local 的 `auto` 现在等于开，不再探测）映射成 `ipv6`；`local.state-capacity` / `shared.state-capacity` 仍然决定内核状态表容量（上限 1048576）；`shared.advanced.tc-priority` 等于顶层 `tc-priority`。`tcp-splice` 和 `shared.advanced.routing-mark` / `routing-table` 已经没有作用，启动时会提示一次。
 
 ## 对内核版本的要求
 
@@ -226,8 +237,9 @@ listeners:
 
 | 内核 | 影响 |
 | --- | --- |
-| 5.4 及以上 | 可以正常工作 |
+| 5.4 及以上 | 默认数据面（local 走 cgroup、shared 走 packet_rewrite）可以正常工作 |
 | 5.5 及以上 | socket 关闭时能立刻回收状态，否则只能等 LRU 淘汰 |
+| 5.6 及以上 | 才能选 `local.data-plane: tc` 和 `shared.data-plane: socket_assign`（要 `bpf_sk_assign`） |
 | 5.14 及以上 | 用户态可以主动清理过期的重定向表项，否则同样只靠 LRU |
 | 6.6 及以上 | 用 TCX 挂载，不依赖 qdisc；更早的内核自动回退到 clsact |
 
@@ -407,14 +419,11 @@ listeners:
   - name: ebpf-in
     type: ebpf
     mode: hybrid
-    dns-mode: hijack
+    dns-mode: hijack                # 顶层写法会套用到 local 和 shared 两个角色
     bypass-rule-set: [CN-IP]        # 国内 IP 不过核心
-    bypass-private-address: false
-    local:
-      ipv6-mode: auto
+    bypass-private-address: false   # 旁路网关：下联互访也进核心，拿得到统计
     shared:
       interface: [br0]
-      ipv6-mode: always
 
 # 只用 eBPF 的话关掉 TUN；一起开见「和 TUN 共存」
 tun:
@@ -461,9 +470,15 @@ CGO_ENABLED=0 GOARCH=amd64 go build -tags "with_gvisor with_ebpf" -o mihomo .
 
 ## eBPF 入站是怎么做的
 
-`local` 模式挂 cgroup BPF 程序（`connect4/6`、`sendmsg4/6`、`recvmsg4/6`），在 `connect()` 和 `sendmsg()` 的时候把目标地址改写成本机 loopback 上的一个重定向地址，原始目标存进 BPF map，mihomo 收到连接后再查回来。`shared` 模式挂 TC 程序在下联网卡的 ingress/egress 上，做同样的事情但是在包这一层。
+后端代码移植自 [CHIZI-0618/sing-box](https://github.com/CHIZI-0618/sing-box) 的 `testing-ebpf-tc-rewrite` 分支（经 TanakaLun 的 mihomo 适配层），是"一份策略 + 可选数据面"的结构：
 
-CN IP 直连是把规则集里的网段编译进两个 LPM trie（IPv4 一个、IPv6 一个），BPF 程序查表命中就直接返回放行，整个改写流程都不走。判断顺序是：DHCP → 端口 53（DNS）→ 保留地址 → 本机地址 → fake-ip → 私网 → bypass CIDR。DNS 排在 CIDR 前面，所以劫持 DNS 不受 bypass 影响。
+- **local 默认走 cgroup**：挂 `connect4/6`、`sendmsg4/6`、`recvmsg4/6`，在 `connect()` 和 `sendmsg()` 的时候把目标地址改写成本机 loopback 上的一个重定向地址（从 `127.128.0.0/9` 等候选里自动挑一个不和路由、网卡地址、fake-ip 段冲突的），原始目标存进 BPF map，mihomo 收到连接后再查回来。可选 `data-plane: tc`：在默认网卡 egress 上选包，改目的 MAC 后 `bpf_redirect` 进一对 veth，在对端 ingress 用 `bpf_sk_assign` 直接塞给内部监听 socket，配合自动分配的 fwmark / 路由表把包送进本机协议栈。
+- **shared 默认走 packet_rewrite**：在下联网卡 ingress 把目的地址改写到重定向地址，egress 再改回来，回程包的源地址也一起还原；可选 `socket_assign` 保留原始五元组、直接 `bpf_sk_assign`。
+- **自身流量识别**：mihomo 自己的 socket 通过 socket cookie 登记到一张 LRU map（进程独占 cgroup 时由 `sock_create/release` 钩子维护，否则由 dialer 建 socket 时登记），所有数据面在拦截前先查它，不再依赖 TGID 比对。
+- **进程归属**：可选的 cgroup 跟踪程序记下 cookie → pid/uid，用户态只读 `/proc/<pid>/exe` 就能给 `PROCESS-NAME` 规则用，不必扫全部进程的 fd。
+- **策略只编译一次**：UID 区间、源 CIDR/MAC、端口、fake-ip 段、DNS 模式编成一份不可变快照，各数据面编码进自己的 control map；`bypass-rule-set` 和 `fake-ip-range` 变化时同时刷进所有活着的后端。
+
+CN IP 直连是把规则集里的网段编译进两个 LPM trie（IPv4 一个、IPv6 一个），BPF 程序查表命中就直接返回放行，整个改写流程都不走。判断顺序是：自身 socket → 安全网关（分片、DHCP、保留地址）→ fake-ip 强制拦截 → DNS 模式 → UID / 源策略 → bypass 端口 → 本机地址 → 私网 → bypass CIDR。DNS 排在 CIDR 前面，所以劫持 DNS 不受 bypass 影响。
 
 ## 状态表与回收
 
@@ -479,19 +494,32 @@ CN IP 直连是把规则集里的网段编译进两个 LPM trie（IPv4 一个、
 
 ## 已修的问题
 
-**UDP 超时单位错误。** `udp-timeout` 的值被当成纳秒而不是秒用了，配置 300 实际是 300 纳秒，导致 UDP 状态每 5 秒左右被清空一次。
+**UDP 超时单位错误。** `udp-timeout` 的值被当成纳秒而不是秒用了，配置 300 实际是 300 纳秒，导致 UDP 状态每 5 秒左右被清空一次。上游重写后这个问题又回来了一次，这里再次修掉，并用测试钉死。
 
 **重定向表耗尽导致断流。** 重定向表原本是固定大小的 hash map，而 BPF 侧从不删除 TCP 表项。跑一段时间填满之后，`bpf_map_update_elem` 返回 `-E2BIG`，四次 token 尝试全部失败，`connect()` 直接被拒绝，从此每个新连接都失败，重启才恢复。改成 LRU 之后满了只淘汰最久未用的表项，不再拒绝新连接。
 
-**统计计数器索引撞车。** Go 侧的常量声明漏了 `iota`，UDP 的失败计数索引被写成了 0，和 TCP 共用一个槽位，读到的数是错的。
+**统计计数器索引撞车。** Go 侧的常量声明漏了 `iota`，UDP 的失败计数索引被写成了 0，和 TCP 共用一个槽位，读到的数是错的。（统计计数器随上游重写一起被移除，此条只作历史记录。）
 
-**TCP 连接路径上的多余查表。** `token_v4_attempt` / `token_v6_attempt` 对 TCP 会先查一次 UDP 表再查 TCP 表。协议是 key 的一部分，那次查询不可能命中，纯属浪费——每次 `connect()` 白算一次哈希，最坏四次。改成三目选表后，带 TCP 的程序共减少 230 条指令。
+**TCP 连接路径上的多余查表。** `token_v4_attempt` / `token_v6_attempt` 对 TCP 会先查一次 UDP 表再查 TCP 表。协议是 key 的一部分，那次查询不可能命中，纯属浪费——每次 `connect()` 白算一次哈希，最坏四次。上游最终的写法是按协议走两条静态路径（部分内核的 verifier 拒绝把动态选出的 map 指针传给 `bpf_map_lookup_elem`），已同步。
 
 **共享网络的回程 ARP。** `shared` 模式改写回程包源地址为 loopback 重定向地址，内核解析下联客户端 MAC 时会拿这个地址当 ARP sender，客户端的 `arp_process` 会把 sender 为 loopback 的 ARP 当 martian 丢掉，邻居表项一过期回程就间歇黑洞。修复是挂载期间把下联网卡的 `arp_announce` 提到 2，卸载时恢复。
 
-**两处内存泄漏。** 一是节点健康记录表的清扫挂在读路径上，而写路径无条件插入，配置里没开 `penalize-unstable` 时表只增不减；二是 TCX 挂载失败时的重试队列没有上限。
+**两处内存泄漏。** 一是节点健康记录表的清扫挂在读路径上，而写路径无条件插入，配置里没开 `penalize-unstable` 时表只增不减；二是 TCX 挂载失败时的重试队列没有上限（上游重写后挂载改为事件驱动的按网卡对账，不再有这个队列）。
 
-**诊断数据算了但没人看。** 清扫器每轮都算出状态表的占用率，`LookupAndDeleteMode()` 知道内核能不能回收，`ProbeKernel()` 会生成完整的内核能力报告——这三个都没有任何调用方。现在占用率超过 85% 会告警（70% 以下解除，避免抖动），内核能力报告在启动后打一次。断流那个 bug 之所以拖了那么久才被发现，就是因为这些降级路径全都"能用，只是没余量"，从外面看和健康状态一模一样。
+**诊断数据算了但没人看。** `ProbeKernel()` 会生成完整的内核能力报告，却没有任何调用方。现在内核能力报告在启动后打一次，列出当前内核缺哪些可选能力、各自意味着什么。共享流表的容量压力则由清扫器自己处理：占用超过 70% 进入加速清扫，回落到 50% 以下退出。断流那个 bug 之所以拖了那么久才被发现，就是因为这些降级路径全都"能用，只是没余量"，从外面看和健康状态一模一样。
+
+**fake-ip 段热更新与 TUN 共存。** 上游把 fake-ip 段编进一份启动时的不可变策略快照；这里保留了运行时更新——`fake-ip-range` 改了之后重编快照并推进所有活着的后端，后来才出现的下联网卡也按新段建后端——以及「和 TUN 共存」一节描述的整套路由排除 / 到达即直连机制，这两样 sing-box 侧都没有。
+
+## 与 sing-box 上游的同步
+
+eBPF 后端以 [CHIZI-0618/sing-box](https://github.com/CHIZI-0618/sing-box) 的 `testing-ebpf-tc-rewrite` 分支为准。该分支会 force-push 重写历史，所以同步时按 `common/ebpf/internal/bpfgen/manifest.txt` 里的源文件哈希和目录树对比，不看 commit 祖先。当前已同步到 `4af7ae48`，比 TanakaLun 分支多出这几个修复：
+
+- **自身流量误判**（`58cd212d`）：开启进程跟踪后 UID 策略位也写进 cookie 表，原来任何被跟踪的 socket 都会被当成 mihomo 自身而绕过；现在必须带 `SELF_BYPASS` 位才算，exclude 模式下的元数据取反也一并修正。
+- **cgroup token 分配**（`9f798e09`）：按协议走两条静态 map 路径，避开部分内核 verifier 对动态 map 指针的拒绝。
+- **Android netd 刷 clsact 后的 EINVAL**（`1820f646`）：删 filter 返回 EINVAL 时复查一次，确认已不存在就当删除成功，否则 TC 数据面会静默失效再也不重挂。
+- **fwmark 位被占满**（`4a8b08be`）：mark 位从 bit30 一路扫到 bit0，带 FRA_FWMASK 的规则只算 mask 位；解决 Android 上 netd 规则把高位占满导致分配失败。
+- **热点网卡重配置事务化**（`aaf7146b`）：先建候选挂载再提交，失败整体回滚，不再出现"旧的拆了新的没挂上"的半残状态。
+- 启动日志里打印解析后的 UID 区间（`4af7ae48`）。
 
 ## Tailscale
 
@@ -513,7 +541,8 @@ CN IP 直连是把规则集里的网段编译进两个 LPM trie（IPv4 一个、
 
 - [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) — 上游本体，[官方文档](https://wiki.metacubex.one/)
 - [vernesong/mihomo](https://github.com/vernesong/mihomo) — smart 内核（`type: smart` 策略组、LightGBM 权重模型、`policy-priority` 等）
-- [TanakaLun/mihomo](https://github.com/TanakaLun/mihomo/tree/ebpf-inbound) — eBPF 透明入站（移植自 sing-box 的 cilium/ebpf 后端）
+- [TanakaLun/mihomo](https://github.com/TanakaLun/mihomo/tree/ebpf-inbound) — eBPF 透明入站的 mihomo 适配层
+- [CHIZI-0618/sing-box](https://github.com/CHIZI-0618/sing-box/tree/testing-ebpf-tc-rewrite) — eBPF 后端本体（`common/ebpf`，统一 TC + cgroup 数据面）
 
 以及 mihomo 自身所站立的项目：
 

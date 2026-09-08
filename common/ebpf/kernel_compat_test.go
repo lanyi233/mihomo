@@ -11,7 +11,7 @@ func TestKnownUnsafeLPMTrieRelease(t *testing.T) {
 		unsafe  bool
 	}{
 		{"6.6.0", true},
-		{"6.6.30-android15-8-g9d08353fa520-abogki", true},
+		{"6.6.30-android15-8-g9d08353fa520", true},
 		{"6.6.46+", true},
 		{"6.6.47", false},
 		{"6.6.99-vendor", false},
@@ -20,7 +20,6 @@ func TestKnownUnsafeLPMTrieRelease(t *testing.T) {
 		{"6.6", false},
 		{"unknown", false},
 	} {
-		testCase := testCase
 		t.Run(testCase.release, func(t *testing.T) {
 			t.Parallel()
 			if unsafe := knownUnsafeLPMTrieRelease(testCase.release); unsafe != testCase.unsafe {

@@ -14,28 +14,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func (b *SharedNetworkBackend) LookupOriginal(
-	protocol uint8,
-	client netip.AddrPort,
-	tokenDestination netip.AddrPort,
-) (OriginalDestination, error) {
-	original, _, err := b.lookupFlow(protocol, client, tokenDestination, false)
-	return original, err
-}
-
 func (b *SharedNetworkBackend) LookupFlow(
 	protocol uint8,
 	client netip.AddrPort,
 	tokenDestination netip.AddrPort,
-) (OriginalDestination, *SharedNetworkFlowHandle, error) {
-	return b.lookupFlow(protocol, client, tokenDestination, true)
-}
-
-func (b *SharedNetworkBackend) lookupFlow(
-	protocol uint8,
-	client netip.AddrPort,
-	tokenDestination netip.AddrPort,
-	retain bool,
 ) (OriginalDestination, *SharedNetworkFlowHandle, error) {
 	if b == nil {
 		return OriginalDestination{}, nil, errBackendClosed
@@ -55,26 +37,19 @@ func (b *SharedNetworkBackend) lookupFlow(
 		unsafe.Pointer(&key),
 		unsafe.Pointer(&value),
 	); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			b.tokenLookupMisses.Add(1)
-		}
 		return OriginalDestination{}, nil, E.Cause(err, "lookup shared-network original destination")
 	}
 	address, err := sharedNetworkOriginalAddress(value)
 	if err != nil {
 		return OriginalDestination{}, nil, err
 	}
-	if retain {
-		b.flowAccess.Lock()
-		defer b.flowAccess.Unlock()
-	}
+	b.flowAccess.Lock()
+	defer b.flowAccess.Unlock()
 	flow := makeSharedNetworkFlowHandle(key, value)
 	if err = b.validateFlowGenerationLocked(flow); err != nil {
 		return OriginalDestination{}, nil, err
 	}
-	if retain {
-		b.retainFlowLocked(flow)
-	}
+	b.retainFlowLocked(flow)
 	return OriginalDestination{
 		Destination: netip.AddrPortFrom(address, value.Port),
 		SourceMAC:   sharedNetworkOriginalMAC(value),
@@ -288,18 +263,26 @@ func (b *SharedNetworkBackend) deferTCPFlowReleaseLocked(flow SharedNetworkFlowH
 	if b.flowReleases == nil {
 		b.flowReleases = make(map[SharedNetworkFlowHandle]time.Time)
 	}
-	b.flowReleases[flow] = now.Add(sharedNetworkTCPReleaseGrace)
+	deadline := now.Add(sharedNetworkTCPReleaseGrace)
+	b.flowReleases[flow] = deadline
+	if b.flowReleaseDeadline.IsZero() || deadline.Before(b.flowReleaseDeadline) {
+		b.flowReleaseDeadline = deadline
+	}
+	b.signalFlowWake()
+}
+
+func (b *SharedNetworkBackend) signalFlowWake() {
 	select {
-	case b.flowReleaseWake <- struct{}{}:
+	case b.flowWake <- struct{}{}:
 	default:
 	}
 }
 
-func (b *SharedNetworkBackend) TCPFlowReleaseWake() <-chan struct{} {
+func (b *SharedNetworkBackend) TCPFlowWake() <-chan struct{} {
 	if b == nil {
 		return nil
 	}
-	return b.flowReleaseWake
+	return b.flowWake
 }
 
 func (b *SharedNetworkBackend) NextTCPFlowReleaseDelay(now time.Time) (time.Duration, bool) {
@@ -308,16 +291,10 @@ func (b *SharedNetworkBackend) NextTCPFlowReleaseDelay(now time.Time) (time.Dura
 	}
 	b.flowAccess.Lock()
 	defer b.flowAccess.Unlock()
-	var earliest time.Time
-	for _, deadline := range b.flowReleases {
-		if earliest.IsZero() || deadline.Before(earliest) {
-			earliest = deadline
-		}
-	}
-	if earliest.IsZero() {
+	if b.flowReleaseDeadline.IsZero() {
 		return 0, false
 	}
-	return max(earliest.Sub(now), 0), true
+	return max(b.flowReleaseDeadline.Sub(now), 0), true
 }
 
 func (b *SharedNetworkBackend) validateFlowGenerationLocked(flow SharedNetworkFlowHandle) error {
@@ -327,13 +304,9 @@ func (b *SharedNetworkBackend) validateFlowGenerationLocked(flow SharedNetworkFl
 		unsafe.Pointer(&flow.originalKey),
 		unsafe.Pointer(&current),
 	); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			b.generationMisses.Add(1)
-		}
 		return E.Cause(err, "validate shared-network flow generation")
 	}
 	if current.Generation != flow.generation || current.TokenAddr != flow.listenerKey.TokenAddr {
-		b.generationMismatch.Add(1)
 		return E.Cause(unix.ENOENT, "shared-network flow generation changed")
 	}
 	return nil
@@ -390,6 +363,7 @@ func (b *SharedNetworkBackend) retainFlowLocked(flow SharedNetworkFlowHandle) {
 		b.flowReferences = make(map[SharedNetworkFlowHandle]uint32)
 	}
 	b.flowReferences[flow]++
+	b.signalFlowWake()
 }
 
 func (b *SharedNetworkBackend) FlushReleasedTCPFlows(now time.Time, budget uint32) (uint32, error) {
@@ -409,8 +383,17 @@ func (b *SharedNetworkBackend) FlushReleasedTCPFlows(now time.Time, budget uint3
 	var processed uint32
 	var removed uint32
 	var flushErr error
+	var earliest time.Time
+	budgetExhausted := false
 	for flow, deadline := range b.flowReleases {
-		if processed >= budget || now.Before(deadline) {
+		if processed >= budget {
+			budgetExhausted = true
+			break
+		}
+		if now.Before(deadline) {
+			if earliest.IsZero() || deadline.Before(earliest) {
+				earliest = deadline
+			}
 			continue
 		}
 		processed++
@@ -427,6 +410,11 @@ func (b *SharedNetworkBackend) FlushReleasedTCPFlows(now time.Time, budget uint3
 		if flowRemoved {
 			removed++
 		}
+	}
+	if budgetExhausted {
+		b.flowReleaseDeadline = now
+	} else {
+		b.flowReleaseDeadline = earliest
 	}
 	return removed, flushErr
 }
@@ -504,9 +492,6 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(
 		Usage:    MapUsage{Capacity: b.mapCapacity.Proxy},
 		Complete: scan.Complete,
 	}
-	if b.proxyUsageKnown.Load() {
-		result.Usage.Entries = b.proxyUsage.Load()
-	}
 	var sweepErr error
 	for _, entry := range b.flowSweepCandidates {
 		removed, retained, removeErr := b.removeOrphanedFlowCandidate(mapFD, entry)
@@ -530,8 +515,6 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(
 			result.Usage.Entries -= b.flowSweepRemoved
 		}
 		b.flowSweepRemoved = 0
-		b.proxyUsage.Store(result.Usage.Entries)
-		b.proxyUsageKnown.Store(true)
 	}
 	return result, sweepErr
 }
@@ -614,25 +597,6 @@ func (b *SharedNetworkBackend) removeOrphanedFlowCandidate(
 	return removed, false, err
 }
 
-func (b *SharedNetworkBackend) ProxyMapUsage() (MapUsage, error) {
-	if b == nil {
-		return MapUsage{}, errBackendClosed
-	}
-	b.access.RLock()
-	defer b.access.RUnlock()
-	if b.runtime == nil {
-		return MapUsage{}, errBackendClosed
-	}
-	usage := MapUsage{
-		Entries:  b.proxyUsage.Load(),
-		Capacity: b.mapCapacity.Proxy,
-	}
-	if !b.proxyUsageKnown.Load() {
-		return usage, unix.ENODATA
-	}
-	return usage, nil
-}
-
 func deleteMapIfExists(mapFD int, key unsafe.Pointer) error {
 	err := deleteMap(mapFD, key)
 	if errors.Is(err, unix.ENOENT) {
@@ -650,14 +614,11 @@ func (b *SharedNetworkBackend) TokenReservationFailures() (uint64, error) {
 	if b.runtime == nil {
 		return 0, errBackendClosed
 	}
-	return b.sharedNetworkStatisticLocked(sharedNetworkStatTokenReservationFailure)
-}
-
-func (b *SharedNetworkBackend) sharedNetworkStatisticLocked(index uint32) (uint64, error) {
 	statsMap := b.runtime.maps["shared_stats"]
 	if statsMap == nil {
 		return 0, errBackendClosed
 	}
+	var index uint32
 	var perCPU []uint64
 	if err := statsMap.Lookup(&index, &perCPU); err != nil {
 		return 0, err
@@ -667,36 +628,4 @@ func (b *SharedNetworkBackend) sharedNetworkStatisticLocked(index uint32) (uint6
 		total += value
 	}
 	return total, nil
-}
-
-func (b *SharedNetworkBackend) SharedNetworkStatistics() (SharedNetworkStatistics, error) {
-	if b == nil {
-		return SharedNetworkStatistics{}, errBackendClosed
-	}
-	b.access.RLock()
-	defer b.access.RUnlock()
-	if b.runtime == nil {
-		return SharedNetworkStatistics{}, errBackendClosed
-	}
-	var values [8]uint64
-	for index := range values {
-		value, err := b.sharedNetworkStatisticLocked(uint32(index))
-		if err != nil {
-			return SharedNetworkStatistics{}, err
-		}
-		values[index] = value
-	}
-	return SharedNetworkStatistics{
-		TokenReservationFailures: values[sharedNetworkStatTokenReservationFailure],
-		TokenPublishRetries:      values[sharedNetworkStatTokenPublishRetry],
-		OriginalPublishFailures:  values[sharedNetworkStatOriginalPublishFailure],
-		EgressFlowMisses:         values[sharedNetworkStatEgressFlowMiss],
-		SocketAssignments:        values[sharedNetworkStatSocketAssignment],
-		SocketAssignFailures:     values[sharedNetworkStatSocketAssignFailure],
-		UDPSocketAssignments:     values[sharedNetworkStatUDPSocketAssignment],
-		UDPSocketAssignFailures:  values[sharedNetworkStatUDPSocketAssignFailure],
-		TokenLookupMisses:        b.tokenLookupMisses.Load(),
-		GenerationLookupMisses:   b.generationMisses.Load(),
-		GenerationMismatches:     b.generationMismatch.Load(),
-	}, nil
 }
