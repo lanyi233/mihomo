@@ -474,7 +474,8 @@ INLINE bool fill_ipv4_key(void *data, void *data_end, __u32 l3_offset,
     return true;
 }
 
-INLINE bool fill_ipv6_key(void *data, void *data_end, __u32 l3_offset,
+/* Keep extension-header pointer bounds local for Linux 5.4 verifiers. */
+NOINLINE bool fill_ipv6_key(void *data, void *data_end, __u32 l3_offset,
     const struct sb_tc_control *control, struct sb_tc_assign_key *key) {
     struct ipv6_header *ip = data + l3_offset;
     if ((void *)(ip + 1) > data_end || (network_order32(ip->version_flow) >> 28U) != 6U) return false;

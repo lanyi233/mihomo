@@ -22,11 +22,11 @@ func countMapEntries(fd int, keySize uintptr, maxEntries uint32) (uint32, error)
 	if keySize == 0 || keySize > uintptr(^uint(0)>>1) {
 		return 0, errors.New("invalid BPF map key size")
 	}
-	var key []byte
+	var key any
 	var count uint32
 	for {
 		next, nextErr := mapInstance.NextKeyBytes(key)
-		if errors.Is(nextErr, unix.ENOENT) {
+		if errors.Is(nextErr, unix.ENOENT) || (nextErr == nil && next == nil) {
 			return count, nil
 		}
 		if nextErr != nil {

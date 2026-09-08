@@ -192,6 +192,9 @@ func (v policyVector) sharedFlags() uint32 {
 	if v.BypassFlowCache {
 		flags |= sharedNetworkFlagBypassFlowCache
 	}
+	if v.SharedBypassPort {
+		flags |= sharedNetworkFlagBypassPort
+	}
 	if v.FakeIPIPv4 {
 		flags |= sharedNetworkFlagFakeIPIPv4
 	}

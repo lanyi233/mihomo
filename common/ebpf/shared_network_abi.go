@@ -129,7 +129,7 @@ const (
 	sharedNetworkFlagExcludeSourceMAC
 	sharedNetworkFlagBypassPrivateAddress
 	sharedNetworkFlagBypassFlowCache
-	_
+	sharedNetworkFlagBypassPort
 	sharedNetworkFlagFakeIPIPv4
 	sharedNetworkFlagFakeIPIPv6
 )

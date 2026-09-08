@@ -41,11 +41,11 @@ func eBPFOperationError(operation string, err error) error {
 	if errors.As(err, &errno) {
 		switch errno {
 		case unix.EBUSY:
-			return E.Cause(errno, "another eBPF inbound is already active on this attach point: ", operation)
+			return E.Cause(err, "another eBPF inbound is already active on this attach point: ", operation)
 		case unix.ENOSYS, unix.EINVAL, unix.EOPNOTSUPP, linuxErrnoNotSupported:
-			return E.Cause(errno, "eBPF inbound is not supported by this kernel: ", operation)
+			return E.Cause(err, "eBPF inbound is not supported by this kernel: ", operation)
 		case unix.EPERM, unix.EACCES:
-			return E.Cause(errno, "eBPF inbound is not permitted on this device: ", operation)
+			return E.Cause(err, "eBPF inbound is not permitted on this device: ", operation)
 		}
 	}
 	return E.Cause(err, operation)

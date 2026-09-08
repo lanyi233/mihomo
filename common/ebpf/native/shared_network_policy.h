@@ -57,7 +57,11 @@ INLINE bool source_mac_selected(const __u8 source[6], __u32 flags) {
         map_lookup(&shared_include_source_mac, &key) != 0;
 }
 
-INLINE bool shared_port_bypassed(__u8 protocol, __u16 destination_port) {
+INLINE bool shared_port_bypassed(
+    __u8 protocol,
+    __u16 destination_port,
+    const struct sb_shared_control *control) {
+    if ((control->flags & SB_SHARED_FLAG_BYPASS_PORT) == 0U) return false;
     struct sb_shared_port_key key = {
         .protocol = protocol,
         .port = destination_port,
@@ -83,7 +87,7 @@ INLINE bool ipv6_client_selected(
     return source_mac_selected(source_mac, flags) && ipv6_source_selected(source, flags);
 }
 
-NOINLINE __u8 shared_dns_policy(
+INLINE __u8 shared_dns_policy(
     __u8 protocol,
     __u16 source_port,
     __u16 destination_port,
@@ -95,27 +99,28 @@ NOINLINE __u8 shared_dns_policy(
     return SB_SHARED_POLICY_RESPECT_SOURCE;
 }
 
-NOINLINE __u8 ipv4_policy(
+INLINE __u8 ipv4_policy(
     const __u8 destination[4],
     __u8 protocol,
     __u16 source_port,
     __u16 destination_port,
     const struct sb_shared_control *control) {
     if (sb_ebpf_ipv4_safety_bypass(destination)) return SB_SHARED_POLICY_BYPASS;
+    bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv4(
+        destination,
+        control->flags,
+        SB_SHARED_FLAG_FAKEIP_IPV4,
+        control->fakeip_ipv4_prefix,
+        control->fakeip_ipv4_mask);
+    if (!force_fakeip && (control->flags & SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
+        sb_ebpf_ipv4_private_address(destination)) return SB_SHARED_POLICY_BYPASS;
     __u32 map_policy_flags = control->flags &
         (SB_SHARED_FLAG_HOST_IPV4 | SB_SHARED_FLAG_BYPASS_IPV4);
     struct sb_lpm4_key key = {.prefixlen = 32U};
     __builtin_memcpy(key.addr, destination, 4U);
     if ((map_policy_flags & SB_SHARED_FLAG_HOST_IPV4) != 0U &&
         map_lookup(&shared_host_ipv4, &key) != 0) return SB_SHARED_POLICY_BYPASS;
-    if (sb_ebpf_must_intercept_fakeip_ipv4(
-        destination,
-        control->flags,
-        SB_SHARED_FLAG_FAKEIP_IPV4,
-        control->fakeip_ipv4_prefix,
-        control->fakeip_ipv4_mask)) return SB_SHARED_POLICY_PROXY;
-    if ((control->flags & SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
-        sb_ebpf_ipv4_private_address(destination)) return SB_SHARED_POLICY_BYPASS;
+    if (force_fakeip) return SB_SHARED_POLICY_PROXY;
     if (map_policy_flags == 0U) return SB_SHARED_POLICY_PROXY;
     if ((map_policy_flags & SB_SHARED_FLAG_BYPASS_IPV4) == 0U) return SB_SHARED_POLICY_PROXY;
     return map_lookup(&shared_bypass_ipv4, &key) == 0
@@ -123,13 +128,21 @@ NOINLINE __u8 ipv4_policy(
         : SB_SHARED_POLICY_CACHE_BYPASS;
 }
 
-NOINLINE __u8 ipv6_policy(
+INLINE __u8 ipv6_policy(
     const __u8 destination[16],
     __u8 protocol,
     __u16 source_port,
     __u16 destination_port,
     const struct sb_shared_control *control) {
     if (sb_ebpf_ipv6_safety_bypass(destination)) return SB_SHARED_POLICY_BYPASS;
+    bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv6(
+        destination,
+        control->flags,
+        SB_SHARED_FLAG_FAKEIP_IPV6,
+        control->fakeip_ipv6_prefix,
+        control->fakeip_ipv6_mask);
+    if (!force_fakeip && (control->flags & SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
+        sb_ebpf_ipv6_private_address(destination)) return SB_SHARED_POLICY_BYPASS;
     __u32 map_policy_flags = control->flags &
         (SB_SHARED_FLAG_HOST_IPV6 | SB_SHARED_FLAG_BYPASS_IPV6);
     struct sb_lpm6_key key = {.prefixlen = 128U};
@@ -137,14 +150,7 @@ NOINLINE __u8 ipv6_policy(
     if ((map_policy_flags & SB_SHARED_FLAG_HOST_IPV6) != 0U && map_lookup(&shared_host_ipv6, &key) != 0) {
         return SB_SHARED_POLICY_BYPASS;
     }
-    if (sb_ebpf_must_intercept_fakeip_ipv6(
-        destination,
-        control->flags,
-        SB_SHARED_FLAG_FAKEIP_IPV6,
-        control->fakeip_ipv6_prefix,
-        control->fakeip_ipv6_mask)) return SB_SHARED_POLICY_PROXY;
-    if ((control->flags & SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
-        sb_ebpf_ipv6_private_address(destination)) return SB_SHARED_POLICY_BYPASS;
+    if (force_fakeip) return SB_SHARED_POLICY_PROXY;
     if (map_policy_flags == 0U) return SB_SHARED_POLICY_PROXY;
     if ((map_policy_flags & SB_SHARED_FLAG_BYPASS_IPV6) == 0U) return SB_SHARED_POLICY_PROXY;
     return map_lookup(&shared_bypass_ipv6, &key) == 0

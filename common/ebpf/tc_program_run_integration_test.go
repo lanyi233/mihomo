@@ -4,12 +4,17 @@ package ebpf
 
 import (
 	"encoding/binary"
+	"errors"
+	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"net/netip"
 	"testing"
 )
 
 func TestTCProgramRunIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "run unified TC eBPF programs in the kernel")
+	requireTCSocketAssignment(t)
 	policy, err := CompilePolicy(PolicyConfig{
 		EnableTCP:           true,
 		SharedDNSMode:       DNSModeRespectPolicy,
@@ -94,6 +99,7 @@ func TestTCProgramRunIntegration(t *testing.T) {
 
 func TestTCIPv6PathIsolationIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "verify TC eBPF IPv6 path isolation")
+	requireTCSocketAssignment(t)
 	packet := testIPv6TCPPacket(
 		netip.MustParseAddr("2001:db8::10"), netip.MustParseAddr("2001:4860:4860::8888"), 53000, 443, nil,
 	)
@@ -148,6 +154,7 @@ func TestTCIPv6PathIsolationIntegration(t *testing.T) {
 
 func TestTCFragmentPolicyIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "verify TC eBPF fragment policy")
+	requireTCSocketAssignment(t)
 	backend, err := PrepareTC(TCConfig{
 		ListenerPort:     65531,
 		EnableShared:     true,
@@ -204,5 +211,16 @@ func TestTCFragmentPolicyIntegration(t *testing.T) {
 				t.Fatalf("unexpected action: %d != %d", action, testCase.wantAction)
 			}
 		})
+	}
+}
+
+func requireTCSocketAssignment(t *testing.T) {
+	t.Helper()
+	err := features.HaveProgramHelper(CiliumEBPF.SchedCLS, asm.FnSkAssign)
+	if errors.Is(err, CiliumEBPF.ErrNotSupported) {
+		t.Skip("kernel lacks bpf_sk_assign; socket-assignment data plane requires Linux 5.9 or a backport")
+	}
+	if err != nil {
+		t.Fatalf("probe bpf_sk_assign: %v", err)
 	}
 }

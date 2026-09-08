@@ -63,10 +63,20 @@ func TestPolicyVectorEncodesEachDataPlane(t *testing.T) {
 		sharedNetworkFlagIncludeSource, sharedNetworkFlagExcludeSource,
 		sharedNetworkFlagIncludeSourceMAC, sharedNetworkFlagExcludeSourceMAC,
 		sharedNetworkFlagBypassPrivateAddress, sharedNetworkFlagBypassFlowCache,
+		sharedNetworkFlagBypassPort,
 		sharedNetworkFlagFakeIPIPv4, sharedNetworkFlagFakeIPIPv6,
 	} {
 		if shared&bit == 0 {
 			t.Fatalf("shared vector omitted flag %#x: %#x", bit, shared)
 		}
+	}
+}
+
+func TestPolicyVectorSharedBypassPortPresence(t *testing.T) {
+	if flags := (policyVector{}).sharedFlags(); flags&sharedNetworkFlagBypassPort != 0 {
+		t.Fatalf("empty shared bypass-port policy set flag: %#x", flags)
+	}
+	if flags := (policyVector{SharedBypassPort: true}).sharedFlags(); flags&sharedNetworkFlagBypassPort == 0 {
+		t.Fatalf("populated shared bypass-port policy omitted flag: %#x", flags)
 	}
 }

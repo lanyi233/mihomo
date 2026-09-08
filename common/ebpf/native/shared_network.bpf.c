@@ -72,8 +72,6 @@ static __u64 (*ktime_get_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 static __s64 (*csum_diff)(const __be32 *from, __u32 from_size, const __be32 *to, __u32 to_size, __wsum seed) =
     (void *)BPF_FUNC_csum_diff;
 static long (*skb_pull_data)(struct __sk_buff *skb, __u32 length) = (void *)BPF_FUNC_skb_pull_data;
-static long (*skb_store_bytes)(struct __sk_buff *skb, __u32 offset, const void *from, __u32 length, __u64 flags) =
-    (void *)BPF_FUNC_skb_store_bytes;
 static long (*l3_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to, __u64 flags) =
     (void *)BPF_FUNC_l3_csum_replace;
 static long (*l4_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to, __u64 flags) =
@@ -102,9 +100,12 @@ INLINE __u32 swap32(__u32 value) {
 }
 
 INLINE void copy_address(__u8 destination[16], const __u8 source[16], __u32 size) {
-#pragma clang loop unroll(full)
-    for (__u32 index = 0U; index < 16U; ++index) {
-        if (index < size) destination[index] = source[index];
+    if (size == 16U) {
+        __builtin_memcpy(destination, source, 16U);
+    } else if (size == 8U) {
+        __builtin_memcpy(destination, source, 8U);
+    } else {
+        __builtin_memcpy(destination, source, 4U);
     }
 }
 
@@ -176,7 +177,7 @@ NOINLINE int ingress_ipv4(
             return SB_SHARED_ACT_CONTINUE;
         }
         if (!respect_source) {
-            if (shared_port_bypassed(ip->protocol, destination_port)) {
+            if (shared_port_bypassed(ip->protocol, destination_port, control)) {
                 cache_bypass(scratch, ip->protocol, tcp_sequence);
                 return SB_SHARED_ACT_CONTINUE;
             }
@@ -245,9 +246,6 @@ NOINLINE int egress_ipv4(
         return TC_ACT_SHOT;
     }
     __u32 header_length = (__u32)ip->ihl * 4U;
-    __u32 zero = 0U;
-    struct sb_shared_scratch *scratch = map_lookup(&shared_scratch, &zero);
-    if (scratch == 0) return TC_ACT_SHOT;
     struct transport_ports *ports = (void *)ip + header_length;
     if ((void *)(ports + 1) > data_end) return TC_ACT_SHOT;
     if (swap16(ports->source) != control->listener_port) return SB_SHARED_ACT_CONTINUE;
@@ -272,22 +270,21 @@ NOINLINE int egress_ipv4(
         return TC_ACT_SHOT;
     }
 
-    __builtin_memset(&scratch->listener_key, 0, sizeof(scratch->listener_key));
-    scratch->listener_key.family = AF_INET_VALUE;
-    scratch->listener_key.protocol = ip->protocol;
-    scratch->listener_key.client_port = swap16(ports->destination);
-    scratch->listener_key.listener_port = control->listener_port;
-    __builtin_memcpy(scratch->listener_key.client_addr, &ip->destination, 4U);
-    __builtin_memcpy(scratch->listener_key.token_addr, &ip->source, 4U);
+    struct sb_shared_listener_key listener_key = {};
+    listener_key.family = AF_INET_VALUE;
+    listener_key.protocol = ip->protocol;
+    listener_key.client_port = swap16(ports->destination);
+    listener_key.listener_port = control->listener_port;
+    __builtin_memcpy(listener_key.client_addr, &ip->destination, 4U);
+    __builtin_memcpy(listener_key.token_addr, &ip->source, 4U);
     struct sb_shared_original_value *original = map_lookup(
         &shared_flow_by_token,
-        &scratch->listener_key);
+        &listener_key);
     if (original == 0 || original->ifindex != skb->ifindex) {
         return TC_ACT_SHOT;
     }
-    __builtin_memcpy(&scratch->original_value, original, sizeof(scratch->original_value));
     __be32 original_address;
-    __builtin_memcpy(&original_address, scratch->original_value.addr, 4U);
+    __builtin_memcpy(&original_address, original->addr, 4U);
     return rewrite_ipv4(
         skb,
         l3_offset,
@@ -296,7 +293,7 @@ NOINLINE int egress_ipv4(
         ip->source,
         original_address,
         ports->source,
-        swap16(scratch->original_value.port),
+        swap16(original->port),
         ip->protocol);
 }
 
@@ -401,8 +398,8 @@ NOINLINE int ingress_ipv6(
     scratch->original.original_port = destination_port;
     __builtin_memcpy(scratch->source_mac.address, &source_mac_first, 4U);
     __builtin_memcpy(scratch->source_mac.address + 4U, &source_mac_last, 2U);
-    copy_address(scratch->original.client_addr, ip->source, 16U);
-    copy_address(scratch->original.original_addr, ip->destination, 16U);
+    __builtin_memcpy(scratch->original.client_addr, ip->source, 16U);
+    __builtin_memcpy(scratch->original.original_addr, ip->destination, 16U);
     __u8 dns_policy = shared_dns_policy(
         protocol, source_port, destination_port, control);
     if (dns_policy == SB_SHARED_POLICY_BYPASS) {
@@ -421,7 +418,7 @@ NOINLINE int ingress_ipv6(
             return SB_SHARED_ACT_CONTINUE;
         }
         if (!respect_source) {
-            if (shared_port_bypassed(protocol, destination_port)) {
+            if (shared_port_bypassed(protocol, destination_port, control)) {
                 cache_bypass(scratch, protocol, tcp_sequence);
                 return SB_SHARED_ACT_CONTINUE;
             }
@@ -505,9 +502,6 @@ NOINLINE int egress_ipv6(
     }
     transport &= IPV6_TRANSPORT_MASK;
     if (!selected_protocol(protocol, control)) return TC_ACT_SHOT;
-    __u32 zero = 0U;
-    struct sb_shared_scratch *scratch = map_lookup(&shared_scratch, &zero);
-    if (scratch == 0) return TC_ACT_SHOT;
     struct transport_ports *ports = data + transport;
     if ((void *)(ports + 1) > data_end) return TC_ACT_SHOT;
     __be16 source_port_raw = ports->source;
@@ -543,29 +537,28 @@ NOINLINE int egress_ipv6(
         return TC_ACT_SHOT;
     }
 
-    __builtin_memset(&scratch->listener_key, 0, sizeof(scratch->listener_key));
-    scratch->listener_key.family = AF_INET6_VALUE;
-    scratch->listener_key.protocol = protocol;
-    scratch->listener_key.client_port = swap16(destination_port_raw);
-    scratch->listener_key.listener_port = control->listener_port;
-    copy_address(scratch->listener_key.client_addr, ip->destination, 16U);
-    copy_address(scratch->listener_key.token_addr, ip->source, 16U);
+    struct sb_shared_listener_key listener_key = {};
+    listener_key.family = AF_INET6_VALUE;
+    listener_key.protocol = protocol;
+    listener_key.client_port = swap16(destination_port_raw);
+    listener_key.listener_port = control->listener_port;
+    __builtin_memcpy(listener_key.client_addr, ip->destination, 16U);
+    __builtin_memcpy(listener_key.token_addr, ip->source, 16U);
     struct sb_shared_original_value *original = map_lookup(
         &shared_flow_by_token,
-        &scratch->listener_key);
+        &listener_key);
     if (original == 0 || original->ifindex != skb->ifindex) {
         return TC_ACT_SHOT;
     }
-    __builtin_memcpy(&scratch->original_value, original, sizeof(scratch->original_value));
     return rewrite_ipv6(
         skb,
         l3_offset,
         transport,
         true,
-        scratch->listener_key.token_addr,
-        scratch->original_value.addr,
+        listener_key.token_addr,
+        original->addr,
         source_port_raw,
-        swap16(scratch->original_value.port),
+        swap16(original->port),
         protocol);
 }
 

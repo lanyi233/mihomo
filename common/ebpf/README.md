@@ -207,7 +207,7 @@ make -C common/ebpf check
 Run correctness and ABI tests with:
 
 ```bash
-go test -tags with_ebpf ./common/ebpf ./protocol/ebpf
+go test -tags with_ebpf ./common/ebpf ./listener/sing_ebpf
 ```
 
 Kernel program and attachment tests require Linux root privileges and explicit
@@ -215,5 +215,8 @@ opt-in:
 
 ```bash
 sudo env SING_BOX_EBPF_INTEGRATION=1 \
-  go test -tags 'with_ebpf ebpf_integration' ./common/ebpf ./protocol/ebpf
+  go test -tags 'with_ebpf ebpf_integration' ./common/ebpf ./listener/sing_ebpf
 ```
+
+See [Android 5.4 validation](../../docs/ebpf-validation.md) for device results,
+capability-dependent skips, and Android test commands.

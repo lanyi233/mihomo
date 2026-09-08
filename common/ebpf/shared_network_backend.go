@@ -202,6 +202,7 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		EnableIPv4:          redirectIPv4.IsValid(),
 		EnableSharedIPv6:    redirectIPv6.IsValid(),
 		SharedBypassPrivate: policy.sharedBypassPrivate,
+		SharedBypassPort:    len(policy.sharedBypassPortEntries) > 0,
 		IncludeSource:       len(policy.includeSource.ipv4)+len(policy.includeSource.ipv6) > 0,
 		ExcludeSource:       len(policy.excludeSource.ipv4)+len(policy.excludeSource.ipv6) > 0,
 		IncludeSourceMAC:    len(policy.includeSourceMAC) > 0,
