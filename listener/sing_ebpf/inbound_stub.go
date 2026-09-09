@@ -13,14 +13,14 @@ import (
 )
 
 // Listener is the eBPF inbound listener. It is only available when the
-// binary is built for linux/android with cgo and the `with_ebpf` build tag.
+// binary is built for linux/android with the `with_ebpf` build tag.
 type Listener interface {
 	Close() error
 	Address() string
 }
 
-// New creates an eBPF inbound. Without the `with_ebpf` build tag and cgo the
-// feature is unavailable and this returns an error.
+// New creates an eBPF inbound. Without the `with_ebpf` build tag the feature
+// is unavailable and this returns an error.
 func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inbound.Addition) (Listener, error) {
-	return nil, E.New("eBPF inbound requires cgo and the with_ebpf build tag on linux/android")
+	return nil, E.New("eBPF inbound requires the with_ebpf build tag on linux/android")
 }

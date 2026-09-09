@@ -281,7 +281,7 @@ runner with cgroup v2, root access, and bpftool:
 
 ```bash
 bash common/ebpf/check-kernel.sh --mode all --cgroup /sys/fs/cgroup
-SING_BOX_EBPF_INTEGRATION=1 CGO_ENABLED=1 go test -count=1 \
+SING_BOX_EBPF_INTEGRATION=1 CGO_ENABLED=0 go test -count=1 \
   -tags "with_gvisor with_ebpf ebpf_integration" \
   ./common/ebpf/... -run Integration
 ```

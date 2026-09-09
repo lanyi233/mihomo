@@ -144,8 +144,8 @@ jobs:
 
         # The eBPF inbound is gated behind with_ebpf, and the release builds
         # never passed it -- so every published binary answered a configured
-        # eBPF listener with "eBPF inbound requires cgo and the with_ebpf build
-        # tag" and started without it. That also silently downgraded anyone who
+        # eBPF listener with "eBPF inbound requires the with_ebpf build tag"
+        # and started without it. That also silently downgraded anyone who
         # self-upgraded through POST /upgrade, which points at this repository.
         # The tag only has an effect on linux and android; elsewhere it selects
         # the same stub an untagged build already gets, so scope it.
