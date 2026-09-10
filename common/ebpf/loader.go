@@ -12,16 +12,42 @@ import (
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"golang.org/x/sys/unix"
 )
 
 const bpfFlagNoPrealloc = 1
 
-var (
-	loadCgroup        = BPFGen.LoadCgroup
-	loadSharedNetwork = BPFGen.LoadSharedNetwork
-	loadSplice        = BPFGen.LoadSplice
-)
+var loadTC = BPFGen.LoadTC
+
+var loadCgroup = BPFGen.LoadCgroup
+
+var loadCgroupCoarse = BPFGen.LoadCgroupCoarse
+
+var loadCgroupStorage = BPFGen.LoadCgroupStorage
+
+var loadSharedNetwork = BPFGen.LoadSharedNetwork
+
+func attachProgramRaw(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
+	if err := link.RawAttachProgram(link.RawAttachProgramOptions{Target: target, Program: program, Attach: attachType, Flags: 2}); err == nil {
+		return nil
+	}
+	return link.RawAttachProgram(link.RawAttachProgramOptions{Target: target, Program: program, Attach: attachType})
+}
+
+func rawDetachProgram(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
+	return link.RawDetachProgram(link.RawDetachProgramOptions{Target: target, Program: program, Attach: attachType})
+}
+
+func sameProgramIDs(left, right []CiliumEBPF.ProgramID) bool {
+	return slices.Equal(left, right)
+}
+
+func verifierErrorStage(err error) string {
+	var verifierErr *CiliumEBPF.VerifierError
+	if errors.As(err, &verifierErr) {
+		return fmt.Sprintf("verifier rejected program: %v", verifierErr)
+	}
+	return ""
+}
 
 type programSelection struct {
 	section string
@@ -50,7 +76,8 @@ func loadObjectMaps(
 			delete(spec.Maps, name)
 			continue
 		}
-		if override.name == "" || override.mapType == CiliumEBPF.UnspecifiedMap || override.maxEntries == 0 {
+		if override.name == "" || override.mapType == CiliumEBPF.UnspecifiedMap ||
+			(override.maxEntries == 0 && override.mapType != CiliumEBPF.SkStorage) {
 			return nil, E.New("invalid eBPF map override for ", name)
 		}
 		mapSpec.Name = override.name
@@ -66,7 +93,7 @@ func loadObjectMaps(
 	}
 	collection, err := CiliumEBPF.NewCollection(spec)
 	if err != nil {
-		return nil, E.Cause(err, "create eBPF maps")
+		return nil, eBPFOperationError("create eBPF maps", err)
 	}
 	maps := make(map[string]*CiliumEBPF.Map, len(collection.Maps))
 	for name, mapInstance := range collection.Maps {
@@ -77,32 +104,19 @@ func loadObjectMaps(
 	return maps, nil
 }
 
-func newRuntimeMap(
-	name string,
-	mapType CiliumEBPF.MapType,
-	keySize uint32,
-	valueSize uint32,
-	maxEntries uint32,
-	flags uint32,
-) (*CiliumEBPF.Map, error) {
-	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
-		Name:       name,
-		Type:       mapType,
-		KeySize:    keySize,
-		ValueSize:  valueSize,
-		MaxEntries: maxEntries,
-		Flags:      flags,
-	})
-	if err != nil {
-		return nil, E.Cause(err, "create ", name, " eBPF map")
-	}
-	return mapInstance, nil
-}
-
 func loadObjectPrograms(
 	loadSpec func() (*CiliumEBPF.CollectionSpec, error),
 	maps map[string]*CiliumEBPF.Map,
 	selections []programSelection,
+) ([]*CiliumEBPF.Program, error) {
+	return loadObjectProgramsWithOptions(loadSpec, maps, selections, CiliumEBPF.ProgramOptions{})
+}
+
+func loadObjectProgramsWithOptions(
+	loadSpec func() (*CiliumEBPF.CollectionSpec, error),
+	maps map[string]*CiliumEBPF.Map,
+	selections []programSelection,
+	programOptions CiliumEBPF.ProgramOptions,
 ) ([]*CiliumEBPF.Program, error) {
 	spec, err := loadSpec()
 	if err != nil {
@@ -153,9 +167,10 @@ func loadObjectPrograms(
 	}
 	collection, err := CiliumEBPF.NewCollectionWithOptions(spec, CiliumEBPF.CollectionOptions{
 		MapReplacements: maps,
+		Programs:        programOptions,
 	})
 	if err != nil {
-		return nil, E.Cause(err, "load eBPF programs")
+		return nil, eBPFOperationError("load eBPF programs", err)
 	}
 	programs := make([]*CiliumEBPF.Program, len(selections))
 	for index, symbol := range programSymbols {
@@ -172,11 +187,11 @@ func loadObjectPrograms(
 
 func closePrograms(programs []*CiliumEBPF.Program) error {
 	var closeErr error
-	for index := len(programs) - 1; index >= 0; index-- {
-		if programs[index] == nil {
+	for index, program := range slices.Backward(programs) {
+		if program == nil {
 			continue
 		}
-		closeErr = E.Errors(closeErr, programs[index].Close())
+		closeErr = E.Errors(closeErr, program.Close())
 		programs[index] = nil
 	}
 	return closeErr
@@ -192,46 +207,4 @@ func closeMaps(maps map[string]*CiliumEBPF.Map) error {
 		delete(maps, name)
 	}
 	return closeErr
-}
-
-func attachProgramRaw(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
-	const allowMulti = 2
-	err := rawAttachProgram(target, program, attachType, allowMulti)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.EPERM) &&
-		!errors.Is(err, unix.ENOTSUP) && !errors.Is(err, unix.EOPNOTSUPP) {
-		return err
-	}
-	return rawAttachProgram(target, program, attachType, 0)
-}
-
-func rawAttachProgram(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType, flags uint32) error {
-	return link.RawAttachProgram(link.RawAttachProgramOptions{
-		Target:  target,
-		Program: program,
-		Attach:  attachType,
-		Flags:   flags,
-	})
-}
-
-func rawDetachProgram(target int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
-	return link.RawDetachProgram(link.RawDetachProgramOptions{
-		Target:  target,
-		Program: program,
-		Attach:  attachType,
-	})
-}
-
-func sameProgramIDs(left, right []CiliumEBPF.ProgramID) bool {
-	return slices.Equal(left, right)
-}
-
-func verifierErrorStage(err error) string {
-	var verifierErr *CiliumEBPF.VerifierError
-	if errors.As(err, &verifierErr) {
-		return fmt.Sprintf("verifier rejected program: %v", verifierErr)
-	}
-	return ""
 }

@@ -19,9 +19,9 @@ const tunOverlapWarningInterval = 10 * time.Minute
 // publishBypassPolicyLocked republishes the effective bypass policy and reports
 // any bypassed destination a running TUN listener has taken over.
 //
-// Bypassing a destination in eBPF only means the socket keeps its original
-// destination: the packet still follows the routing table, and TUN auto-route
-// points that table at the TUN device. A bypassed destination that TUN claims is
+// Bypassing a destination in eBPF only means the packet keeps its original
+// destination: it still follows the routing table, and TUN auto-route points
+// that table at the TUN device. A bypassed destination that TUN claims is
 // therefore not direct at all -- it is proxied by whatever the rule engine
 // picks, which is a black hole for a LAN or otherwise proxy-unreachable address
 // whenever the rules have no direct rule covering it.
@@ -35,11 +35,14 @@ const tunOverlapWarningInterval = 10 * time.Minute
 //
 // The caller holds bypassRuleSetAccess.
 func (i *Inbound) publishBypassPolicyLocked() {
+	if i.bypassPublisher == nil {
+		return
+	}
 	var routeExclude []netip.Prefix
-	if i.bypassPrivateAddress {
+	if i.bypassesPrivateAddress() {
 		routeExclude = ECommon.PrivateAddressPrefixes()
 	}
-	prefixes := i.effectiveBypassPrefixesLocked(routeExclude)
+	prefixes := effectiveBypassPrefixes(routeExclude, i.bypassCIDR)
 	i.bypassPublisher.Publish(i.dnsBypassSet, prefixes, routeExclude, i.bypassTUNDirect)
 	claimed := resolver.TunClaimedPrefixes(prefixes)
 	if len(claimed) == 0 {
@@ -49,6 +52,19 @@ func (i *Inbound) publishBypassPolicyLocked() {
 		tunOverlapLogger(i.bypassTUNDirect),
 		resolver.TunBypassOverlapMessage(claimed, i.bypassTUNDirect),
 	)
+}
+
+// bypassesPrivateAddress reports whether any enabled data plane lets private
+// destinations past the redirect. The local and shared roles carry their own
+// switch, and either one alone is enough to need the route exclusion: a
+// forwarded packet the shared program bypasses and a local socket the cgroup
+// program bypasses both end up in the routing table with their real
+// destination, which is exactly where TUN auto-route would claim them.
+func (i *Inbound) bypassesPrivateAddress() bool {
+	if i.localEnabled && i.localPolicy.BypassPrivateAddress {
+		return true
+	}
+	return i.sharedEnabled && i.sharedBypassPrivate
 }
 
 // An overlap that is already handled on arrival is worth knowing about -- those
@@ -61,17 +77,15 @@ func tunOverlapLogger(tunDirect bool) warningLogger {
 	return log.Warnln
 }
 
-// effectiveBypassPrefixesLocked joins the private ranges the caller already
+// effectiveBypassPrefixes joins the private ranges the caller already
 // materialised with the resolved bypass_rule_set CIDRs, so the fixed list is
 // cloned once per publish rather than once per use.
 //
 // The full slice expression caps privateRanges at its own length, so appending a
 // CIDR always allocates rather than writing into an array the caller still holds
-// and hands to Publish itself. Today's private list has no spare capacity to
-// write into anyway, so that cap is a guard against the list growing, not a
-// saving. With no CIDRs to add the result aliases privateRanges instead, which
-// is safe only because the registry treats every slice it is handed as
-// read-only.
-func (i *Inbound) effectiveBypassPrefixesLocked(privateRanges []netip.Prefix) []netip.Prefix {
-	return append(privateRanges[:len(privateRanges):len(privateRanges)], i.bypassCIDR...)
+// and hands to Publish itself. With no CIDRs to add the result aliases
+// privateRanges instead, which is safe only because the registry treats every
+// slice it is handed as read-only.
+func effectiveBypassPrefixes(privateRanges []netip.Prefix, bypassCIDR []netip.Prefix) []netip.Prefix {
+	return append(privateRanges[:len(privateRanges):len(privateRanges)], bypassCIDR...)
 }

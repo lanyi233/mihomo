@@ -26,11 +26,21 @@ func testInbound(t *testing.T, inbound *Inbound) *Inbound {
 	return inbound
 }
 
+// localPrivateBypass is a local-only inbound whose cgroup program lets private
+// destinations through, the default for the local role.
+func localPrivateBypass(tunDirect bool) *Inbound {
+	return &Inbound{
+		localEnabled:    true,
+		localPolicy:     ECommon.LocalPolicy{BypassPrivateAddress: true},
+		bypassTUNDirect: tunDirect,
+	}
+}
+
 func TestPublishBypassPolicyPrivateAddress(t *testing.T) {
 	resolver.TunRouteClaimed.Store(nil)
 	// bypassTUNDirect mirrors the option default, which is what puts the
 	// prefixes into the membership set asserted below.
-	inbound := testInbound(t, &Inbound{bypassPrivateAddress: true, bypassTUNDirect: true})
+	inbound := testInbound(t, localPrivateBypass(true))
 	inbound.publishBypassPolicyLocked()
 
 	excludes := resolver.EBPFRouteExcludePrefixes.Load()
@@ -46,6 +56,35 @@ func TestPublishBypassPolicyPrivateAddress(t *testing.T) {
 	}
 	if published.DirectSet == nil || !published.DirectSet.Contains(netip.MustParseAddr("192.168.1.1")) {
 		t.Fatal("expected a usable membership set")
+	}
+}
+
+// The shared role has its own private-address switch. A forwarded packet the
+// shared program bypasses follows the routing table just like a local socket
+// does, so shared-only bypass needs the route exclusion as much as local does.
+func TestPublishBypassPolicySharedPrivateAddress(t *testing.T) {
+	resolver.TunRouteClaimed.Store(nil)
+	inbound := testInbound(t, &Inbound{sharedEnabled: true, sharedBypassPrivate: true, bypassTUNDirect: true})
+	inbound.publishBypassPolicyLocked()
+
+	excludes := resolver.EBPFRouteExcludePrefixes.Load()
+	if excludes == nil || len(*excludes) != len(ECommon.PrivateAddressPrefixes()) {
+		t.Fatalf("expected the private set to be excluded for a shared bypass, got %v", excludes)
+	}
+}
+
+// A role that is configured but not enabled must not contribute its switch.
+func TestPublishBypassPolicyIgnoresDisabledRole(t *testing.T) {
+	resolver.TunRouteClaimed.Store(nil)
+	inbound := testInbound(t, &Inbound{
+		localEnabled:        true,
+		localPolicy:         ECommon.LocalPolicy{BypassPrivateAddress: false},
+		sharedEnabled:       false,
+		sharedBypassPrivate: true,
+	})
+	inbound.publishBypassPolicyLocked()
+	if excludes := resolver.EBPFRouteExcludePrefixes.Load(); excludes != nil {
+		t.Fatalf("expected no route exclusion from a disabled shared role, got %v", *excludes)
 	}
 }
 
@@ -68,14 +107,14 @@ func TestPublishBypassPolicyRuleSetIsNotRouteExcluded(t *testing.T) {
 }
 
 func TestPublishBypassPolicyNothingBypassed(t *testing.T) {
-	inbound := testInbound(t, &Inbound{bypassPrivateAddress: true, bypassTUNDirect: true})
+	inbound := testInbound(t, localPrivateBypass(true))
 	inbound.publishBypassPolicyLocked()
 	if resolver.EBPFBypassPolicyValue.Load() == nil {
 		t.Fatal("expected a policy to be published first")
 	}
 
 	// Republishing with nothing to bypass must retract what this inbound had.
-	inbound.bypassPrivateAddress = false
+	inbound.localPolicy.BypassPrivateAddress = false
 	inbound.publishBypassPolicyLocked()
 	if published := resolver.EBPFBypassPolicyValue.Load(); published != nil {
 		t.Fatalf("expected a stale policy to be cleared, got %v", published)
@@ -83,6 +122,13 @@ func TestPublishBypassPolicyNothingBypassed(t *testing.T) {
 	if excludes := resolver.EBPFRouteExcludePrefixes.Load(); excludes != nil {
 		t.Fatalf("expected stale route exclusions to be cleared, got %v", *excludes)
 	}
+}
+
+// An inbound that never got a publisher -- New failed before creating one --
+// must not panic when the policy path runs.
+func TestPublishBypassPolicyWithoutPublisher(t *testing.T) {
+	inbound := &Inbound{bypassCIDR: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}}
+	inbound.publishBypassPolicyLocked()
 }
 
 // The whole point of the diagnostic: a bypassed prefix that TUN still routes is

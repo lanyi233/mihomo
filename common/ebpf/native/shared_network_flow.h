@@ -1,4 +1,3 @@
-// Copyright 2026, Asterisk4Magisk contributors
 // Copyright 2026, sing-box contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -116,7 +115,6 @@ NOINLINE int reserve_token_attempt(
     scratch->token.generation = now ^ ((__u64)hash << 32U);
     scratch->token.last_seen_ns = now;
     if (!publish_token(scratch, control, BPF_NOEXIST)) {
-        record_shared_stat(SB_SHARED_STAT_TOKEN_PUBLISH_RETRY);
         return SB_SHARED_TOKEN_RETRY;
     }
     if (map_update(
@@ -134,7 +132,6 @@ NOINLINE int reserve_token_attempt(
         __builtin_memcpy(&scratch->token, existing, sizeof(scratch->token));
         return SB_SHARED_TOKEN_RESERVED;
     }
-    record_shared_stat(SB_SHARED_STAT_ORIGINAL_PUBLISH_FAILURE);
     return SB_SHARED_TOKEN_RETRY;
 }
 
@@ -206,8 +203,10 @@ NOINLINE bool load_cached_bypass(
 
 NOINLINE void cache_bypass(
     struct sb_shared_scratch *scratch,
+    const struct sb_shared_control *control,
     __u8 protocol,
     __u32 tcp_sequence) {
+    if ((control->flags & SB_SHARED_FLAG_BYPASS_FLOW_CACHE) == 0U) return;
     __builtin_memset(&scratch->bypass_flow, 0, sizeof(scratch->bypass_flow));
     scratch->bypass_flow.last_seen_ns = ktime_get_ns();
     if (protocol == IPPROTO_TCP_VALUE) scratch->bypass_flow.tcp_sequence = tcp_sequence;

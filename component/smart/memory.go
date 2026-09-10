@@ -3,6 +3,7 @@ package smart
 import (
 	"encoding/json"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/lru"
@@ -29,6 +30,7 @@ var (
 	targetCacheRefreshFlags    xsync.Map[string, bool]
 	dbResultRefreshFlags       xsync.Map[string, bool]
 	blockedNodesRefreshFlags   xsync.Map[string, bool]
+	cacheAdjustMutex           sync.Mutex
 )
 
 type (
@@ -236,7 +238,9 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 
 	// SmartTarget (same ruleset = same node)
 	targetKey := FormatDBKey(config, group, target)
-	unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
+	if existing, expireTime, found := unwrapCache.GetWithExpire(targetKey); !found || len(existing.Proxies) == 0 || expireTime.Before(time.Now()) {
+		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
+	}
 
 	// ASN sharing (CDN excluded): first-writer-wins
 	if asnNumber != "" && !CdnASNs[asnNumber] {
@@ -252,20 +256,19 @@ func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcar
 		return nil, false
 	}
 
-	targetKey := FormatDBKey(config, group, target)
-	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
-		if len(value.Proxies) > 0 {
-			return value.Proxies, expireTime.Before(time.Now())
-		}
-	}
-
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
 		if value, expireTime, found := unwrapCache.GetWithExpire(asnKey); found {
 			if len(value.Proxies) > 0 {
-				unwrapCache.Set(targetKey, UnwrapMap{Proxies: value.Proxies})
 				return value.Proxies, expireTime.Before(time.Now())
 			}
+		}
+	}
+
+	targetKey := FormatDBKey(config, group, target)
+	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
+		if len(value.Proxies) > 0 {
+			return value.Proxies, expireTime.Before(time.Now())
 		}
 	}
 
@@ -313,10 +316,12 @@ func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string
 
 // 调整缓存参数
 func (s *Store) AdjustCacheParameters() {
+	cacheAdjustMutex.Lock()
+	defer cacheAdjustMutex.Unlock()
+
 	memoryUsage := GetSystemMemoryUsage()
 
 	globalCacheParams.mutex.Lock()
-	defer globalCacheParams.mutex.Unlock()
 
 	isFirstRun := globalCacheParams.LastMemoryUsage == 0
 	needAdjust := isFirstRun
@@ -329,6 +334,7 @@ func (s *Store) AdjustCacheParameters() {
 	globalCacheParams.LastMemoryUsage = memoryUsage
 
 	if !needAdjust && !isFirstRun {
+		globalCacheParams.mutex.Unlock()
 		return
 	}
 
@@ -340,18 +346,21 @@ func (s *Store) AdjustCacheParameters() {
 		globalCacheParams.MaxTargets = MinTargetsLimit + int(float64(MaxTargetsLimit-MinTargetsLimit)*adjustFactor)
 		globalCacheParams.BatchSaveThreshold = MinBatchThreshLimit + int(float64(MaxBatchThreshLimit-MinBatchThreshLimit)*adjustFactor)
 	}
+	maxTargets := globalCacheParams.MaxTargets
+	batchSaveThreshold := globalCacheParams.BatchSaveThreshold
+	globalCacheParams.mutex.Unlock()
 
 	log.Infoln("[SmartStore] Parameters adjusted: MaxTargets=%d, BatchThreshold=%d",
-		globalCacheParams.MaxTargets,
-		globalCacheParams.BatchSaveThreshold)
+		maxTargets,
+		batchSaveThreshold)
 
-	cacheSize := globalCacheParams.MaxTargets / 4
-	targetCache = lru.ResetLRU(targetCache, cacheSize, lru.WithAge[string, string](300), lru.WithStale[string, string](true))
-	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](600), lru.WithStale[string, UnwrapMap](true))
-	recordCache = lru.ResetLRU(recordCache, cacheSize, lru.WithAge[string, *AtomicStatsRecord](300), lru.WithStale[string, *AtomicStatsRecord](true))
-	dbResultCache = lru.ResetLRU(dbResultCache, cacheSize, lru.WithAge[string, map[string][]byte](300), lru.WithStale[string, map[string][]byte](true))
-	blockedNodesCache = lru.ResetLRU(blockedNodesCache, cacheSize, lru.WithAge[string, map[string]bool](300), lru.WithStale[string, map[string]bool](true))
-	hostStatusCache = lru.ResetLRU(hostStatusCache, cacheSize, lru.WithAge[string, *HostStatus](300), lru.WithStale[string, *HostStatus](true))
+	cacheSize := maxTargets / 4
+	targetCache.Resize(cacheSize)
+	unwrapCache.Resize(cacheSize)
+	recordCache.Resize(cacheSize)
+	dbResultCache.Resize(cacheSize)
+	blockedNodesCache.Resize(cacheSize)
+	hostStatusCache.Resize(cacheSize)
 	go s.FlushQueue(true)
 }
 

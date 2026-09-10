@@ -5,11 +5,8 @@ package ebpf
 import (
 	"errors"
 	"net/netip"
-	"syscall"
-	"time"
 	"unsafe"
 
-	"github.com/metacubex/sing/common/control"
 	E "github.com/metacubex/sing/common/exceptions"
 
 	CiliumEBPF "github.com/cilium/ebpf"
@@ -21,63 +18,6 @@ const (
 	mapLookupAndDeleteSupported
 	mapLookupAndDeleteUnsupported
 )
-
-func (b *CgroupBackend) SocketProtectFunc() control.Func {
-	if b == nil {
-		return nil
-	}
-	return func(network string, address string, rawConn syscall.RawConn) error {
-		if b.selfBypassTGID.Load() {
-			return nil
-		}
-		return control.Raw(rawConn, func(fd uintptr) error {
-			cookie, err := readSocketCookie(fd)
-			if err != nil {
-				return E.Cause(err, "read socket cookie")
-			}
-			b.access.RLock()
-			if b.runtime == nil {
-				b.access.RUnlock()
-				return errBackendClosed
-			}
-			if b.runtime.self_bypass_tgid {
-				b.access.RUnlock()
-				return nil
-			}
-			if b.socketBypassMapFD >= 0 {
-				err = registerSocketCookie(b.socketBypassMapFD, cookie)
-				b.access.RUnlock()
-				return err
-			}
-			b.access.RUnlock()
-
-			b.access.Lock()
-			defer b.access.Unlock()
-			if b.runtime == nil {
-				return errBackendClosed
-			}
-			if b.runtime.self_bypass_tgid {
-				return nil
-			}
-			if b.socketBypassMapFD >= 0 {
-				return registerSocketCookie(b.socketBypassMapFD, cookie)
-			}
-			if b.pendingSocketCookies == nil {
-				b.pendingSocketCookies = make(map[uint64]struct{})
-			}
-			b.pendingSocketCookies[cookie] = struct{}{}
-			return nil
-		})
-	}
-}
-
-func registerSocketCookie(mapFD int, cookie uint64) error {
-	value := uint8(1)
-	if err := updateMap(mapFD, unsafe.Pointer(&cookie), unsafe.Pointer(&value)); err != nil {
-		return E.Cause(err, "register eBPF bypass socket")
-	}
-	return nil
-}
 
 func (b *CgroupBackend) LookupOriginal(protocol uint8, listenerDestination netip.AddrPort) (OriginalDestination, error) {
 	return b.lookupOriginal(protocol, listenerDestination, false)
@@ -234,6 +174,9 @@ func (b *CgroupBackend) RecoverConnectedUDPOriginal(listenerDestination netip.Ad
 	if b.runtime == nil {
 		return OriginalDestination{}, errBackendClosed
 	}
+	if b.runtime.socket_release_supported {
+		return OriginalDestination{}, E.Cause(unix.ENOENT, "connected UDP LRU recovery is disabled")
+	}
 	tokenMap := b.runtime.maps["cgroup_udp_token"]
 	if tokenMap == nil {
 		return OriginalDestination{}, E.New("connected UDP token map is unavailable")
@@ -315,17 +258,11 @@ func (b *CgroupBackend) findConnectedUDPToken(
 	tokenMap *CiliumEBPF.Map,
 	listener listenerLookupKey,
 ) (uint64, error) {
-	// This searches the token map BY VALUE, so it is inherently O(entries).
-	// It runs inline on the UDP read loop, so it must stay bounded: a densely
-	// populated map would otherwise stall packet reception for the whole scan.
-	// Giving up early is safe — the caller treats ENOENT as "cannot recover"
-	// and drops the packet, which is what an exhaustive miss would do anyway.
-	budget := min(b.mapCapacity.UDPRedirect, connectedUDPTokenScanBudget)
 	// Connected UDP recovery is a cold path. Batch lookup avoids one syscall
 	// per token on kernels that implement BPF_MAP_LOOKUP_BATCH, while the
 	// support state keeps vendor/old kernels on the proven iterator path.
 	if b.connectedUDPTokenLookupSupport.mode.Load() != mapBatchUnsupported {
-		batchCapacity := min(uint32(mapBatchMaxEntries), budget)
+		batchCapacity := min(uint32(mapBatchMaxEntries), b.mapCapacity.UDPRedirect)
 		if cap(b.connectedUDPTokenKeys) < int(batchCapacity) {
 			b.connectedUDPTokenKeys = make([]uint64, batchCapacity)
 			b.connectedUDPTokenValues = make([]listenerLookupKey, batchCapacity)
@@ -335,8 +272,8 @@ func (b *CgroupBackend) findConnectedUDPToken(
 		}
 		var cursor CiliumEBPF.MapBatchCursor
 		var scanned uint32
-		for scanned < budget {
-			batchSize := min(batchCapacity, budget-scanned)
+		for scanned < b.mapCapacity.UDPRedirect {
+			batchSize := min(batchCapacity, b.mapCapacity.UDPRedirect-scanned)
 			countValue, batchErr := tokenMap.BatchLookup(
 				&cursor,
 				b.connectedUDPTokenKeys[:batchSize],
@@ -382,7 +319,7 @@ func (b *CgroupBackend) findConnectedUDPToken(
 		if currentToken == listener {
 			return cookie, nil
 		}
-		if scanned >= budget {
+		if scanned >= b.mapCapacity.UDPRedirect {
 			break
 		}
 	}
@@ -480,316 +417,6 @@ func mapLookupAndDeleteUnavailable(err error) bool {
 		errors.Is(err, linuxErrnoNotSupported)
 }
 
-// deleteStaleRedirect removes an entry only when the value returned by the
-// kernel's atomic lookup-and-delete still matches the scan snapshot. If the
-// key was reused, restore the returned value with BPF_NOEXIST; a concurrent
-// replacement wins and is left untouched. Kernels without this operation rely
-// on the bounded LRU maps instead of taking a racy lookup-then-delete path.
-func (b *CgroupBackend) deleteStaleRedirect(
-	mapFD int,
-	key *listenerLookupKey,
-	expected originalDestinationValue,
-) (bool, error) {
-	if mapFD < 0 || b.lookupAndDeleteMode.Load() == mapLookupAndDeleteUnsupported {
-		return false, nil
-	}
-	var current originalDestinationValue
-	err := lookupAndDeleteMap(mapFD, unsafe.Pointer(key), unsafe.Pointer(&current))
-	if errors.Is(err, unix.ENOENT) {
-		b.lookupAndDeleteMode.CompareAndSwap(mapLookupAndDeleteUnknown, mapLookupAndDeleteSupported)
-		return false, nil
-	}
-	if err != nil {
-		if mapLookupAndDeleteUnavailable(err) {
-			b.lookupAndDeleteMode.Store(mapLookupAndDeleteUnsupported)
-			return false, nil
-		}
-		return false, err
-	}
-	b.lookupAndDeleteMode.CompareAndSwap(mapLookupAndDeleteUnknown, mapLookupAndDeleteSupported)
-	if current == expected {
-		return true, nil
-	}
-	if restoreErr := updateMapWithFlags(
-		mapFD,
-		unsafe.Pointer(key),
-		unsafe.Pointer(&current),
-		bpfNoExist,
-	); restoreErr != nil && !errors.Is(restoreErr, unix.EEXIST) {
-		return false, E.Cause(restoreErr, "restore concurrently refreshed redirect")
-	}
-	return false, nil
-}
-
-// connectedUDPTokenScanBudget caps the by-value token search so it cannot
-// monopolise the UDP read loop.
-const connectedUDPTokenScanBudget = 4096
-
-type tcpRedirectEntry struct {
-	key   listenerLookupKey
-	value originalDestinationValue
-}
-
-func (b *CgroupBackend) SweepStaleTCPRedirects(
-	maxAge time.Duration,
-	fallbackBudget uint32,
-) (CgroupTCPRedirectSweepResult, error) {
-	if b == nil {
-		return CgroupTCPRedirectSweepResult{}, errBackendClosed
-	}
-	if maxAge <= 0 || fallbackBudget == 0 {
-		return CgroupTCPRedirectSweepResult{}, unix.EINVAL
-	}
-	b.tcpSweepAccess.Lock()
-	defer b.tcpSweepAccess.Unlock()
-
-	nowNS, err := monotonicNowNS()
-	if err != nil {
-		return CgroupTCPRedirectSweepResult{}, err
-	}
-	maxAgeNS := uint64(maxAge)
-	if nowNS <= maxAgeNS {
-		return CgroupTCPRedirectSweepResult{
-			Usage:    MapUsage{Capacity: b.mapCapacity.TCPRedirect},
-			Complete: true,
-		}, nil
-	}
-	staleBefore := nowNS - maxAgeNS
-
-	b.access.RLock()
-	defer b.access.RUnlock()
-	if b.runtime == nil {
-		return CgroupTCPRedirectSweepResult{}, errBackendClosed
-	}
-	b.tcpSweepCandidates = b.tcpSweepCandidates[:0]
-	scan, err := b.tcpSweepScratch.scan(
-		b.runtime.maps["cgroup_tcp_redirect"],
-		b.mapCapacity.TCPRedirect,
-		fallbackBudget,
-		func(key listenerLookupKey, value originalDestinationValue) {
-			if value.CreatedAtNS != 0 && value.CreatedAtNS <= staleBefore {
-				b.tcpSweepCandidates = append(b.tcpSweepCandidates, tcpRedirectEntry{key: key, value: value})
-			}
-		},
-	)
-	if err != nil {
-		return CgroupTCPRedirectSweepResult{}, err
-	}
-	result := CgroupTCPRedirectSweepResult{
-		Scanned:  scan.Scanned,
-		Usage:    MapUsage{Capacity: b.mapCapacity.TCPRedirect},
-		Complete: scan.Complete,
-	}
-	if b.tcpRedirectUsageKnown.Load() {
-		result.Usage.Entries = b.tcpRedirectUsage.Load()
-	}
-	var sweepErr error
-	for _, entry := range b.tcpSweepCandidates {
-		removed, deleteErr := b.deleteStaleRedirect(b.tcpRedirectMapFD, &entry.key, entry.value)
-		if deleteErr != nil {
-			sweepErr = E.Errors(sweepErr, deleteErr)
-		}
-		if removed {
-			result.Removed++
-		}
-	}
-	b.tcpSweepRemoved += result.Removed
-	if result.Complete {
-		result.Usage.Entries = scan.Entries
-		if b.tcpSweepRemoved >= result.Usage.Entries {
-			result.Usage.Entries = 0
-		} else {
-			result.Usage.Entries -= b.tcpSweepRemoved
-		}
-		b.tcpSweepRemoved = 0
-		b.tcpRedirectUsage.Store(result.Usage.Entries)
-		b.tcpRedirectUsageKnown.Store(true)
-	}
-	return result, sweepErr
-}
-
-// SweepStaleUDPRedirects removes non-connected UDP redirect entries that were
-// never observed by userspace (for example, a send-only socket that closed
-// before its packet reached the inbound listener). Connected entries are
-// removed only when their token still exists and points at a different
-// redirect; a missing token may have been evicted from the independent LRU and
-// is therefore preserved for userspace recovery.
-func (b *CgroupBackend) SweepStaleUDPRedirects(
-	maxAge time.Duration,
-	fallbackBudget uint32,
-) (CgroupUDPRedirectSweepResult, error) {
-	if b == nil {
-		return CgroupUDPRedirectSweepResult{}, errBackendClosed
-	}
-	if maxAge <= 0 || fallbackBudget == 0 {
-		return CgroupUDPRedirectSweepResult{}, unix.EINVAL
-	}
-	b.udpSweepAccess.Lock()
-	defer b.udpSweepAccess.Unlock()
-
-	nowNS, err := monotonicNowNS()
-	if err != nil {
-		return CgroupUDPRedirectSweepResult{}, err
-	}
-	maxAgeNS := uint64(maxAge)
-	if nowNS <= maxAgeNS {
-		return CgroupUDPRedirectSweepResult{
-			Usage:    MapUsage{Capacity: b.mapCapacity.UDPRedirect},
-			Complete: true,
-		}, nil
-	}
-	staleBefore := nowNS - maxAgeNS
-
-	b.access.RLock()
-	defer b.access.RUnlock()
-	if b.runtime == nil {
-		return CgroupUDPRedirectSweepResult{}, errBackendClosed
-	}
-	b.udpSweepCandidates = b.udpSweepCandidates[:0]
-	scan, err := b.udpSweepScratch.scan(
-		b.runtime.maps["cgroup_udp_redirect"],
-		b.mapCapacity.UDPRedirect,
-		fallbackBudget,
-		func(key listenerLookupKey, value originalDestinationValue) {
-			if b.staleUDPRedirectEntry(key, value, staleBefore) {
-				b.udpSweepCandidates = append(b.udpSweepCandidates, tcpRedirectEntry{key: key, value: value})
-			}
-		},
-	)
-	if err != nil {
-		return CgroupUDPRedirectSweepResult{}, err
-	}
-	result := CgroupUDPRedirectSweepResult{
-		Scanned:  scan.Scanned,
-		Usage:    MapUsage{Capacity: b.mapCapacity.UDPRedirect},
-		Complete: scan.Complete,
-	}
-	var sweepErr error
-	for _, entry := range b.udpSweepCandidates {
-		removed, deleteErr := b.deleteStaleRedirect(b.udpRedirectMapFD, &entry.key, entry.value)
-		if deleteErr != nil {
-			sweepErr = E.Errors(sweepErr, deleteErr)
-		}
-		if !removed {
-			continue
-		}
-		result.Removed++
-		if entry.value.SocketCookie != 0 && b.udpFlowMapFD >= 0 {
-			flowKey := makeUDPFlowKey(entry.value)
-			if flowErr := deleteMap(b.udpFlowMapFD, unsafe.Pointer(&flowKey)); flowErr != nil && !errors.Is(flowErr, unix.ENOENT) {
-				sweepErr = E.Errors(sweepErr, E.Cause(flowErr, "delete stale UDP flow cache"))
-			}
-		}
-	}
-	b.udpSweepRemoved += result.Removed
-	if result.Complete {
-		result.Usage.Entries = scan.Entries
-		if b.udpSweepRemoved >= result.Usage.Entries {
-			result.Usage.Entries = 0
-		} else {
-			result.Usage.Entries -= b.udpSweepRemoved
-		}
-		b.udpSweepRemoved = 0
-	}
-	return result, sweepErr
-}
-
-func staleUDPRedirect(value originalDestinationValue, staleBefore uint64) bool {
-	return value.Flags&originalDestinationFlagConnectedUDP == 0 &&
-		value.CreatedAtNS != 0 && value.CreatedAtNS <= staleBefore
-}
-
-func (b *CgroupBackend) staleUDPRedirectEntry(
-	key listenerLookupKey,
-	value originalDestinationValue,
-	staleBefore uint64,
-) bool {
-	if staleUDPRedirect(value, staleBefore) {
-		return true
-	}
-	return value.Flags&originalDestinationFlagConnectedUDP != 0 &&
-		value.CreatedAtNS != 0 && value.CreatedAtNS <= staleBefore &&
-		b.orphanedConnectedUDPRedirect(key, value)
-}
-
-func (b *CgroupBackend) orphanedConnectedUDPRedirect(key listenerLookupKey, value originalDestinationValue) bool {
-	if value.Flags&originalDestinationFlagConnectedUDP == 0 || value.SocketCookie == 0 {
-		return false
-	}
-	if b.runtime == nil || b.runtime.udp_token_map_fd < 0 {
-		return false
-	}
-	var token listenerLookupKey
-	err := lookupMap(
-		b.runtime.udp_token_map_fd,
-		unsafe.Pointer(&value.SocketCookie),
-		unsafe.Pointer(&token),
-	)
-	// Token and redirect state live in independent bounded LRU maps. If the
-	// token was evicted first, userspace cannot discover this redirect through
-	// RecoverConnectedUDPOriginal, so an old entry would otherwise occupy the
-	// redirect map until it filled. A fresh entry is still protected by the
-	// age check in staleUDPRedirectEntry; only stale orphan state reaches here.
-	return errors.Is(err, unix.ENOENT) || (err == nil && token != key)
-}
-
-func monotonicNowNS() (uint64, error) {
-	var now unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &now); err != nil {
-		return 0, err
-	}
-	return uint64(now.Sec)*uint64(time.Second) + uint64(now.Nsec), nil
-}
-
-func (b *CgroupBackend) RedirectMapUsage(protocol uint8) (MapUsage, error) {
-	if b == nil {
-		return MapUsage{}, errBackendClosed
-	}
-	b.access.RLock()
-	defer b.access.RUnlock()
-	if b.runtime == nil {
-		return MapUsage{}, errBackendClosed
-	}
-	if protocol == ProtocolTCP {
-		usage := MapUsage{
-			Entries:  b.tcpRedirectUsage.Load(),
-			Capacity: b.mapCapacity.TCPRedirect,
-		}
-		if !b.tcpRedirectUsageKnown.Load() {
-			return usage, unix.ENODATA
-		}
-		return usage, nil
-	}
-	mapFD, err := b.redirectMap(protocol)
-	if err != nil {
-		return MapUsage{}, err
-	}
-	entries, err := countMapEntries(
-		mapFD,
-		unsafe.Sizeof(listenerLookupKey{}),
-		b.mapCapacity.UDPRedirect,
-	)
-	return MapUsage{Entries: entries, Capacity: b.mapCapacity.UDPRedirect}, err
-}
-
-func (b *CgroupBackend) LookupAndDeleteMode() string {
-	if b == nil {
-		return "unavailable"
-	}
-	switch b.lookupAndDeleteMode.Load() {
-	case mapLookupAndDeleteSupported:
-		return "atomic"
-	case mapLookupAndDeleteUnsupported:
-		// Not a fallback: there is no second code path. BPF_MAP_LOOKUP_AND_DELETE_ELEM
-		// only accepts hash maps from Linux 5.14, and without it deleteStaleRedirect
-		// declines to act rather than race a lookup against a concurrent refresh,
-		// so reclamation on such kernels is whatever the bounded LRU maps do.
-		return "unsupported_lru_only"
-	default:
-		return "unknown"
-	}
-}
-
 func (b *CgroupBackend) DeleteRedirect(protocol uint8, listenerDestination netip.AddrPort) error {
 	if b == nil {
 		return errBackendClosed
@@ -807,18 +434,16 @@ func (b *CgroupBackend) DeleteRedirect(protocol uint8, listenerDestination netip
 	if err != nil {
 		return err
 	}
-	var recoveryErr error
 	if protocol == ProtocolUDP && b.udpFlowMapFD >= 0 {
 		var original originalDestinationValue
 		lookupErr := lookupMap(redirectMap, unsafe.Pointer(&key), unsafe.Pointer(&original))
 		if lookupErr == nil {
-			if recoveryErr = updateMap(
+			if recoveryErr := updateMap(
 				b.udpRecoveryMapFD,
 				unsafe.Pointer(&key),
 				unsafe.Pointer(&original),
 			); recoveryErr != nil {
-				b.udpRecoveryUpdateFailures.Add(1)
-				recoveryErr = E.Cause(recoveryErr, "retain recoverable UDP original destination")
+				return E.Cause(recoveryErr, "retain recoverable UDP original destination")
 			}
 		}
 		if lookupErr == nil && original.SocketCookie != 0 {
@@ -838,7 +463,7 @@ func (b *CgroupBackend) DeleteRedirect(protocol uint8, listenerDestination netip
 	if err != nil {
 		return E.Cause(err, "delete redirect mapping")
 	}
-	return recoveryErr
+	return nil
 }
 
 func (b *CgroupBackend) redirectMap(protocol uint8) (int, error) {
@@ -850,33 +475,4 @@ func (b *CgroupBackend) redirectMap(protocol uint8) (int, error) {
 	default:
 		return -1, E.New("unsupported eBPF redirect protocol: ", protocol)
 	}
-}
-
-func (b *CgroupBackend) RedirectReservationFailures(protocol uint8) (uint64, error) {
-	if b == nil {
-		return 0, errBackendClosed
-	}
-	b.access.RLock()
-	defer b.access.RUnlock()
-	if b.runtime == nil {
-		return 0, errBackendClosed
-	}
-	return b.redirectReservationFailuresLocked(protocol)
-}
-
-func (b *CgroupBackend) redirectReservationFailuresLocked(protocol uint8) (uint64, error) {
-	var key uint32
-	switch protocol {
-	case ProtocolTCP:
-		key = cgroupStatTCPRedirectFailure
-	case ProtocolUDP:
-		key = cgroupStatUDPRedirectFailure
-	default:
-		return 0, unix.EPROTONOSUPPORT
-	}
-	var failures uint64
-	if err := lookupMap(b.statsMapFD, unsafe.Pointer(&key), unsafe.Pointer(&failures)); err != nil {
-		return 0, err
-	}
-	return failures, nil
 }

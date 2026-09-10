@@ -9,34 +9,23 @@ import (
 	"time"
 
 	E "github.com/metacubex/sing/common/exceptions"
+
+	CiliumEBPF "github.com/cilium/ebpf"
 )
 
 const (
-	ProtocolTCP                   = 6
-	ProtocolUDP                   = 17
-	TCPRedirectMapCapacity        = 32768
-	UDPRedirectMapCapacity        = 32768
-	UDPPeerMapCapacity            = 16384
-	UDPFlowMapCapacity            = 16384
-	SocketBypassMapCapacity       = 32768
-	SharedNetworkProxyCapacity    = 32768
-	SharedNetworkBypassCapacity   = 16384
-	SharedNetworkFragmentCapacity = 8192
-	UDPRecoveryMapCapacity        = 8192
-	MaxConfigurableMapCapacity    = 1 << 20
-	// These mirror SB_EBPF_CGROUP_STAT_* in native/abi.h and index the
-	// cgroup_stats array map. Both values must be written out: a bare
-	// identifier in a const block without iota repeats the previous
-	// expression, which silently aliased UDP onto the TCP slot and made
-	// udp_redirect_reservation_failures report the TCP counter.
-	cgroupStatTCPRedirectFailure        = 0
-	cgroupStatUDPRedirectFailure        = 1
+	TCPRedirectMapCapacity              = 32768
+	UDPRedirectMapCapacity              = 32768
+	UDPPeerMapCapacity                  = 16384
+	UDPFlowMapCapacity                  = 16384
+	SocketBypassMapCapacity             = 32768
+	SharedNetworkProxyCapacity          = 32768
+	SharedNetworkBypassCapacity         = 16384
+	UDPRecoveryMapCapacity              = 8192
+	MaxConfigurableMapCapacity          = 1 << 20
 	originalDestinationFlagConnectedUDP = 1
 	udpFlowActionProxy                  = 1
 	udpFlowActionBypass                 = 2
-
-	addressFamilyIPv4 = 2
-	addressFamilyIPv6 = 10
 )
 
 const (
@@ -49,7 +38,7 @@ const (
 	cgroupFlagUIDDefaultBypass
 	cgroupFlagBypassIPv4
 	cgroupFlagBypassIPv6
-	cgroupFlagAutoIPv6
+	_
 	cgroupFlagUDPFlow
 	cgroupFlagBypassPrivateAddress
 	_
@@ -57,11 +46,12 @@ const (
 	cgroupFlagHostIPv6
 	cgroupFlagFakeIPIPv4
 	cgroupFlagFakeIPIPv6
+	cgroupFlagBypassPort
 )
 
 type cgroupControl struct {
 	Flags                uint32
-	SelfTGID             uint32
+	Reserved             uint32
 	UDPTimeoutSeconds    uint32
 	RedirectIPv4Prefix   uint32
 	RedirectIPv4HostMask uint32
@@ -106,31 +96,15 @@ type MapUsage struct {
 	Capacity uint32
 }
 
-type CgroupTCPRedirectSweepResult struct {
-	Scanned  uint32
-	Removed  uint32
-	Usage    MapUsage
-	Complete bool
-}
-
-type CgroupUDPRedirectSweepResult struct {
-	Scanned  uint32
-	Removed  uint32
-	Usage    MapUsage
-	Complete bool
-}
-
 type SharedNetworkMapCapacities struct {
-	Proxy    uint32
-	Bypass   uint32
-	Fragment uint32
+	Proxy  uint32
+	Bypass uint32
 }
 
 func DefaultSharedNetworkMapCapacities() SharedNetworkMapCapacities {
 	return SharedNetworkMapCapacities{
-		Proxy:    SharedNetworkProxyCapacity,
-		Bypass:   SharedNetworkBypassCapacity,
-		Fragment: SharedNetworkFragmentCapacity,
+		Proxy:  SharedNetworkProxyCapacity,
+		Bypass: SharedNetworkBypassCapacity,
 	}
 }
 
@@ -139,15 +113,12 @@ type CgroupConfig struct {
 	EnableTCP     bool
 	EnableUDP     bool
 	EnableIPv6    bool
-	AutoIPv6      bool
-	IPv6Available bool
 	RedirectIPv4  netip.Prefix
 	RedirectIPv6  netip.Prefix
-	FakeIPIPv4    netip.Prefix
-	FakeIPIPv6    netip.Prefix
 	MapCapacity   CgroupMapCapacity
 	UDPTimeout    time.Duration
-	Policy        CgroupPolicy
+	Policy        CompiledPolicy
+	SelfBypassMap *CiliumEBPF.Map
 }
 
 func DefaultCgroupMapCapacity() CgroupMapCapacity {
@@ -163,6 +134,7 @@ func DefaultCgroupMapCapacity() CgroupMapCapacity {
 type OriginalDestination struct {
 	Destination  netip.AddrPort
 	ConnectedUDP bool
+	SocketCookie uint64
 	SourceMAC    net.HardwareAddr
 }
 
@@ -224,6 +196,7 @@ func originalDestinationFromValue(original originalDestinationValue) (OriginalDe
 	return OriginalDestination{
 		Destination:  netip.AddrPortFrom(address.Unmap(), original.Port),
 		ConnectedUDP: original.Flags&originalDestinationFlagConnectedUDP != 0,
+		SocketCookie: original.SocketCookie,
 	}, nil
 }
 

@@ -241,7 +241,10 @@ func ResetConnection() {
 	if DefaultResolver != nil {
 		go DefaultResolver.ResetConnection()
 	}
-	go SystemResolver.ResetConnection() // SystemResolver unneeded check nil
+	// Interface monitors can report changes before DNS initialization completes.
+	if SystemResolver != nil {
+		go SystemResolver.ResetConnection()
+	}
 }
 
 func SortationAddr(ips []netip.Addr) (ipv4s, ipv6s []netip.Addr) {

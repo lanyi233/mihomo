@@ -9,10 +9,11 @@ import (
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"golang.org/x/sys/unix"
 )
 
-func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, uidEntries int) error {
+func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, uidEntries int, selfBypassMap *CiliumEBPF.Map) error {
 	udpLayout := cgroupUDPMapConfiguration(
 		runtimeState.enable_udp,
 		runtimeState.socket_release_supported,
@@ -33,45 +34,75 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 	}
 	var err error
 	runtimeState.maps, err = loadObjectMaps(loadCgroup, map[string]mapSpecOverride{
-		"cgroup_control": {name: "sb_cg_control", mapType: CiliumEBPF.Array, maxEntries: 1},
-		"cgroup_stats":   {name: "sb_cg_stats", mapType: CiliumEBPF.Array, maxEntries: 2},
-		// TCP redirect entries are removed on accept, but a failed/non-accepted
-		// connect can outlive userspace. Keep the map bounded so a long-running
-		// Android process cannot turn stale state into permanent EPERM failures.
-		"cgroup_tcp_redirect":   {name: "sb_cg_tcp", mapType: CiliumEBPF.LRUHash, maxEntries: tcpCapacity},
-		"cgroup_udp_redirect":   {name: "sb_cg_udp", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
-		"cgroup_udp_recovery":   {name: "sb_cg_recover", mapType: CiliumEBPF.LRUHash, maxEntries: recoveryCapacity},
-		"cgroup_udp_token":      {name: "sb_cg_token", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
-		"cgroup_udp_peer":       {name: "sb_cg_peer", mapType: udpLayout.peerType, maxEntries: udpLayout.peerCapacity, flags: udpLayout.peerFlags},
-		"cgroup_udp_flow":       {name: "sb_cg_flow", mapType: CiliumEBPF.LRUHash, maxEntries: udpLayout.flowCapacity},
-		"cgroup_uid_policy":     {name: "sb_cg_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: uidCapacity, flags: bpfFlagNoPrealloc},
-		"cgroup_bypass_ipv4":    {name: "sb_cg_bypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
-		"cgroup_bypass_ipv6":    {name: "sb_cg_bypass6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
-		"cgroup_host_ipv4":      {name: "sb_cg_host4", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
-		"cgroup_host_ipv6":      {name: "sb_cg_host6", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
-		"cgroup_ipv6_available": {name: "sb_cg_ipv6", mapType: CiliumEBPF.Array, maxEntries: 1},
+		"cgroup_control":       {name: "sb_cg_control", mapType: CiliumEBPF.Array, maxEntries: 1},
+		"cgroup_tcp_redirect":  {name: "sb_cg_tcp", mapType: CiliumEBPF.LRUHash, maxEntries: tcpCapacity},
+		"cgroup_udp_redirect":  {name: "sb_cg_udp", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
+		"cgroup_udp_recovery":  {name: "sb_cg_recover", mapType: CiliumEBPF.LRUHash, maxEntries: recoveryCapacity},
+		"cgroup_udp_token":     {name: "sb_cg_token", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
+		"cgroup_udp_peer":      {name: "sb_cg_peer", mapType: udpLayout.peerType, maxEntries: udpLayout.peerCapacity, flags: udpLayout.peerFlags},
+		"cgroup_udp_flow":      {name: "sb_cg_flow", mapType: CiliumEBPF.LRUHash, maxEntries: udpLayout.flowCapacity},
+		"cgroup_socket_bypass": {name: "sb_cg_sock_byp", mapType: CiliumEBPF.LRUHash, maxEntries: capacity.SocketBypass},
+		"cgroup_bypass_port":   {name: "sb_cg_bypass_port", mapType: CiliumEBPF.Hash, maxEntries: tcPortPolicyCapacity},
+		"cgroup_uid_policy":    {name: "sb_cg_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: uidCapacity, flags: bpfFlagNoPrealloc},
+		"cgroup_bypass_ipv4":   {name: "sb_cg_bypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
+		"cgroup_bypass_ipv6":   {name: "sb_cg_bypass6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
+		"cgroup_host_ipv4":     {name: "sb_cg_host4", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
+		"cgroup_host_ipv6":     {name: "sb_cg_host6", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
 	})
 	if err != nil {
 		return err
 	}
+	if selfBypassMap == nil {
+		return E.New("missing eBPF self-bypass map")
+	}
+	sharedSelfBypassMap, err := selfBypassMap.Clone()
+	if err != nil {
+		return E.Cause(err, "clone eBPF self-bypass map")
+	}
+	if closeErr := runtimeState.maps["cgroup_socket_bypass"].Close(); closeErr != nil {
+		_ = sharedSelfBypassMap.Close()
+		return closeErr
+	}
+	runtimeState.maps["cgroup_socket_bypass"] = sharedSelfBypassMap
 	if err = validateCgroupUDPCleanupMaps(runtimeState); err != nil {
 		return err
 	}
+	if runtimeState.socket_storage_supported {
+		storageMaps, storageErr := loadObjectMaps(loadCgroupStorage, map[string]mapSpecOverride{
+			"cgroup_udp_socket_storage": {
+				name:       "sb_cg_udp_sock",
+				mapType:    CiliumEBPF.SkStorage,
+				maxEntries: 0,
+				flags:      bpfFlagNoPrealloc,
+			},
+		})
+		if storageErr == nil && storageMaps["cgroup_udp_socket_storage"] != nil {
+			runtimeState.maps["cgroup_udp_socket_storage"] = storageMaps["cgroup_udp_socket_storage"]
+		} else {
+			_ = closeMaps(storageMaps)
+			runtimeState.socket_storage_supported = false
+		}
+	}
 	runtimeState.control_map_fd = runtimeState.maps["cgroup_control"].FD()
-	runtimeState.stats_map_fd = runtimeState.maps["cgroup_stats"].FD()
 	runtimeState.tcp_redirect_map_fd = runtimeState.maps["cgroup_tcp_redirect"].FD()
 	runtimeState.udp_redirect_map_fd = runtimeState.maps["cgroup_udp_redirect"].FD()
 	runtimeState.udp_recovery_map_fd = runtimeState.maps["cgroup_udp_recovery"].FD()
 	runtimeState.udp_token_map_fd = runtimeState.maps["cgroup_udp_token"].FD()
 	runtimeState.udp_peer_map_fd = runtimeState.maps["cgroup_udp_peer"].FD()
 	runtimeState.udp_flow_map_fd = runtimeState.maps["cgroup_udp_flow"].FD()
+	runtimeState.bypass_socket_cookie_map_fd = runtimeState.maps["cgroup_socket_bypass"].FD()
 	runtimeState.uid_policy_map_fd = runtimeState.maps["cgroup_uid_policy"].FD()
 	runtimeState.bypass_ipv4_cidr_map_fd = runtimeState.maps["cgroup_bypass_ipv4"].FD()
 	runtimeState.bypass_ipv6_cidr_map_fd = runtimeState.maps["cgroup_bypass_ipv6"].FD()
 	runtimeState.host_ipv4_map_fd = runtimeState.maps["cgroup_host_ipv4"].FD()
 	runtimeState.host_ipv6_map_fd = runtimeState.maps["cgroup_host_ipv6"].FD()
-	runtimeState.ipv6_available_map_fd = runtimeState.maps["cgroup_ipv6_available"].FD()
 	return nil
+}
+
+func probeCgroupSocketStorageSupport() bool {
+	return features.HaveMapType(CiliumEBPF.SkStorage) == nil &&
+		features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnSkStorageGet) == nil &&
+		features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnSkStorageDelete) == nil
 }
 
 type cgroupUDPMapLayout struct {
@@ -100,19 +131,14 @@ func cgroupUDPMapConfiguration(
 		return layout
 	}
 	layout.peerCapacity = capacity.UDPPeer
-	// Keep redirect, token, and peer state bounded even when the kernel has
-	// sock_release support. Unconnected sendmsg flows do not have a token entry
-	// for sock_release to find, so fixed Hash maps can still fill permanently
-	// when a packet never reaches userspace. sock_release remains the precise
-	// cleanup path; LRU is the last-resort protection for orphaned state.
+	layout.flowCapacity = capacity.UDPFlow
+	if socketReleaseSupported {
+		return layout
+	}
 	layout.cleanupType = CiliumEBPF.LRUHash
 	layout.cleanupFlags = 0
 	layout.peerType = CiliumEBPF.LRUHash
 	layout.peerFlags = 0
-	if socketReleaseSupported {
-		layout.flowCapacity = capacity.UDPFlow
-		return layout
-	}
 	return layout
 }
 
@@ -121,17 +147,20 @@ func validateCgroupUDPCleanupMaps(runtimeState *cgroupRuntime) error {
 		return nil
 	}
 	expectedType := CiliumEBPF.LRUHash
-	for _, name := range []string{"cgroup_udp_redirect", "cgroup_udp_token", "cgroup_udp_peer"} {
+	if runtimeState.socket_release_supported {
+		expectedType = CiliumEBPF.Hash
+	}
+	for _, name := range []string{"cgroup_udp_redirect", "cgroup_udp_token"} {
 		mapInstance := runtimeState.maps[name]
 		if mapInstance == nil {
-			return E.New("missing UDP LRU map ", name)
+			return E.New("missing UDP cleanup map ", name)
 		}
 		info, err := mapInstance.Info()
 		if err != nil {
-			return E.Cause(err, "inspect UDP LRU map ", name)
+			return E.Cause(err, "inspect UDP cleanup map ", name)
 		}
 		if info.Type != expectedType {
-			return E.New("invalid UDP LRU map type for ", name, ": ", info.Type, ", expected ", expectedType)
+			return E.New("invalid UDP cleanup map type for ", name, ": ", info.Type, ", expected ", expectedType)
 		}
 	}
 	return nil

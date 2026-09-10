@@ -1,6 +1,7 @@
 package lru
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -181,4 +182,66 @@ func TestCloneTo(t *testing.T) {
 
 	n.Set("5", 5)
 	assert.False(t, n.Exist("1"))
+}
+
+func TestResize(t *testing.T) {
+	var evicted []string
+	c := New[string, string](
+		WithSize[string, string](3),
+		WithEvict[string, string](func(key, _ string) { evicted = append(evicted, key) }),
+	)
+	c.Set("one", "1")
+	c.Set("two", "2")
+	c.Set("three", "3")
+
+	// Make "one" most recently used, so shrinking removes "two" first.
+	_, _ = c.Get("one")
+	c.Resize(2)
+
+	assert.Equal(t, []string{"two"}, evicted)
+	assert.False(t, c.Exist("two"))
+	assert.True(t, c.Exist("one"))
+	assert.True(t, c.Exist("three"))
+
+	c.Resize(0)
+	for i := 0; i < 10; i++ {
+		c.Set(string(rune('a'+i)), "value")
+	}
+	c.mu.Lock()
+	assert.Equal(t, 12, c.lru.Len())
+	c.mu.Unlock()
+}
+
+func TestResizeConcurrentAccess(t *testing.T) {
+	c := New[int, int](WithSize[int, int](64))
+	for i := 0; i < 64; i++ {
+		c.Set(i, i)
+	}
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			for i := 0; i < 2_000; i++ {
+				key := offset*2_000 + i
+				c.Set(key, key)
+				_, _ = c.Get(key)
+			}
+		}(worker)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			c.Resize(8 + i%57)
+		}
+	}()
+	wg.Wait()
+
+	c.Resize(8)
+	c.mu.Lock()
+	assert.LessOrEqual(t, c.lru.Len(), 8)
+	assert.Equal(t, 8, c.maxSize)
+	c.mu.Unlock()
 }

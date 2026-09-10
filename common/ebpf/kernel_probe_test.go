@@ -22,6 +22,8 @@ func TestClassifyKernelProbeError(t *testing.T) {
 		{"supported", nil, KernelProbePass},
 		{"unsupported", CiliumEBPF.ErrNotSupported, KernelProbeFail},
 		{"wrapped unsupported", errors.Join(errors.New("probe"), CiliumEBPF.ErrNotSupported), KernelProbeFail},
+		{"unsupported errno", unix.EOPNOTSUPP, KernelProbeFail},
+		{"android unsupported errno", linuxErrnoNotSupported, KernelProbeFail},
 		{"permission denied", unix.EPERM, KernelProbeUnknown},
 	}
 	for _, test := range tests {
@@ -37,14 +39,31 @@ func TestKernelProbeReportCounts(t *testing.T) {
 	report := &KernelProbeReport{}
 	report.Add(KernelProbePass, "common", KernelProbeRequired, "one", "")
 	report.Add(KernelProbeFail, "local", KernelProbeRequired, "two", "")
-	report.Add(KernelProbeFail, "local", KernelProbeFallback, "three", "")
-	report.Add(KernelProbeUnknown, "shared-network", KernelProbeRequired, "four", "")
+	report.Add(KernelProbeFail, "local", KernelProbePerformance, "three", "")
+	report.Add(KernelProbeUnknown, "shared", KernelProbeRequired, "four", "")
 	if failures := report.RequiredFailures(); failures != 1 {
 		t.Fatalf("unexpected required failure count: %d", failures)
 	}
 	counts := report.Counts()
 	if counts[KernelProbePass] != 1 || counts[KernelProbeFail] != 2 || counts[KernelProbeUnknown] != 1 {
 		t.Fatalf("unexpected counts: %v", counts)
+	}
+	if unknowns := report.RequiredUnknowns(); unknowns != 1 {
+		t.Fatalf("unexpected required unknown count: %d", unknowns)
+	}
+	if issues := report.RequiredIssues(); issues != 2 {
+		t.Fatalf("unexpected required issue count: %d", issues)
+	}
+	if err := report.RequiredError(); err == nil || !strings.Contains(err.Error(), "two") {
+		t.Fatalf("unexpected required error: %v", err)
+	}
+}
+
+func TestKernelProbeSuccessfulResultIsPreflight(t *testing.T) {
+	report := &KernelProbeReport{}
+	report.Add(KernelProbePass, "common", KernelProbeRequired, "map", "available")
+	if result := kernelProbeResult(report); result != "preflight_passed" {
+		t.Fatalf("unexpected successful preflight result: %s", result)
 	}
 }
 
@@ -75,22 +94,25 @@ func TestMemlockProbeResult(t *testing.T) {
 func TestWriteKernelProbeReport(t *testing.T) {
 	report := &KernelProbeReport{
 		Platform:      "Linux",
-		KernelRelease: "4.19.0-test",
+		KernelRelease: "5.7.0-test",
 		Architecture:  "arm64",
 		Mode:          KernelProbeModeLocal,
+		IPv6:          true,
 	}
 	report.Add(KernelProbePass, "common", KernelProbeRequired, "hash map", "available")
-	report.Add(KernelProbeUnknown, "local", KernelProbeRequired, "cgroup", "permission required")
+	report.Add(KernelProbeUnknown, "local", KernelProbeRequired, "TC hook", "permission required")
 	var output bytes.Buffer
 	if err := WriteKernelProbeReport(&output, report); err != nil {
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
-		"kernel: 4.19.0-test",
+		"kernel: 5.7.0-test",
+		"ipv6: true",
 		"cilium/ebpf direct bpf(2) probes",
+		"does not load the exact selected eBPF objects",
 		"PASS",
 		"UNKNOWN",
-		"Summary: PASS=1 WARN=0 FAIL=0 UNKNOWN=1",
+		"Summary: PASS=1 WARN=0 FAIL=0 UNKNOWN=1 REQUIRED_FAILURES=0 REQUIRED_UNKNOWNS=1",
 	} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("report is missing %q:\n%s", expected, output.String())
@@ -103,7 +125,7 @@ func TestWriteKernelProbeReportJSON(t *testing.T) {
 		Platform:      "Android",
 		KernelRelease: "6.6.30-test",
 		Architecture:  "arm64",
-		Mode:          KernelProbeModeSharedNetwork,
+		Mode:          KernelProbeModeShared,
 		Network:       []string{"tcp", "udp"},
 		ActivePrograms: []KernelProbeProgram{{
 			ID:       42,
@@ -113,7 +135,7 @@ func TestWriteKernelProbeReportJSON(t *testing.T) {
 		}},
 	}
 	report.Add(KernelProbePass, "common", KernelProbeRequired, "hash map", "available")
-	report.Add(KernelProbeFail, "shared-network", KernelProbeRequired, "sched_cls", "unavailable")
+	report.Add(KernelProbeFail, "shared", KernelProbeRequired, "sched_cls", "unavailable")
 	var output bytes.Buffer
 	if err := WriteKernelProbeReportJSON(&output, report); err != nil {
 		t.Fatal(err)
@@ -122,9 +144,11 @@ func TestWriteKernelProbeReportJSON(t *testing.T) {
 		t.Fatalf("unexpected finding field names: %s", output.String())
 	}
 	var decoded struct {
-		KernelRelease  string `json:"kernel_release"`
-		Result         string `json:"result"`
-		ActivePrograms []struct {
+		KernelRelease   string `json:"kernel_release"`
+		Result          string `json:"result"`
+		Preflight       bool   `json:"preflight"`
+		ExactObjectLoad bool   `json:"exact_object_load"`
+		ActivePrograms  []struct {
 			ID   uint32 `json:"id"`
 			Type string `json:"type"`
 		} `json:"active_programs"`
@@ -136,33 +160,10 @@ func TestWriteKernelProbeReportJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	if decoded.KernelRelease != report.KernelRelease || decoded.Result != "unsupported" ||
+		!decoded.Preflight || decoded.ExactObjectLoad ||
 		decoded.Summary.RequiredFailures != 1 || len(decoded.ActivePrograms) != 1 ||
 		decoded.ActivePrograms[0].ID != 42 || decoded.ActivePrograms[0].Type != CiliumEBPF.SchedCLS.String() {
 		t.Fatalf("unexpected JSON report: %+v", decoded)
-	}
-}
-
-func TestPathWithin(t *testing.T) {
-	for _, test := range []struct {
-		path string
-		root string
-		want bool
-	}{
-		{"/sys/fs/cgroup", "/sys/fs/cgroup", true},
-		{"/sys/fs/cgroup/sing-box", "/sys/fs/cgroup", true},
-		{"/sys/fs/cgroup2", "/sys/fs/cgroup", false},
-		{"/sys/fs", "/sys/fs/cgroup", false},
-	} {
-		if got := pathWithin(test.path, test.root); got != test.want {
-			t.Fatalf("pathWithin(%q, %q)=%v, want %v", test.path, test.root, got, test.want)
-		}
-	}
-}
-
-func TestKernelVersionCode(t *testing.T) {
-	version := kernelVersionCode(5, 2, 300)
-	if formatted := formatKernelVersionCode(version); formatted != "5.2.255" {
-		t.Fatalf("unexpected formatted version: %s", formatted)
 	}
 }
 
@@ -176,5 +177,122 @@ func TestParseKernelProbeNetwork(t *testing.T) {
 	}
 	if _, _, _, err = parseKernelProbeNetwork([]string{"icmp"}); err == nil {
 		t.Fatal("expected invalid network error")
+	}
+}
+
+func TestNormalizeProbeDataPlanes(t *testing.T) {
+	tests := []struct {
+		name    string
+		options KernelProbeOptions
+		local   KernelProbeDataPlane
+		shared  KernelProbeDataPlane
+	}{
+		{name: "default all", options: KernelProbeOptions{Mode: KernelProbeModeAll}, local: KernelProbeDataPlaneCgroup, shared: KernelProbeDataPlanePacketRewrite},
+		{name: "default local", options: KernelProbeOptions{Mode: KernelProbeModeLocal}, local: KernelProbeDataPlaneCgroup},
+		{name: "default shared", options: KernelProbeOptions{Mode: KernelProbeModeShared}, shared: KernelProbeDataPlanePacketRewrite},
+		{name: "explicit cgroup and rewrite", options: KernelProbeOptions{LocalDataPlane: KernelProbeDataPlaneCgroup, SharedDataPlane: KernelProbeDataPlanePacketRewrite}, local: KernelProbeDataPlaneCgroup, shared: KernelProbeDataPlanePacketRewrite},
+		{name: "local only", options: KernelProbeOptions{LocalDataPlane: KernelProbeDataPlaneTC}, local: KernelProbeDataPlaneTC},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			local, shared, err := normalizeProbeDataPlanes(test.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if local != test.local || shared != test.shared {
+				t.Fatalf("got local=%q shared=%q", local, shared)
+			}
+		})
+	}
+	if _, _, err := normalizeProbeDataPlanes(KernelProbeOptions{LocalDataPlane: "invalid"}); err == nil {
+		t.Fatal("expected invalid local data plane")
+	}
+}
+
+func TestKernelProbePlanSeparatesTCDataPlanes(t *testing.T) {
+	local := newKernelProbePlan(KernelProbeDataPlaneTC, "")
+	if !local.localTC || !local.needsSocketAssignment() || !local.needsTCProgram() ||
+		local.localCgroup || local.sharedSocketAssign || local.sharedPacketRewrite {
+		t.Fatalf("unexpected local TC plan: %+v", local)
+	}
+
+	shared := newKernelProbePlan("", KernelProbeDataPlaneSocketAssign)
+	if !shared.sharedSocketAssign || !shared.needsSocketAssignment() || !shared.needsTCProgram() ||
+		shared.localTC || shared.localCgroup || shared.sharedPacketRewrite {
+		t.Fatalf("unexpected shared socket-assign plan: %+v", shared)
+	}
+
+	rewrite := newKernelProbePlan("", KernelProbeDataPlanePacketRewrite)
+	if !rewrite.sharedPacketRewrite || rewrite.needsSocketAssignment() || !rewrite.needsTCProgram() ||
+		rewrite.localTC || rewrite.localCgroup || rewrite.sharedSocketAssign {
+		t.Fatalf("unexpected shared packet-rewrite plan: %+v", rewrite)
+	}
+}
+
+func TestCgroupRequiredHelpers(t *testing.T) {
+	tcpHelpers := cgroupRequiredHelpers(false)
+	for _, expected := range []string{
+		"bpf_map_lookup_elem",
+		"bpf_map_update_elem",
+		"bpf_map_delete_elem",
+	} {
+		if !probeHelpersContain(tcpHelpers, expected) {
+			t.Fatalf("TCP cgroup helper set is missing %s", expected)
+		}
+	}
+	if probeHelpersContain(tcpHelpers, "bpf_ktime_get_ns") {
+		t.Fatal("TCP-only cgroup helper set requires UDP time helper")
+	}
+	if !probeHelpersContain(cgroupRequiredHelpers(true), "bpf_ktime_get_ns") {
+		t.Fatal("UDP cgroup helper set is missing time helper")
+	}
+}
+
+func probeHelpersContain(helpers []cgroupProbeHelper, name string) bool {
+	for _, helper := range helpers {
+		if helper.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestProbeSharedCapabilitiesChecksEveryInterface(t *testing.T) {
+	report := &KernelProbeReport{}
+	probeSharedCapabilities(report, KernelProbeDataPlanePacketRewrite, []string{"sb-probe-a", "sb-probe-b"})
+	checked := 0
+	for _, finding := range report.Findings {
+		if strings.HasPrefix(finding.Feature, "interface sb-probe-") {
+			checked++
+		}
+	}
+	if checked != 2 {
+		t.Fatalf("checked %d shared interfaces, want 2: %+v", checked, report.Findings)
+	}
+}
+
+func TestValidateProbeSharedFraming(t *testing.T) {
+	if err := validateProbeSharedFraming(KernelProbeDataPlanePacketRewrite, TCLinkFramingEthernet); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateProbeSharedFraming(KernelProbeDataPlanePacketRewrite, TCLinkFramingRawIP); err == nil {
+		t.Fatal("packet_rewrite accepted raw-IP framing")
+	}
+	if err := validateProbeSharedFraming(KernelProbeDataPlaneSocketAssign, TCLinkFramingRawIP); err != nil {
+		t.Fatalf("socket_assign rejected raw-IP framing: %v", err)
+	}
+	if err := validateProbeSharedFraming(KernelProbeDataPlaneSocketAssign, TCLinkFramingUnsupported); err == nil {
+		t.Fatal("socket_assign accepted unsupported framing")
+	}
+}
+
+func TestSingBoxEBPFProgramNames(t *testing.T) {
+	for _, name := range []string{"sb_tc_local_l2", "sb_ebpf_conn4", "sb_share_in", "sb_self_create", "sb_proc_connect4"} {
+		if !isSingBoxEBPFProgramName(name) {
+			t.Fatalf("sing-box eBPF program was not recognized: %s", name)
+		}
+	}
+	if isSingBoxEBPFProgramName("unrelated_bpf") {
+		t.Fatal("unrelated BPF program was recognized")
 	}
 }

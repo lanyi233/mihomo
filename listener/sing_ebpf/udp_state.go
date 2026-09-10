@@ -3,486 +3,217 @@
 package sing_ebpf
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	ECommon "github.com/metacubex/mihomo/common/ebpf"
+	commonEBPF "github.com/metacubex/mihomo/common/ebpf"
+	N "github.com/metacubex/mihomo/common/net"
+	C "github.com/metacubex/mihomo/constant"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
 
+const (
+	udpClientShardCount         = 16
+	udpReplyAliasLimit          = 64
+	udpReplySocketShardCapacity = 64
+	udpReplySocketTotalCapacity = udpClientShardCount * udpReplySocketShardCapacity
+)
+
+var errUDPReplySocketPoolBusy = errors.New("eBPF UDP reply socket pool has no idle slot")
+
 type udpClientTable struct {
-	clientShards       [udpClientShardCount]udpClientShard
-	redirectAccess     sync.Mutex
-	redirectReferences map[udpRedirectReference]uint32
+	clientShards [udpClientShardCount]udpClientShard
 }
 
-const udpClientShardCount = 16
-
 type udpClientShard struct {
+	sweep   udpSweepQueue
 	access  sync.RWMutex
 	clients map[netip.AddrPort]*udpClientState
 }
 
 type udpClientState struct {
-	access               sync.RWMutex
-	lastActive           time.Time
-	connectedBinding     atomic.Pointer[udpRedirectBinding]
-	connected            bool
-	connectedDestination netip.AddrPort
-	sourceMAC            net.HardwareAddr
-	bindings             map[netip.AddrPort]udpRedirectBinding
-	originals            map[netip.Addr]udpOriginalDestination
-	replyAliasCount      uint16
+	sweep           udpSweepEntry
+	activity        udpActivity
+	access          sync.RWMutex
+	sourceMAC       net.HardwareAddr
+	socketCookie    uint64
+	bindings        map[netip.AddrPort]udpRedirectBinding
+	replyAliasCount uint16
+	closed          bool
+	cgroupDataPlane bool
+	cgroupOriginals map[netip.Addr]commonEBPF.OriginalDestination
+	// lAddr is the address the tunnel keys its NAT table on, built once per
+	// client instead of formatted for every packet.
+	lAddr net.Addr
 }
 
 type udpRedirectBinding struct {
-	address    netip.Addr
-	packetInfo []byte
-	connected  bool
-	reference  udpRedirectReference
-	sharedFlow *ECommon.SharedNetworkFlowHandle
-	replyAlias bool
-	direct     bool
+	replyAlias      bool
+	redirectAddress netip.Addr
+	packetInfo      []byte
+	connected       bool
 }
-
-type udpRedirectReference struct {
-	client  netip.AddrPort
-	address netip.Addr
-}
-
-type udpRedirectRelease struct {
-	reference  udpRedirectReference
-	sharedFlow *ECommon.SharedNetworkFlowHandle
-}
-
-type udpOriginalDestination struct {
-	original   ECommon.OriginalDestination
-	sharedFlow *ECommon.SharedNetworkFlowHandle
-	replyAlias bool
-	direct     bool
-}
-
-const udpReplyAliasLimit = 64
 
 func (t *udpClientTable) load(client netip.AddrPort) (*udpClientState, bool) {
 	shard := t.clientShard(client)
 	shard.access.RLock()
-	clientState, loaded := shard.clients[client]
+	state, loaded := shard.clients[client]
 	shard.access.RUnlock()
-	return clientState, loaded
-}
-
-func (t *udpClientTable) current(client netip.AddrPort, expectedState *udpClientState) bool {
-	clientState, loaded := t.load(client)
-	return loaded && clientState == expectedState
+	return state, loaded
 }
 
 func (t *udpClientTable) loadOrCreate(client netip.AddrPort) *udpClientState {
-	if clientState, loaded := t.load(client); loaded {
-		return clientState
+	if state, loaded := t.load(client); loaded {
+		return state
 	}
 	shard := t.clientShard(client)
 	shard.access.Lock()
 	defer shard.access.Unlock()
-	return shard.loadOrCreateLocked(client)
+	if state, loaded := shard.clients[client]; loaded {
+		return state
+	}
+	if shard.clients == nil {
+		shard.clients = make(map[netip.AddrPort]*udpClientState)
+	}
+	state := &udpClientState{
+		bindings:        make(map[netip.AddrPort]udpRedirectBinding),
+		cgroupOriginals: make(map[netip.Addr]commonEBPF.OriginalDestination),
+	}
+	state.activity.touch()
+	shard.clients[client] = state
+	shard.sweep.add(&state.sweep, client)
+	return state
 }
 
-func (s *udpClientShard) loadOrCreateLocked(client netip.AddrPort) *udpClientState {
-	if clientState, loaded := s.clients[client]; loaded {
-		return clientState
+func (t *udpClientTable) cachedCgroupOriginal(client netip.AddrPort, redirectAddress netip.Addr) (commonEBPF.OriginalDestination, bool) {
+	state, loaded := t.load(client)
+	if !loaded {
+		return commonEBPF.OriginalDestination{}, false
 	}
-	if s.clients == nil {
-		s.clients = make(map[netip.AddrPort]*udpClientState)
+	state.access.RLock()
+	original, loaded := state.cgroupOriginals[redirectAddress]
+	state.access.RUnlock()
+	return original, loaded
+}
+
+func (t *udpClientTable) setCgroupBinding(client netip.AddrPort, original commonEBPF.OriginalDestination, redirectAddress netip.Addr) {
+	state := t.loadOrCreate(client)
+	state.access.Lock()
+	state.cgroupOriginals[redirectAddress] = original
+	state.socketCookie = original.SocketCookie
+	state.cgroupDataPlane = true
+	state.bindings[original.Destination] = udpRedirectBinding{
+		redirectAddress: redirectAddress,
+		packetInfo:      sourcePacketInfo(redirectAddress),
+		connected:       original.ConnectedUDP,
 	}
-	clientState := &udpClientState{
-		bindings:   make(map[netip.AddrPort]udpRedirectBinding),
-		originals:  make(map[netip.Addr]udpOriginalDestination),
-		lastActive: time.Now(),
+	state.access.Unlock()
+}
+
+func (t *udpClientTable) setCgroupReplyBinding(client netip.AddrPort, expected *udpClientState, destination netip.AddrPort, redirectAddress netip.Addr) bool {
+	shard := t.clientShard(client)
+	shard.access.RLock()
+	defer shard.access.RUnlock()
+	if shard.clients[client] != expected {
+		return false
 	}
-	s.clients[client] = clientState
-	return clientState
+	expected.access.Lock()
+	defer expected.access.Unlock()
+	if expected.closed || expected.replyAliasCount >= udpReplyAliasLimit {
+		return false
+	}
+	expected.cgroupOriginals[redirectAddress] = commonEBPF.OriginalDestination{Destination: destination}
+	expected.cgroupDataPlane = true
+	expected.bindings[destination] = udpRedirectBinding{
+		replyAlias:      true,
+		redirectAddress: redirectAddress,
+		packetInfo:      sourcePacketInfo(redirectAddress),
+	}
+	expected.replyAliasCount++
+	return true
 }
 
 func (t *udpClientTable) clientShard(client netip.AddrPort) *udpClientShard {
 	port := client.Port()
-	index := (port ^ port>>8) & (udpClientShardCount - 1)
-	return &t.clientShards[index]
+	return &t.clientShards[(port^port>>8)&(udpClientShardCount-1)]
 }
 
-func (t *udpClientTable) cachedOriginal(client netip.AddrPort, redirectAddress netip.Addr) (udpOriginalDestination, bool) {
-	original, _, loaded := t.cachedPacketState(client, redirectAddress)
-	return original, loaded
-}
-
-func (t *udpClientTable) cachedPacketState(
-	client netip.AddrPort,
-	redirectAddress netip.Addr,
-) (udpOriginalDestination, bool, bool) {
-	clientState, loaded := t.load(client)
-	if !loaded {
-		return udpOriginalDestination{}, false, false
-	}
-	// A cache hit is the entire hot path of an established session: the callers
-	// only install a binding while bindingReady is false, so sweep would reclaim
-	// a session that is still passing traffic unless the read path refreshes
-	// lastActive itself. That write is why this takes the exclusive lock.
-	clientState.access.Lock()
-	original, loaded := clientState.originals[redirectAddress]
-	if !loaded {
-		clientState.access.Unlock()
-		return udpOriginalDestination{}, false, false
-	}
-	binding, bindingLoaded := clientState.bindings[original.original.Destination]
-	bindingReady := bindingLoaded &&
-		binding.address == redirectAddress &&
-		binding.connected == original.original.ConnectedUDP
-	clientState.lastActive = time.Now()
-	clientState.access.Unlock()
-	return original, bindingReady, true
-}
-
-func (t *udpClientTable) setBinding(
+func (t *udpClientTable) setDirectBinding(
 	client netip.AddrPort,
 	destination netip.AddrPort,
-	redirectAddress netip.Addr,
-	connected bool,
-) []netip.Addr {
-	releases, _ := t.setBindingState(
-		client,
-		redirectAddress,
-		udpRedirectReference{address: redirectAddress},
-		udpOriginalDestination{
-			original: ECommon.OriginalDestination{
-				Destination:  destination,
-				ConnectedUDP: connected,
-			},
-		},
-	)
-	addresses := make([]netip.Addr, 0, len(releases))
-	for _, release := range releases {
-		addresses = append(addresses, release.reference.address)
+	sourceMAC net.HardwareAddr,
+	socketCookie uint64,
+) {
+	state := t.loadOrCreate(client)
+	state.access.Lock()
+	defer state.access.Unlock()
+	if len(sourceMAC) > 0 {
+		state.sourceMAC = append(state.sourceMAC[:0], sourceMAC...)
 	}
-	return addresses
+	state.socketCookie = socketCookie
+	state.bindings[destination] = udpRedirectBinding{}
 }
 
-func (t *udpClientTable) setSharedBinding(
+func (t *udpClientTable) setDirectReplyBinding(
 	client netip.AddrPort,
-	original ECommon.OriginalDestination,
-	redirectAddress netip.Addr,
-	flow *ECommon.SharedNetworkFlowHandle,
-) ([]udpRedirectRelease, bool) {
-	return t.setBindingState(
-		client,
-		redirectAddress,
-		udpRedirectReference{client: client, address: redirectAddress},
-		udpOriginalDestination{
-			original:   original,
-			sharedFlow: flow,
-		},
-	)
-}
-
-func (t *udpClientTable) setSharedAssignmentBinding(
-	client netip.AddrPort,
-	original ECommon.OriginalDestination,
-) ([]udpRedirectRelease, bool) {
-	return t.setBindingState(
-		client,
-		original.Destination.Addr(),
-		udpRedirectReference{},
-		udpOriginalDestination{original: original, direct: true},
-	)
-}
-
-func (t *udpClientTable) setSharedAssignmentReplyBinding(
-	client netip.AddrPort,
-	expectedState *udpClientState,
-	original ECommon.OriginalDestination,
-) ([]udpRedirectRelease, bool) {
-	return t.setExistingBindingState(
-		client,
-		expectedState,
-		original.Destination.Addr(),
-		udpRedirectReference{},
-		udpOriginalDestination{original: original, replyAlias: true, direct: true},
-	)
-}
-
-func (t *udpClientTable) setExistingBindingState(
-	client netip.AddrPort,
-	expectedState *udpClientState,
-	redirectAddress netip.Addr,
-	reference udpRedirectReference,
-	original udpOriginalDestination,
-) ([]udpRedirectRelease, bool) {
+	expected *udpClientState,
+	destination netip.AddrPort,
+) bool {
 	shard := t.clientShard(client)
 	shard.access.RLock()
 	defer shard.access.RUnlock()
-	if shard.clients[client] != expectedState {
-		return nil, false
+	if shard.clients[client] != expected {
+		return false
 	}
-	return t.setClientBinding(expectedState, redirectAddress, reference, original)
+	expected.access.Lock()
+	defer expected.access.Unlock()
+	if expected.closed {
+		return false
+	}
+	if _, loaded := expected.bindings[destination]; loaded {
+		return true
+	}
+	if expected.replyAliasCount >= udpReplyAliasLimit {
+		return false
+	}
+	expected.bindings[destination] = udpRedirectBinding{replyAlias: true}
+	expected.replyAliasCount++
+	return true
 }
 
-func (t *udpClientTable) setBindingState(
-	client netip.AddrPort,
-	redirectAddress netip.Addr,
-	reference udpRedirectReference,
-	original udpOriginalDestination,
-) ([]udpRedirectRelease, bool) {
-	shard := t.clientShard(client)
-	shard.access.RLock()
-	clientState, loaded := shard.clients[client]
-	if loaded {
-		released, installed := t.setClientBinding(clientState, redirectAddress, reference, original)
-		shard.access.RUnlock()
-		return released, installed
-	}
-	shard.access.RUnlock()
-
-	shard.access.Lock()
-	clientState = shard.loadOrCreateLocked(client)
-	released, installed := t.setClientBinding(clientState, redirectAddress, reference, original)
-	shard.access.Unlock()
-	return released, installed
-}
-
-func (t *udpClientTable) setClientBinding(
-	clientState *udpClientState,
-	redirectAddress netip.Addr,
-	reference udpRedirectReference,
-	original udpOriginalDestination,
-) ([]udpRedirectRelease, bool) {
-	destination := original.original.Destination
-	connected := original.original.ConnectedUDP
-	clientState.access.RLock()
-	current, loaded := clientState.bindings[destination]
-	clientState.access.RUnlock()
-	if loaded && current.address == redirectAddress && current.connected == connected &&
-		current.replyAlias == original.replyAlias && current.direct == original.direct {
-		return nil, false
-	}
-
-	clientState.access.Lock()
-	defer clientState.access.Unlock()
-	current, loaded = clientState.bindings[destination]
-	clientState.lastActive = time.Now()
-	if original.replyAlias && (!loaded || !current.replyAlias) && clientState.replyAliasCount >= udpReplyAliasLimit {
-		return nil, false
-	}
-	clientState.originals[redirectAddress] = original
-	if len(original.original.SourceMAC) != 0 {
-		clientState.sourceMAC = append(clientState.sourceMAC[:0], original.original.SourceMAC...)
-	}
-	binding := udpRedirectBinding{
-		address:    redirectAddress,
-		packetInfo: sourcePacketInfo(redirectAddress),
-		connected:  connected,
-		reference:  reference,
-		sharedFlow: original.sharedFlow,
-		replyAlias: original.replyAlias,
-		direct:     original.direct,
-	}
-	clientState.bindings[destination] = binding
-	if original.replyAlias && (!loaded || !current.replyAlias) {
-		clientState.replyAliasCount++
-	} else if !original.replyAlias && loaded && current.replyAlias {
-		clientState.replyAliasCount--
-	}
-	if clientState.connected && clientState.connectedDestination == destination {
-		connectedBinding := binding
-		clientState.connectedBinding.Store(&connectedBinding)
-	}
-	if loaded && current.address != redirectAddress {
-		clientState.deleteUnusedOriginalLocked(current.address)
-	}
-
-	t.redirectAccess.Lock()
-	defer t.redirectAccess.Unlock()
-	if !connected && !binding.direct {
-		t.retainRedirectLocked(reference)
-	}
-	if loaded && !current.connected && !current.direct && t.releaseRedirectLocked(current.reference) {
-		return []udpRedirectRelease{{
-			reference:  current.reference,
-			sharedFlow: current.sharedFlow,
-		}}, true
-	}
-	return nil, true
-}
-
-func (s *udpClientState) deleteUnusedOriginalLocked(address netip.Addr) {
-	for _, binding := range s.bindings {
-		if binding.address == address {
-			return
-		}
-	}
-	delete(s.originals, address)
-}
-
-func (t *udpClientTable) delete(client netip.AddrPort, expectedState *udpClientState) []netip.Addr {
-	releases := t.deleteClient(client, expectedState)
-	addresses := make([]netip.Addr, 0, len(releases))
-	for _, release := range releases {
-		addresses = append(addresses, release.reference.address)
-	}
-	return addresses
-}
-
-// deleteShared releases a shared-network client's bindings, returning the TC
-// flow handles to release.
-func (t *udpClientTable) deleteShared(client netip.AddrPort, expectedState *udpClientState) []udpRedirectRelease {
-	return t.deleteClient(client, expectedState)
-}
-
-func (t *udpClientTable) deleteClient(client netip.AddrPort, expectedState *udpClientState) []udpRedirectRelease {
+func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState) []netip.Addr {
 	shard := t.clientShard(client)
 	shard.access.Lock()
 	defer shard.access.Unlock()
-	if shard.clients[client] != expectedState {
+	if shard.clients[client] != expected {
 		return nil
 	}
 	delete(shard.clients, client)
-
-	expectedState.access.Lock()
-	defer expectedState.access.Unlock()
-	t.redirectAccess.Lock()
-	defer t.redirectAccess.Unlock()
-	var released []udpRedirectRelease
-	for _, binding := range expectedState.bindings {
-		if !binding.connected && !binding.direct && t.releaseRedirectLocked(binding.reference) {
-			released = append(released, udpRedirectRelease{
-				reference:  binding.reference,
-				sharedFlow: binding.sharedFlow,
-			})
-		}
+	shard.sweep.remove(&expected.sweep)
+	expected.access.Lock()
+	redirects := make([]netip.Addr, 0, len(expected.cgroupOriginals))
+	for address := range expected.cgroupOriginals {
+		redirects = append(redirects, address)
 	}
-	clear(expectedState.bindings)
-	clear(expectedState.originals)
-	expectedState.replyAliasCount = 0
-	expectedState.connectedBinding.Store(nil)
-	return released
+	expected.closed = true
+	clear(expected.bindings)
+	clear(expected.cgroupOriginals)
+	expected.cgroupDataPlane = false
+	expected.replyAliasCount = 0
+	expected.access.Unlock()
+	return redirects
 }
 
-// sweep removes client states that have been idle for longer than timeout and
-// passes their released bindings to release. The caller decides whether to
-// delete cgroup redirect entries or shared-network TC flow handles.
-func (t *udpClientTable) sweep(now time.Time, timeout time.Duration, release func(releases []udpRedirectRelease)) {
-	var clients []*udpClientState
-	for index := range t.clientShards {
-		shard := &t.clientShards[index]
-		shard.access.RLock()
-		for _, clientState := range shard.clients {
-			clientState.access.RLock()
-			idle := now.Sub(clientState.lastActive)
-			clientState.access.RUnlock()
-			if idle > timeout {
-				clients = append(clients, clientState)
-			}
-		}
-		shard.access.RUnlock()
-	}
-	for _, clientState := range clients {
-		releases := t.deleteClientByState(clientState)
-		release(releases)
-	}
-}
-
-func (t *udpClientTable) deleteClientByState(expectedState *udpClientState) []udpRedirectRelease {
-	for index := range t.clientShards {
-		shard := &t.clientShards[index]
-		shard.access.Lock()
-		for client, state := range shard.clients {
-			if state == expectedState {
-				delete(shard.clients, client)
-				shard.access.Unlock()
-				return t.releaseClientState(expectedState)
-			}
-		}
-		shard.access.Unlock()
-	}
-	return nil
-}
-
-func (t *udpClientTable) releaseClientState(expectedState *udpClientState) []udpRedirectRelease {
-	expectedState.access.Lock()
-	defer expectedState.access.Unlock()
-	t.redirectAccess.Lock()
-	defer t.redirectAccess.Unlock()
-	var released []udpRedirectRelease
-	for _, binding := range expectedState.bindings {
-		if !binding.connected && !binding.direct && t.releaseRedirectLocked(binding.reference) {
-			released = append(released, udpRedirectRelease{
-				reference:  binding.reference,
-				sharedFlow: binding.sharedFlow,
-			})
-		}
-	}
-	clear(expectedState.bindings)
-	clear(expectedState.originals)
-	expectedState.replyAliasCount = 0
-	expectedState.connectedBinding.Store(nil)
-	return released
-}
-
-func (t *udpClientTable) retainRedirectLocked(reference udpRedirectReference) {
-	if t.redirectReferences == nil {
-		t.redirectReferences = make(map[udpRedirectReference]uint32)
-	}
-	t.redirectReferences[reference]++
-}
-
-func (t *udpClientTable) releaseRedirectLocked(reference udpRedirectReference) bool {
-	references := t.redirectReferences[reference]
-	if references > 1 {
-		t.redirectReferences[reference] = references - 1
-		return false
-	}
-	if references == 1 {
-		delete(t.redirectReferences, reference)
-		return true
-	}
-	return false
-}
-
-func (s *udpClientState) redirectBinding(destination netip.AddrPort) (udpRedirectBinding, bool) {
-	if binding := s.connectedBinding.Load(); binding != nil {
-		return *binding, true
-	}
-	s.access.RLock()
-	if s.connected {
-		destination = s.connectedDestination
-	}
-	binding, loaded := s.bindings[destination]
-	s.access.RUnlock()
-	return binding, loaded
-}
-
-// replyTemplate returns an existing binding of the matching address family to
-// derive a reply alias from when a direct lookup misses.
-func (s *udpClientState) replyTemplate(destination netip.AddrPort, shared bool) (udpRedirectBinding, bool) {
+func (s *udpClientState) isCgroupDataPlane() bool {
 	s.access.RLock()
 	defer s.access.RUnlock()
-	if s.replyAliasCount >= udpReplyAliasLimit {
-		return udpRedirectBinding{}, false
-	}
-	for _, binding := range s.bindings {
-		if binding.address.Is4() == destination.Addr().Is4() && (!shared || binding.sharedFlow != nil) {
-			return binding, true
-		}
-	}
-	return udpRedirectBinding{}, false
-}
-
-func (s *udpClientState) sourceMACAddress() net.HardwareAddr {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return append(net.HardwareAddr(nil), s.sourceMAC...)
+	return s.cgroupDataPlane
 }
 
 func sourcePacketInfo(address netip.Addr) []byte {
@@ -492,27 +223,315 @@ func sourcePacketInfo(address netip.Addr) []byte {
 	return (&ipv6.ControlMessage{Src: net.IP(address.AsSlice())}).Marshal()
 }
 
-func (s *udpClientState) setConnected(connected bool, destination netip.AddrPort) {
-	s.access.Lock()
-	s.connected = connected
-	if connected {
-		s.connectedDestination = destination
-		if binding, loaded := s.bindings[destination]; loaded {
-			connectedBinding := binding
-			s.connectedBinding.Store(&connectedBinding)
-		} else {
-			s.connectedBinding.Store(nil)
-		}
-	} else {
-		s.connectedDestination = netip.AddrPort{}
-		s.connectedBinding.Store(nil)
-	}
-	s.access.Unlock()
+// udpReplySocketPool shares transparent reply sockets between all clients of
+// an inbound. A socket bound to an original destination can send replies to any
+// client, so keeping it at client-state scope needlessly multiplies sockets.
+type udpReplySocketPool struct {
+	shards [udpClientShardCount]udpReplySocketShard
+	closed atomic.Bool
 }
 
-func (s *udpClientState) isConnected() bool {
+type udpReplySocketShard struct {
+	access sync.Mutex
+	// live includes retired sockets which still have an active lease. Keeping
+	// those in the count makes the descriptor bound strict even when every
+	// cached socket is concurrently writing.
+	live    int
+	sockets map[netip.AddrPort]*udpReplySocketEntry
+	newest  *udpReplySocketEntry
+	oldest  *udpReplySocketEntry
+}
+
+type udpReplySocketEntry struct {
+	source   netip.AddrPort
+	socket   *net.UDPConn
+	newer    *udpReplySocketEntry
+	older    *udpReplySocketEntry
+	lastUsed time.Time
+	leases   int
+	retired  bool
+}
+
+// udpReplySocketLease pins an entry until the caller finishes its sendmsg.
+// Eviction, idle sweeping, reset, and close can unlink a leased entry, but its
+// socket is closed only after the last lease is released.
+type udpReplySocketLease struct {
+	shard *udpReplySocketShard
+	entry *udpReplySocketEntry
+}
+
+func (p *udpReplySocketPool) lease(
+	source netip.AddrPort,
+	create func(netip.AddrPort) (*net.UDPConn, error),
+) (udpReplySocketLease, error) {
+	if p.closed.Load() {
+		return udpReplySocketLease{}, net.ErrClosed
+	}
+	shard := &p.shards[p.shardIndex(source)]
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	if p.closed.Load() {
+		return udpReplySocketLease{}, net.ErrClosed
+	}
+	if entry := shard.sockets[source]; entry != nil {
+		entry.leases++
+		return udpReplySocketLease{shard: shard, entry: entry}, nil
+	}
+	if shard.live >= udpReplySocketShardCapacity {
+		entry := shard.oldest
+		for entry != nil && entry.leases != 0 {
+			entry = entry.newer
+		}
+		if entry == nil {
+			return udpReplySocketLease{}, errUDPReplySocketPoolBusy
+		}
+		socket := shard.retireLocked(entry)
+		// The entry has no lease, so closing under the shard lock cannot block a
+		// writer and prevents a replacement bind from racing the old socket.
+		_ = socket.Close()
+	}
+	socket, err := create(source)
+	if err != nil {
+		return udpReplySocketLease{}, err
+	}
+	if shard.sockets == nil {
+		shard.sockets = make(map[netip.AddrPort]*udpReplySocketEntry)
+	}
+	entry := &udpReplySocketEntry{
+		source:   source,
+		socket:   socket,
+		lastUsed: time.Now(),
+		leases:   1,
+	}
+	shard.sockets[source] = entry
+	shard.live++
+	shard.insertNewestLocked(entry)
+	return udpReplySocketLease{shard: shard, entry: entry}, nil
+}
+
+func (p *udpReplySocketPool) shardIndex(source netip.AddrPort) int {
+	address := source.Addr().As16()
+	hash := uint32(source.Port()) * 0x9e3779b1
+	for offset := 0; offset < len(address); offset += 4 {
+		hash ^= uint32(address[offset])<<24 |
+			uint32(address[offset+1])<<16 |
+			uint32(address[offset+2])<<8 |
+			uint32(address[offset+3])
+		hash *= 0x85ebca6b
+	}
+	hash ^= hash >> 16
+	return int(hash & (udpClientShardCount - 1))
+}
+
+func (l udpReplySocketLease) release() {
+	if l.entry == nil {
+		return
+	}
+	shard := l.shard
+	shard.access.Lock()
+	entry := l.entry
+	if entry.leases == 0 {
+		shard.access.Unlock()
+		return
+	}
+	entry.leases--
+	if !entry.retired {
+		entry.lastUsed = time.Now()
+		shard.moveNewestLocked(entry)
+		shard.access.Unlock()
+		return
+	}
+	if entry.leases == 0 {
+		socket := entry.socket
+		entry.socket = nil
+		shard.live--
+		_ = socket.Close()
+	}
+	shard.access.Unlock()
+}
+
+func (s *udpReplySocketShard) insertNewestLocked(entry *udpReplySocketEntry) {
+	entry.newer = nil
+	entry.older = s.newest
+	if s.newest != nil {
+		s.newest.newer = entry
+	} else {
+		s.oldest = entry
+	}
+	s.newest = entry
+}
+
+func (s *udpReplySocketShard) moveNewestLocked(entry *udpReplySocketEntry) {
+	if s.newest == entry {
+		return
+	}
+	s.unlinkLocked(entry)
+	s.insertNewestLocked(entry)
+}
+
+func (s *udpReplySocketShard) unlinkLocked(entry *udpReplySocketEntry) {
+	if entry.newer != nil {
+		entry.newer.older = entry.older
+	} else {
+		s.newest = entry.older
+	}
+	if entry.older != nil {
+		entry.older.newer = entry.newer
+	} else {
+		s.oldest = entry.newer
+	}
+	entry.newer = nil
+	entry.older = nil
+}
+
+// retireLocked removes an entry from the reusable cache. The caller may close
+// the returned socket immediately; a nil return means an active lease owns the
+// eventual close.
+func (s *udpReplySocketShard) retireLocked(entry *udpReplySocketEntry) *net.UDPConn {
+	delete(s.sockets, entry.source)
+	s.unlinkLocked(entry)
+	entry.retired = true
+	if entry.leases != 0 {
+		return nil
+	}
+	socket := entry.socket
+	entry.socket = nil
+	s.live--
+	return socket
+}
+
+func (p *udpReplySocketPool) close() error {
+	if !p.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	return p.closeSockets()
+}
+
+// reset closes sockets tied to the previous network path while keeping the
+// pool usable for the next interface generation.
+func (p *udpReplySocketPool) reset() error {
+	if p == nil || p.closed.Load() {
+		return nil
+	}
+	return p.closeSockets()
+}
+
+// sweepIdle closes sockets which have not completed a write within maxIdle.
+// A leased socket is never considered idle even if its sendmsg is long-lived.
+func (p *udpReplySocketPool) sweepIdle(now time.Time, maxIdle time.Duration) error {
+	if p == nil || p.closed.Load() || maxIdle <= 0 {
+		return nil
+	}
+	cutoff := now.Add(-maxIdle)
+	var closeErr error
+	for index := range p.shards {
+		shard := &p.shards[index]
+		shard.access.Lock()
+		for entry := shard.oldest; entry != nil; {
+			next := entry.newer
+			if entry.leases == 0 && !entry.lastUsed.After(cutoff) {
+				socket := shard.retireLocked(entry)
+				closeErr = errors.Join(closeErr, socket.Close())
+			}
+			entry = next
+		}
+		shard.access.Unlock()
+	}
+	return closeErr
+}
+
+func (p *udpReplySocketPool) closeSockets() error {
+	var closeErr error
+	for index := range p.shards {
+		shard := &p.shards[index]
+		shard.access.Lock()
+		for _, entry := range shard.sockets {
+			if socket := shard.retireLocked(entry); socket != nil {
+				closeErr = errors.Join(closeErr, socket.Close())
+			}
+		}
+		shard.sockets = nil
+		shard.access.Unlock()
+	}
+	return closeErr
+}
+
+func (s *udpClientState) redirectBinding(destination netip.AddrPort) (udpRedirectBinding, bool) {
 	s.access.RLock()
-	connected := s.connected
+	binding, loaded := s.bindings[destination]
 	s.access.RUnlock()
-	return connected
+	return binding, loaded
+}
+
+func (s *udpClientState) hasAddressFamily(ipv4 bool) bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	if s.replyAliasCount >= udpReplyAliasLimit {
+		return false
+	}
+	for destination := range s.bindings {
+		if destination.Addr().Is4() == ipv4 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *udpClientState) sourceMACAddress() net.HardwareAddr {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return append(net.HardwareAddr(nil), s.sourceMAC...)
+}
+
+func (s *udpClientState) processSocketCookie() uint64 {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return s.socketCookie
+}
+
+// localAddr returns the address the tunnel keys its NAT table on. It is the
+// same for every packet of a client, so it is built once: formatting the
+// client address and allocating a net.UDPAddr per packet was pure overhead on
+// the read loop.
+func (s *udpClientState) localAddr(client netip.AddrPort) net.Addr {
+	s.access.RLock()
+	lAddr := s.lAddr
+	s.access.RUnlock()
+	if lAddr != nil {
+		return lAddr
+	}
+	s.access.Lock()
+	if s.lAddr == nil {
+		s.lAddr = N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client))
+	}
+	lAddr = s.lAddr
+	s.access.Unlock()
+	return lAddr
+}
+
+// hasDirectBinding reports whether a TC client already has a validated
+// binding for destination, so the per-flow assignment lookup can be skipped
+// for the packets that follow the first one. Reply aliases do not count: they
+// were installed for a remote that answered, not for a flow the kernel
+// assigned.
+func (t *udpClientTable) hasDirectBinding(client netip.AddrPort, destination netip.AddrPort) bool {
+	state, loaded := t.load(client)
+	if !loaded {
+		return false
+	}
+	state.access.RLock()
+	binding, loaded := state.bindings[destination]
+	ready := loaded && !binding.replyAlias && !state.closed && !state.cgroupDataPlane
+	state.access.RUnlock()
+	return ready
+}
+
+// replyBinding reads the reply binding and the data plane of the client in one
+// critical section; the reply path needs both for every packet it writes.
+func (s *udpClientState) replyBinding(destination netip.AddrPort) (udpRedirectBinding, bool, bool) {
+	s.access.RLock()
+	binding, loaded := s.bindings[destination]
+	cgroupDataPlane := s.cgroupDataPlane
+	s.access.RUnlock()
+	return binding, loaded, cgroupDataPlane
 }

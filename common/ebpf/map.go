@@ -15,28 +15,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func probeNonCommonLRU() bool {
-	capacity := max(uint32(64), uint32(runtime.NumCPU()*2))
-	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
-		Name:       "sb_lru_probe",
-		Type:       CiliumEBPF.LRUHash,
-		KeySize:    4,
-		ValueSize:  4,
-		MaxEntries: capacity,
-		Flags:      unix.BPF_F_NO_COMMON_LRU,
-	})
-	if err != nil {
-		return false
-	}
-	_ = mapInstance.Close()
-	return true
-}
-
-func lruMapFlagUnsupported(err error) bool {
-	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) ||
-		errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, linuxErrnoNotSupported)
-}
-
 const (
 	bpfMapLookupElem          = 1
 	bpfMapUpdateElem          = 2
@@ -92,39 +70,6 @@ func deleteMap(mapFD int, key unsafe.Pointer) error {
 	return mapOperation(bpfMapDeleteElem, mapFD, key, nil, 0)
 }
 
-func countMapEntries(mapFD int, keySize uintptr, capacity uint32) (uint32, error) {
-	if keySize == 0 || capacity == 0 {
-		return 0, unix.EINVAL
-	}
-	current := make([]byte, keySize)
-	next := make([]byte, keySize)
-	seen := make(map[string]struct{})
-	var currentPointer unsafe.Pointer
-	for uint32(len(seen)) <= capacity {
-		err := mapOperation(
-			bpfMapGetNextKey,
-			mapFD,
-			currentPointer,
-			unsafe.Pointer(&next[0]),
-			0,
-		)
-		if errors.Is(err, unix.ENOENT) {
-			return uint32(len(seen)), nil
-		}
-		if err != nil {
-			return 0, err
-		}
-		encoded := string(next)
-		if _, loaded := seen[encoded]; loaded {
-			return uint32(len(seen)), nil
-		}
-		seen[encoded] = struct{}{}
-		copy(current, next)
-		currentPointer = unsafe.Pointer(&current[0])
-	}
-	return uint32(len(seen)), nil
-}
-
 func (s *mapScanScratch[K, V]) scan(
 	mapInstance *CiliumEBPF.Map,
 	capacity uint32,
@@ -167,12 +112,7 @@ func (s *mapScanScratch[K, V]) scanBatch(
 	var scanned uint32
 	for scanned < capacity {
 		batchSize := min(uint32(mapBatchMaxEntries), capacity-scanned)
-		countValue, err := mapInstance.BatchLookup(
-			&cursor,
-			s.keys[:batchSize],
-			s.values[:batchSize],
-			nil,
-		)
+		countValue, err := mapInstance.BatchLookup(&cursor, s.keys[:batchSize], s.values[:batchSize], nil)
 		count := uint32(countValue)
 		for index := range count {
 			visit(s.keys[index], s.values[index])
@@ -355,35 +295,6 @@ func deleteMapBatch[K any](
 	return total, nil
 }
 
-func deleteMapBatchIfExists[K any](
-	mapInstance *CiliumEBPF.Map,
-	keys []K,
-	support *mapBatchSupport,
-) (uint32, error) {
-	processed, err := deleteMapBatch(mapInstance, keys, support)
-	if err == nil {
-		return processed, nil
-	}
-	if !errors.Is(err, unix.ENOENT) && !errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
-		return processed, err
-	}
-	if mapInstance == nil {
-		return processed, errBackendClosed
-	}
-	mapFD := mapInstance.FD()
-	for index := int(processed); index < len(keys); index++ {
-		deleteErr := deleteMap(mapFD, unsafe.Pointer(&keys[index]))
-		if errors.Is(deleteErr, unix.ENOENT) || errors.Is(deleteErr, CiliumEBPF.ErrKeyNotExist) {
-			continue
-		}
-		if deleteErr != nil {
-			return processed, deleteErr
-		}
-		processed++
-	}
-	return processed, nil
-}
-
 func deleteMapBatchChunk[K any](
 	mapInstance *CiliumEBPF.Map,
 	keys []K,
@@ -436,24 +347,6 @@ func mapOperation(command uintptr, mapFD int, key unsafe.Pointer, value unsafe.P
 		return errno
 	}
 	return nil
-}
-
-func readSocketCookie(fd uintptr) (uint64, error) {
-	var cookie uint64
-	length := uint32(unsafe.Sizeof(cookie))
-	_, _, errno := unix.Syscall6(
-		unix.SYS_GETSOCKOPT,
-		fd,
-		unix.SOL_SOCKET,
-		unix.SO_COOKIE,
-		uintptr(unsafe.Pointer(&cookie)),
-		uintptr(unsafe.Pointer(&length)),
-		0,
-	)
-	if errno != 0 {
-		return 0, errno
-	}
-	return cookie, nil
 }
 
 var errBackendClosed = syscall.EBADF

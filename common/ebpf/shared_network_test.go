@@ -10,14 +10,8 @@ import (
 )
 
 func TestSharedNetworkABI(t *testing.T) {
-	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 88 {
+	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 80 {
 		t.Fatalf("unexpected shared-network control size: %d", size)
-	}
-	if size := unsafe.Sizeof(sharedNetworkAssignKey{}); size != 40 {
-		t.Fatalf("unexpected shared-network assignment key size: %d", size)
-	}
-	if size := unsafe.Sizeof(sharedNetworkAssignValue{}); size != 12 {
-		t.Fatalf("unexpected shared-network assignment value size: %d", size)
 	}
 	if size := unsafe.Sizeof(sharedNetworkListenerKey{}); size != 40 {
 		t.Fatalf("unexpected shared-network listener key size: %d", size)
@@ -40,6 +34,9 @@ func TestSharedNetworkABI(t *testing.T) {
 	if sharedNetworkFlagBypassFlowCache != 1<<14 {
 		t.Fatalf("unexpected shared-network bypass-flow-cache flag: %#x", sharedNetworkFlagBypassFlowCache)
 	}
+	if sharedNetworkFlagBypassPort != 1<<15 {
+		t.Fatalf("unexpected shared-network bypass-port flag: %#x", sharedNetworkFlagBypassPort)
+	}
 	if sharedNetworkFlagFakeIPIPv4 != 1<<16 || sharedNetworkFlagFakeIPIPv6 != 1<<17 {
 		t.Fatalf(
 			"unexpected shared-network FakeIP flags: IPv4=%#x IPv6=%#x",
@@ -49,6 +46,9 @@ func TestSharedNetworkABI(t *testing.T) {
 	}
 	if sharedNetworkPolicyFlags != 0x5fe0 {
 		t.Fatalf("unexpected shared-network policy flags: %#x", sharedNetworkPolicyFlags)
+	}
+	if sharedNetworkPolicyFlags&sharedNetworkFlagBypassPort != 0 {
+		t.Fatal("runtime policy updates would clear the static shared bypass-port flag")
 	}
 }
 

@@ -27,16 +27,15 @@ func (b *CgroupBackend) Close() error {
 	b.udpRecoveryMapFD = -1
 	b.udpFlowMapFD = -1
 	b.socketBypassMapFD = -1
-	b.pendingSocketCookies = nil
 	b.bypassIPv4CIDRMapFD = -1
 	b.bypassIPv6CIDRMapFD = -1
 	b.hostIPv4MapFD = -1
 	b.hostIPv6MapFD = -1
-	b.ipv6AvailableMapFD = -1
 	b.bypassIPv4CIDR = nil
 	b.bypassIPv6CIDR = nil
 	b.hostIPv4 = nil
 	b.hostIPv6 = nil
+	b.listenerPort = 0
 	return closeErr
 }
 

@@ -12,6 +12,8 @@ import (
 	E "github.com/metacubex/sing/common/exceptions"
 
 	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
@@ -56,7 +58,6 @@ type cgroupRuntime struct {
 	links                       [cgroupProgramCount]link.Link
 	attached                    [cgroupProgramCount]bool
 	control_map_fd              int
-	stats_map_fd                int
 	tcp_redirect_map_fd         int
 	udp_redirect_map_fd         int
 	udp_recovery_map_fd         int
@@ -69,56 +70,39 @@ type cgroupRuntime struct {
 	bypass_ipv6_cidr_map_fd     int
 	host_ipv4_map_fd            int
 	host_ipv6_map_fd            int
-	ipv6_available_map_fd       int
 	socket_release_supported    bool
-	self_bypass_tgid            bool
+	coarse_time_supported       bool
+	socket_storage_supported    bool
 	enable_tcp                  bool
 	enable_udp                  bool
 	uid_policy                  bool
 	uid_default_bypass          bool
 	bypass_ipv4_policy          bool
 	bypass_ipv6_policy          bool
-	auto_ipv6                   bool
-	socket_bypass_capacity      uint32
+	bypass_port_policy          bool
 }
 
 type CgroupBackend struct {
 	access                         sync.RWMutex
 	health                         backendHealth
-	tcpSweepAccess                 sync.Mutex
-	udpSweepAccess                 sync.Mutex
 	udpRecoveryAccess              sync.Mutex
 	udpReplyTokenSequence          atomic.Uint64
-	tcpSweepScratch                mapScanScratch[listenerLookupKey, originalDestinationValue]
-	tcpSweepCandidates             []tcpRedirectEntry
 	connectedUDPTokenLookupSupport mapBatchSupport
 	connectedUDPTokenKeys          []uint64
 	connectedUDPTokenValues        []listenerLookupKey
-	tcpSweepRemoved                uint32
-	udpSweepScratch                mapScanScratch[listenerLookupKey, originalDestinationValue]
-	udpSweepCandidates             []tcpRedirectEntry
-	udpSweepRemoved                uint32
-	tcpRedirectUsage               atomic.Uint32
-	tcpRedirectUsageKnown          atomic.Bool
 	lookupAndDeleteMode            atomic.Int32
 	udpRecoveryConsumeMode         atomic.Int32
-	udpRecoveryUpdateFailures      atomic.Uint64
-	statusCollector                runtimeStatusCollector
-	selfBypassTGID                 atomic.Bool
 	runtime                        *cgroupRuntime
-	statsMapFD                     int
 	mapCapacity                    CgroupMapCapacity
 	tcpRedirectMapFD               int
 	udpRedirectMapFD               int
 	udpRecoveryMapFD               int
 	udpFlowMapFD                   int
 	socketBypassMapFD              int
-	pendingSocketCookies           map[uint64]struct{}
 	bypassIPv4CIDRMapFD            int
 	bypassIPv6CIDRMapFD            int
 	hostIPv4MapFD                  int
 	hostIPv6MapFD                  int
-	ipv6AvailableMapFD             int
 	bypassIPv4CIDR                 []netip.Prefix
 	bypassIPv6CIDR                 []netip.Prefix
 	hostIPv4                       []netip.Prefix
@@ -129,12 +113,11 @@ type CgroupBackend struct {
 	fakeIPIPv4                     netip.Prefix
 	fakeIPIPv6                     netip.Prefix
 	enableIPv6                     bool
-	autoIPv6                       bool
-	ipv6Available                  bool
 	enableUDP                      bool
 	dnsMode                        DNSMode
 	bypassPrivateAddress           bool
 	udpTimeoutSeconds              uint32
+	listenerPort                   uint16
 }
 
 func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
@@ -143,14 +126,9 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	redirectIPv6 := config.RedirectIPv6
 	mapCapacity := config.MapCapacity
 	policy := config.Policy
-	fakeIPIPv4, err := normalizeAddressPrefix("IPv4 FakeIP range", config.FakeIPIPv4, true)
-	if err != nil {
-		return nil, err
-	}
-	fakeIPIPv6, err := normalizeAddressPrefix("IPv6 FakeIP range", config.FakeIPIPv6, false)
-	if err != nil {
-		return nil, err
-	}
+	var err error
+	fakeIPIPv4 := policy.fakeIPIPv4
+	fakeIPIPv6 := policy.fakeIPIPv6
 	if err := validateCgroupMapCapacity(mapCapacity); err != nil {
 		return nil, err
 	}
@@ -178,9 +156,6 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	if config.EnableIPv6 && !redirectIPv6.IsValid() {
 		return nil, E.New("missing IPv6 eBPF redirect address")
 	}
-	if config.AutoIPv6 && !config.EnableIPv6 {
-		return nil, E.New("automatic IPv6 interception requires enabled IPv6 interception")
-	}
 	if !redirectIPv4.IsValid() && !config.EnableIPv6 {
 		return nil, E.New("eBPF cgroup backend has no enabled address family")
 	}
@@ -191,15 +166,12 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 			return nil, err
 		}
 	}
-	uidPolicyEntries, uidDefaultBypass, err := compileUIDPolicy(policy)
-	if err != nil {
-		return nil, err
-	}
+	uidPolicyEntries, uidDefaultBypass := policy.uidEntries, policy.uidDefaultBypass
 	if err = checkLPMTriePolicyCompatibility("UID", len(uidPolicyEntries)); err != nil {
 		return nil, err
 	}
 	if cgroupPath == "" {
-		cgroupPath, err = DetectCgroup2Mount()
+		cgroupPath, err = DetectCgroup2Root()
 		if err != nil {
 			return nil, err
 		}
@@ -227,7 +199,11 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		return nil, eBPFOperationError("detach stale cgroup programs", err)
 	}
 	socketReleaseSupported := false
+	coarseTimeSupported := false
+	socketStorageSupported := false
 	if config.EnableUDP {
+		coarseTimeSupported = features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnKtimeGetCoarseNs) == nil
+		socketStorageSupported = probeCgroupSocketStorageSupport()
 		socketReleaseSupported, err = probeSocketReleaseSupport(int(cgroupFile.Fd()))
 		if err != nil {
 			_ = cgroupFile.Close()
@@ -235,21 +211,21 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		}
 	}
 	runtimeState := &cgroupRuntime{
-		cgroupFile:                  cgroupFile,
-		maps:                        make(map[string]*CiliumEBPF.Map),
-		programs:                    make([]*CiliumEBPF.Program, cgroupProgramCount),
-		enable_tcp:                  config.EnableTCP,
-		enable_udp:                  config.EnableUDP,
-		uid_policy:                  len(uidPolicyEntries) > 0 || uidDefaultBypass,
-		uid_default_bypass:          uidDefaultBypass,
-		bypass_ipv4_policy:          policy.EnableBypassCIDR && redirectIPv4.IsValid(),
-		bypass_ipv6_policy:          policy.EnableBypassCIDR && redirectIPv6.IsValid(),
-		auto_ipv6:                   config.AutoIPv6,
-		socket_release_supported:    socketReleaseSupported,
-		socket_bypass_capacity:      mapCapacity.SocketBypass,
-		bypass_socket_cookie_map_fd: -1,
+		cgroupFile:               cgroupFile,
+		maps:                     make(map[string]*CiliumEBPF.Map),
+		programs:                 make([]*CiliumEBPF.Program, cgroupProgramCount),
+		enable_tcp:               config.EnableTCP,
+		enable_udp:               config.EnableUDP,
+		uid_policy:               len(uidPolicyEntries) > 0 || uidDefaultBypass,
+		uid_default_bypass:       uidDefaultBypass,
+		bypass_ipv4_policy:       policy.local.EnableBypassCIDR && redirectIPv4.IsValid(),
+		bypass_ipv6_policy:       policy.local.EnableBypassCIDR && redirectIPv6.IsValid(),
+		bypass_port_policy:       len(policy.localBypassPortEntries) > 0,
+		socket_release_supported: socketReleaseSupported,
+		coarse_time_supported:    coarseTimeSupported,
+		socket_storage_supported: socketStorageSupported,
 	}
-	if err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries)); err != nil {
+	if err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries), config.SelfBypassMap); err != nil {
 		_ = closeMaps(runtimeState.maps)
 		_ = runtimeState.cgroupFile.Close()
 		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
@@ -261,37 +237,32 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		mapCapacity:          mapCapacity,
 		runtime:              runtimeState,
 		tcpRedirectMapFD:     runtimeState.tcp_redirect_map_fd,
-		statsMapFD:           runtimeState.stats_map_fd,
 		udpRedirectMapFD:     runtimeState.udp_redirect_map_fd,
 		udpRecoveryMapFD:     runtimeState.udp_recovery_map_fd,
 		udpFlowMapFD:         runtimeState.udp_flow_map_fd,
-		socketBypassMapFD:    -1,
+		socketBypassMapFD:    runtimeState.bypass_socket_cookie_map_fd,
 		bypassIPv4CIDRMapFD:  runtimeState.bypass_ipv4_cidr_map_fd,
 		bypassIPv6CIDRMapFD:  runtimeState.bypass_ipv6_cidr_map_fd,
 		hostIPv4MapFD:        runtimeState.host_ipv4_map_fd,
 		hostIPv6MapFD:        runtimeState.host_ipv6_map_fd,
-		ipv6AvailableMapFD:   runtimeState.ipv6_available_map_fd,
 		cgroupPath:           cgroupPath,
 		redirectIPv4:         redirectIPv4,
 		redirectIPv6:         redirectIPv6,
 		fakeIPIPv4:           fakeIPIPv4,
 		fakeIPIPv6:           fakeIPIPv6,
 		enableIPv6:           config.EnableIPv6,
-		autoIPv6:             config.AutoIPv6,
 		enableUDP:            config.EnableUDP,
-		dnsMode:              policy.DNSMode,
-		bypassPrivateAddress: policy.BypassPrivateAddress,
+		dnsMode:              policy.local.DNSMode,
+		bypassPrivateAddress: policy.local.BypassPrivateAddress,
 		udpTimeoutSeconds:    udpTimeoutSeconds,
 	}
-	if config.AutoIPv6 {
-		if _, err = backend.updateIPv6AvailableLocked(config.IPv6Available); err != nil {
-			_ = backend.Close()
-			return nil, E.Cause(err, "initialize IPv6 availability eBPF map")
-		}
-	}
-	if err = populateUIDPolicyMap(runtimeState.maps["cgroup_uid_policy"], uidPolicyEntries); err != nil {
+	if err = populateCompiledPolicyMaps(policyMapTargets{
+		Scope:     "cgroup eBPF",
+		UID:       runtimeState.maps["cgroup_uid_policy"],
+		LocalPort: runtimeState.maps["cgroup_bypass_port"],
+	}, policy); err != nil {
 		_ = backend.Close()
-		return nil, E.Cause(err, "populate UID policy eBPF map")
+		return nil, err
 	}
 	return backend, nil
 }

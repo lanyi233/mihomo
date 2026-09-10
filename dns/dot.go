@@ -3,14 +3,11 @@ package dns
 import (
 	"context"
 	"fmt"
-	"github.com/metacubex/mihomo/component/resolver"
 	"net"
 	"runtime"
-	"sync"
-	"time"
 
-	"github.com/metacubex/mihomo/common/deque"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 
 	"github.com/metacubex/tls"
@@ -27,8 +24,8 @@ type dnsOverTLS struct {
 	nameCertVerify string
 	disableReuse   bool
 
-	access      sync.Mutex
-	connections deque.Deque[net.Conn] // LIFO
+	dialFn func(context.Context) (net.Conn, error)
+	pool   *dnsConnectionPool
 }
 
 var _ dnsClient = (*dnsOverTLS)(nil)
@@ -39,83 +36,12 @@ func (t *dnsOverTLS) Address() string {
 }
 
 func (t *dnsOverTLS) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) {
-	// miekg/dns ExchangeContext doesn't respond to context cancel.
-	// this is a workaround
-	type result struct {
-		msg *D.Msg
-		err error
+	defer runtime.KeepAlive(t)
+	dial := t.dialFn
+	if dial == nil {
+		dial = t.dialContext
 	}
-	ch := make(chan result, 1)
-
-	go func() {
-		var msg *D.Msg
-		var err error
-		defer func() { ch <- result{msg, err} }()
-		for { // retry loop; only retry when reusing old conn
-			err = ctx.Err() // check context first
-			if err != nil {
-				return
-			}
-
-			var conn net.Conn
-			isOldConn := true
-
-			if !t.disableReuse {
-				t.access.Lock()
-				if t.connections.Len() > 0 {
-					conn = t.connections.PopBack()
-				}
-				t.access.Unlock()
-			}
-
-			if conn == nil {
-				conn, err = t.dialContext(ctx)
-				if err != nil {
-					return
-				}
-				isOldConn = false
-			}
-
-			dClient := &D.Client{
-				UDPSize: 4096,
-				Timeout: 5 * time.Second,
-			}
-			dConn := &D.Conn{
-				Conn:    conn,
-				UDPSize: dClient.UDPSize,
-			}
-
-			msg, _, err = dClient.ExchangeWithConn(m, dConn)
-			if err != nil {
-				_ = conn.Close()
-				conn = nil
-				if isOldConn { // retry
-					continue
-				}
-				return
-			}
-
-			if !t.disableReuse {
-				t.access.Lock()
-				if t.connections.Len() >= maxOldDotConns {
-					oldConn := t.connections.PopFront()
-					go oldConn.Close() // close in a new goroutine, not blocking the current task
-				}
-				t.connections.PushBack(conn)
-				t.access.Unlock()
-			} else {
-				_ = conn.Close()
-			}
-			return
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case ret := <-ch:
-		return ret.msg, ret.err
-	}
+	return exchangeDNSWithPool(ctx, m, t.pool, dial, false)
 }
 
 func (t *dnsOverTLS) dialContext(ctx context.Context) (net.Conn, error) {
@@ -146,20 +72,13 @@ func (t *dnsOverTLS) dialContext(ctx context.Context) (net.Conn, error) {
 }
 
 func (t *dnsOverTLS) ResetConnection() {
-	if !t.disableReuse {
-		t.access.Lock()
-		for t.connections.Len() > 0 {
-			oldConn := t.connections.PopFront()
-			go oldConn.Close() // close in a new goroutine, not blocking the current task
-		}
-		t.access.Unlock()
-	}
+	defer runtime.KeepAlive(t)
+	t.pool.reset()
 }
 
 func (t *dnsOverTLS) Close() error {
 	runtime.SetFinalizer(t, nil)
-	t.ResetConnection()
-	return nil
+	return t.pool.close()
 }
 
 func newDoTClient(addr string, resolver resolver.Resolver, params map[string]string, proxyAdapter C.ProxyAdapter, proxyName string) *dnsOverTLS {
@@ -169,7 +88,6 @@ func newDoTClient(addr string, resolver resolver.Resolver, params map[string]str
 		host:   host,
 		dialer: newDNSDialer(resolver, proxyAdapter, proxyName),
 	}
-	c.connections.SetBaseCap(maxOldDotConns)
 	if params["skip-cert-verify"] == "true" {
 		c.skipCertVerify = true
 	}
@@ -177,6 +95,16 @@ func newDoTClient(addr string, resolver resolver.Resolver, params map[string]str
 	if params["disable-reuse"] == "true" {
 		c.disableReuse = true
 	}
+	maxIdle := maxOldDotConns
+	if c.disableReuse {
+		maxIdle = 0
+	}
+	c.pool = newDNSConnectionPool(dnsConnectionPoolOptions{
+		maxOpen:     dnsMaxOpenConnections,
+		maxIdle:     maxIdle,
+		idleTimeout: dnsStreamIdleTimeout,
+		maxLifetime: dnsStreamMaxLifetime,
+	})
 	runtime.SetFinalizer(c, (*dnsOverTLS).Close)
 	return c
 }

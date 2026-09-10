@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -14,11 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/metacubex/mihomo/adapter/inbound"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
-	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/dialer"
-	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -26,92 +24,83 @@ import (
 	"github.com/metacubex/mihomo/log"
 
 	E "github.com/metacubex/sing/common/exceptions"
-	"github.com/metacubex/sing/common/network"
 
 	"go4.org/netipx"
 )
-
-// minimumUDPTimeout bounds udp-timeout from below. The periodic sweeper derives
-// its tick interval and the map stale-age from this value, so a near-zero
-// timeout would evict live sessions on every tick.
-const minimumUDPTimeout = 5 * time.Second
 
 // Listener is the eBPF inbound listener.
 type Listener interface {
 	Close() error
 	Address() string
+	InterfaceUpdated()
 }
 
-var (
-	redirectIPv4Candidates = []netip.Prefix{
-		netip.MustParsePrefix("127.128.0.0/9"),
-		netip.MustParsePrefix("127.64.0.0/10"),
-	}
-	redirectIPv6Candidates = []netip.Prefix{
-		netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
-		netip.MustParsePrefix("fd53:696e:672d:6270::/64"),
-	}
-)
-
 type Inbound struct {
-	ctx       context.Context
-	tunnel    C.Tunnel
-	additions []inbound.Addition
-	options   LC.EBPF
+	dnsRelayAccess sync.Mutex
+	dnsRelays      *dnsRelayLimiter
+	dnsRelayClosed bool
 
-	cgroupEnabled            bool
-	sharedNetworkEnabled     bool
-	cgroupPath               string
-	enableTCP                bool
-	enableUDP                bool
-	dnsMode                  string
-	cgroupIPv6Mode           string
-	cgroupIPv6Available      bool
-	cgroupIPv6Probe          cgroupIPv6ProbeState
-	cgroupIPv6ProbeLock      sync.Mutex
-	sharedIPv6Mode           string
-	redirectIPv4Prefix       netip.Prefix
-	redirectIPv6Prefix       netip.Prefix
-	cgroupMapCapacity        ECommon.CgroupMapCapacity
-	cgroupPolicy             ECommon.CgroupPolicy
-	androidUIDOptions        *androidUIDOptions
-	udpTimeout               time.Duration
-	bypassPrivateAddress     bool
-	bypassTUNDirect          bool
-	sharedNetworkMapCapacity ECommon.SharedNetworkMapCapacities
-	sharedNetworkIncludeMAC  []ECommon.MACAddress
-	sharedNetworkExcludeMAC  []ECommon.MACAddress
+	udpJanitorCancel context.CancelFunc
+	udpJanitorDone   chan struct{}
+	ctx              context.Context
+	tunnel           C.Tunnel
+	additions        []inbound.Addition
+	mode             string
+	localEnabled     bool
+	localDataPlane   string
+	cgroupPath       string
+	sharedEnabled    bool
+	sharedDataPlane  string
+	enableTCP        bool
+	enableUDP        bool
 
-	listeners internalListenerSet
+	localDNSMode        string
+	sharedDNSMode       string
+	localIPv6           bool
+	sharedIPv6          bool
+	sharedBypassPrivate bool
+	tcPriority          uint16
+	localPolicy         ECommon.LocalPolicy
+	compiledPolicy      ECommon.CompiledPolicy
+	sharedOptions       LC.EBPFShared
+	sharedIncludeMAC    []ECommon.MACAddress
+	sharedExcludeMAC    []ECommon.MACAddress
+	localBypassPort     []ECommon.PortRange
+	sharedBypassPort    []ECommon.PortRange
+	fakeIPIPv4Prefix    netip.Prefix
+	fakeIPIPv6Prefix    netip.Prefix
+	redirectIPv4Prefix  netip.Prefix
+	redirectIPv6Prefix  netip.Prefix
+	androidUIDOptions   *androidUIDOptions
+	udpTimeout          time.Duration
+	bypassTUNDirect     bool
+	localStateCapacity  uint32
+	sharedStateCapacity uint32
 
-	sharedNetwork *sharedNetwork
+	// policyAccess guards compiledPolicy and the fake-ip prefixes once the
+	// inbound is running: the fake-ip observer rewrites them while a shared
+	// data plane may be building a backend from the snapshot.
+	policyAccess sync.RWMutex
 
-	backendAccess sync.RWMutex
-	backend       *ECommon.CgroupBackend
+	selfBypass       *ECommon.SelfBypass
+	selfBypassCgroup bool
+	processTracker   *ECommon.ProcessTracker
 
-	protectRegistered bool
+	listeners         internalListenerSet
+	udpClientTable    udpClientTable
+	udpReplySockets   udpReplySocketPool
+	udpWarnings       udpWarningLimiters
+	interfaceWarnings interfaceWarningLimiters
 
-	tcpSplice        bool
-	tcpSpliceBackend *ECommon.SpliceBackend
+	cgroupBackend       *ECommon.CgroupBackend
+	cgroupBackendAccess sync.RWMutex
+	tcDataPlane         *tcDataPlane
+	tcDataPlaneAccess   sync.RWMutex
+	interfaceMonitor    tcInterfaceMonitor
+	lifecycleAccess     sync.RWMutex
+	localRoutes         []*localRoute
 
-	tcpJanitorStop    context.CancelFunc
-	tcpJanitorDone    chan struct{}
-	maintenanceAccess sync.RWMutex
-	tcpJanitorWake    chan struct{}
-
-	localRoutes []*localRoute
-
-	udpClientTable udpClientTable
-	udpWarnings    udpWarningLimiters
-
-	tcpRedirectPressure *mapPressureWatcher
-	udpRedirectPressure *mapPressureWatcher
-
-	localNetwork       *localNetworkMonitor
-	fakeIPRangeRemove  func()
-	tunOverlapWarnings warningLimiter
-	bypassPublisher    *resolver.EBPFBypassPublisher
-	dnsBypassSet       *netipx.IPSet
+	sharedRewrite *sharedRewrite
 
 	bypassRuleSetAccess   sync.Mutex
 	bypassRuleSet         []P.RuleProvider
@@ -121,49 +110,89 @@ type Inbound struct {
 	bypassRuleSetPolicy   ECommon.BypassCIDRPolicy
 	bypassRuleSetDirty    bool
 
-	udpPeriodicStop chan struct{}
-	udpPeriodicDone chan struct{}
+	// TUN coexistence and fake-ip tracking, see tun_coexist.go and fakeip.go.
+	fakeIPRangeRemove  func()
+	tunOverlapWarnings warningLimiter
+	bypassPublisher    *resolver.EBPFBypassPublisher
+	dnsBypassSet       *netipx.IPSet
+
+	protectRegistered bool
 
 	closeOnce sync.Once
 }
 
-// New creates, prepares, and attaches the eBPF inbound.
+type interfaceWarningLimiters struct {
+	inventory        warningLimiter
+	topology         warningLimiter
+	defaultInterface warningLimiter
+	infrastructure   warningLimiter
+	hostPolicy       warningLimiter
+	reconcile        warningLimiter
+}
+
+func (i *Inbound) logWarn(format string, args ...any) {
+	log.Warnln(format, args...)
+}
+
+func (i *Inbound) localTCEnabled() bool {
+	return i.localEnabled && i.localDataPlane == localDataPlaneTC
+}
+
+func (i *Inbound) localCgroupEnabled() bool {
+	return i.localEnabled && i.localDataPlane == localDataPlaneCgroup
+}
+
+func (i *Inbound) sharedSocketAssignEnabled() bool {
+	return i.sharedEnabled && i.sharedDataPlane == sharedDataPlaneSocketAssign
+}
+
+func (i *Inbound) sharedRewriteEnabled() bool {
+	return i.sharedEnabled && i.sharedDataPlane == sharedDataPlanePacketRewrite
+}
+
+func (i *Inbound) cgroupIPv6Enabled() bool {
+	return i.localIPv6
+}
+
+func (i *Inbound) sharedRewriteIPv6Enabled() bool {
+	return i.sharedIPv6
+}
+
+// New creates, prepares, and attaches the eBPF inbound with data-plane
+// selection (cgroup or TC local; socket_assign or packet_rewrite shared).
 func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inbound.Addition) (Listener, error) {
 	if len(additions) == 0 {
 		additions = []inbound.Addition{inbound.WithInName("DEFAULT-EBPF")}
 	}
-	_, cgroupEnabled, sharedNetworkEnabled, err := normalizeMode(options.Mode)
+	options, legacyNotes, err := applyLegacyOptions(options)
 	if err != nil {
 		return nil, err
 	}
-	if err = validateLocalOptions(cgroupEnabled, options.Local); err != nil {
+	for _, note := range legacyNotes {
+		log.Warnln("[EBPF] %s", note)
+	}
+	selection, err := normalizeDataPlanes(options)
+	if err != nil {
 		return nil, err
 	}
-	if err = validateSharedOptions(sharedNetworkEnabled, options.Shared); err != nil {
+	mode, localEnabled, sharedEnabled := selection.mode, selection.localEnabled, selection.sharedEnabled
+	if err = validateLocalOptions(localEnabled, options.Local); err != nil {
+		return nil, err
+	}
+	if err = validateSharedOptions(sharedEnabled, options.Shared); err != nil {
 		return nil, err
 	}
 	if err = validateAndroidUIDOptions(runtime.GOOS, options.Local); err != nil {
 		return nil, err
 	}
-	cgroupPath, err := normalizeCgroupPath(options.Local.CgroupPath)
+	localDataPlane, cgroupPath, sharedDataPlane := selection.localDataPlane, selection.cgroupPath, selection.sharedDataPlane
+	localDNSMode, err := normalizeDNSMode(options.Local.DNSMode)
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "parse local.dns_mode")
 	}
-	dnsMode, err := normalizeDNSMode(options.DNSMode)
+	sharedDNSMode, err := normalizeDNSMode(options.Shared.DNSMode)
 	if err != nil {
-		return nil, err
-	}
-	cgroupIPv6Mode, err := normalizeCgroupIPv6Mode(options.Local.IPv6Mode)
-	if err != nil {
-		return nil, err
-	}
-	sharedIPv6Mode, err := normalizeSharedIPv6Mode(options.Shared.IPv6Mode)
-	if err != nil {
-		return nil, err
-	}
-	cgroupMapCapacity, err := normalizeCgroupMapCapacity(options.Local.StateCapacity)
-	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "parse shared.dns_mode")
 	}
 	includeUIDRanges, err := parseUIDRanges(options.Local.IncludeUID, options.Local.IncludeUIDRange)
 	if err != nil {
@@ -173,68 +202,74 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	if err != nil {
 		return nil, E.Cause(err, "parse exclude_uid_range")
 	}
-	sharedNetworkOptions := LC.EBPFShared{}
-	if sharedNetworkEnabled {
-		sharedNetworkOptions, err = normalizeSharedNetworkOptions(options.Shared)
+	sharedOptions := LC.EBPFShared{}
+	if sharedEnabled {
+		sharedOptions, err = normalizeSharedOptions(options.Shared)
 		if err != nil {
 			return nil, err
 		}
 	}
-	sharedNetworkIncludeMAC, err := parseSharedNetworkMACAddresses("include_mac_address", sharedNetworkOptions.IncludeMACAddress)
+	localBypassPort, err := parsePortRanges("local.bypass_port", options.Local.BypassPort, options.Local.BypassPortRange)
 	if err != nil {
 		return nil, err
 	}
-	sharedNetworkExcludeMAC, err := parseSharedNetworkMACAddresses("exclude_mac_address", sharedNetworkOptions.ExcludeMACAddress)
+	sharedBypassPort, err := parsePortRanges("shared.bypass_port", options.Shared.BypassPort, options.Shared.BypassPortRange)
 	if err != nil {
 		return nil, err
 	}
-	sharedNetworkMapCapacity, err := normalizeSharedNetworkMapCapacity(sharedNetworkOptions.StateCapacity)
+	sharedIncludeMAC, err := parseSharedMACAddresses(
+		"include_mac_address",
+		sharedOptions.IncludeMACAddress,
+	)
 	if err != nil {
 		return nil, err
 	}
-	enableTCP, enableUDP := parseNetworkOptions(options.Network)
-	if !enableTCP && !enableUDP {
-		return nil, E.New("eBPF inbound network must include tcp or udp")
-	}
-	if err = validateSharedNetworkProtocols(sharedNetworkEnabled, enableUDP, dnsMode); err != nil {
+	sharedExcludeMAC, err := parseSharedMACAddresses(
+		"exclude_mac_address",
+		sharedOptions.ExcludeMACAddress,
+	)
+	if err != nil {
 		return nil, err
 	}
-	udpTimeout := resolveUDPTimeout(options.UDPTimeout)
-	bypassPrivateAddress := options.BypassPrivateAddress == nil || *options.BypassPrivateAddress
-	// On by default: a destination this inbound bypasses is one the user asked
-	// to keep off the proxy, and letting TUN hand it to the rules instead is
-	// what makes a bypassed address unreachable.
-	bypassTUNDirect := options.BypassTUNDirect == nil || *options.BypassTUNDirect
+	enableTCP := len(options.Network) == 0 || containsNetwork(options.Network, "tcp")
+	enableUDP := len(options.Network) == 0 || containsNetwork(options.Network, "udp")
 
-	inboundListener := &Inbound{
-		ctx:                      ctx,
-		tunnel:                   tunnel,
-		additions:                additions,
-		options:                  options,
-		cgroupEnabled:            cgroupEnabled,
-		tcpSplice:                options.TCPSplice && enableTCP,
-		sharedNetworkEnabled:     sharedNetworkEnabled,
-		cgroupPath:               cgroupPath,
-		enableTCP:                enableTCP,
-		enableUDP:                enableUDP,
-		dnsMode:                  dnsMode,
-		cgroupIPv6Mode:           cgroupIPv6Mode,
-		cgroupIPv6Available:      true,
-		sharedIPv6Mode:           sharedIPv6Mode,
-		redirectIPv4Prefix:       redirectIPv4Candidates[0],
-		redirectIPv6Prefix:       redirectIPv6Candidates[0],
-		cgroupMapCapacity:        cgroupMapCapacity,
-		udpTimeout:               udpTimeout,
-		bypassPrivateAddress:     bypassPrivateAddress,
-		bypassTUNDirect:          bypassTUNDirect,
-		sharedNetworkMapCapacity: sharedNetworkMapCapacity,
-		sharedNetworkIncludeMAC:  sharedNetworkIncludeMAC,
-		sharedNetworkExcludeMAC:  sharedNetworkExcludeMAC,
-		tcpRedirectPressure:      newMapPressureWatcher(),
-		udpRedirectPressure:      newMapPressureWatcher(),
-		cgroupPolicy: ECommon.CgroupPolicy{
-			DNSMode:              commonDNSMode(dnsMode),
-			BypassPrivateAddress: bypassPrivateAddress,
+	var selfBypass *ECommon.SelfBypass
+	if localEnabled {
+		selfBypass, err = ECommon.NewSelfBypass()
+		if err != nil {
+			return nil, E.Cause(err, "prepare eBPF self-bypass sockets")
+		}
+	}
+
+	inbound := &Inbound{
+		ctx:                 ctx,
+		tunnel:              tunnel,
+		additions:           additions,
+		mode:                mode,
+		localEnabled:        localEnabled,
+		localDataPlane:      localDataPlane,
+		cgroupPath:          cgroupPath,
+		sharedEnabled:       sharedEnabled,
+		sharedDataPlane:     sharedDataPlane,
+		enableTCP:           enableTCP,
+		enableUDP:           enableUDP,
+		selfBypass:          selfBypass,
+		localDNSMode:        localDNSMode,
+		sharedDNSMode:       sharedDNSMode,
+		localIPv6:           localEnabled && enabledByDefault(options.Local.IPv6),
+		sharedIPv6:          sharedEnabled && enabledByDefault(options.Shared.IPv6),
+		sharedBypassPrivate: options.Shared.BypassPrivateAddress == nil || *options.Shared.BypassPrivateAddress,
+		localBypassPort:     localBypassPort,
+		sharedBypassPort:    sharedBypassPort,
+		tcPriority:          options.TCPriority,
+		sharedOptions:       sharedOptions,
+		sharedIncludeMAC:    sharedIncludeMAC,
+		sharedExcludeMAC:    sharedExcludeMAC,
+		localPolicy: ECommon.LocalPolicy{
+			EnableBypassCIDR:     true,
+			DNSMode:              toCommonDNSMode(localDNSMode),
+			BypassPrivateAddress: options.Local.BypassPrivateAddress == nil || *options.Local.BypassPrivateAddress,
 			IncludeUIDConfigured: len(options.Local.IncludeUID) > 0 ||
 				len(options.Local.IncludeUIDRange) > 0 || len(options.Local.IncludePackage) > 0,
 			IncludeUID: includeUIDRanges,
@@ -242,12 +277,32 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		},
 		androidUIDOptions: newAndroidUIDOptions(options.Local),
 	}
-	inboundListener.tunOverlapWarnings.interval = tunOverlapWarningInterval
+	if inbound.tcPriority == 0 {
+		inbound.tcPriority = defaultTCPriority
+	}
+	// On by default: a destination this inbound bypasses is one the user asked
+	// to keep off the proxy, and letting TUN hand it to the rules instead is
+	// what makes a bypassed address unreachable.
+	inbound.bypassTUNDirect = options.BypassTUNDirect == nil || *options.BypassTUNDirect
+	inbound.localStateCapacity = options.Local.StateCapacity
+	inbound.sharedStateCapacity = options.Shared.StateCapacity
+	inbound.tunOverlapWarnings.interval = tunOverlapWarningInterval
 	// Several eBPF inbounds can run at once, so each keeps its own slot in the
 	// coexistence registry: closing one -- including this one, if start fails
 	// below -- must not drop what the others published.
-	inboundListener.bypassPublisher = resolver.NewEBPFBypassPublisher()
-
+	inbound.bypassPublisher = resolver.NewEBPFBypassPublisher()
+	inbound.fakeIPIPv4Prefix, inbound.fakeIPIPv6Prefix = resolver.FakeIPRanges()
+	if err = inbound.normalizeFakeIPPrefixes(); err != nil {
+		return nil, err
+	}
+	if inbound.localCgroupEnabled() || inbound.sharedRewriteEnabled() {
+		if err = inbound.selectRedirectPrefixes(); err != nil {
+			return nil, err
+		}
+	}
+	if err = inbound.resolveProcessPolicy(); err != nil {
+		return nil, err
+	}
 	rp, ok := tunnel.(P.Tunnel)
 	if !ok {
 		return nil, E.New("tunnel does not expose rule providers")
@@ -257,432 +312,500 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		if !loaded {
 			return nil, E.New("parse bypass_rule_set: rule-set not found: ", ruleSetTag)
 		}
-		inboundListener.bypassRuleSet = append(inboundListener.bypassRuleSet, ruleSet)
+		inbound.bypassRuleSet = append(inbound.bypassRuleSet, ruleSet)
 	}
-
-	if sharedNetworkEnabled {
-		inboundListener.sharedNetwork = newSharedNetwork(
-			inboundListener,
-			sharedNetworkOptions,
-			sharedNetworkMapCapacity,
-		)
-	}
-
-	if err = inboundListener.start(); err != nil {
-		_ = inboundListener.Close()
+	inbound.udpTimeout = resolveUDPTimeout(options.UDPTimeout)
+	if err := inbound.compilePolicy(); err != nil {
 		return nil, err
 	}
-	return inboundListener, nil
+	if err := inbound.start(); err != nil {
+		_ = inbound.Close()
+		return nil, err
+	}
+	inbound.startUDPJanitor()
+	return inbound, nil
 }
 
-func parseNetworkOptions(networks []string) (tcp bool, udp bool) {
-	if len(networks) == 0 {
-		return true, true
+// compilePolicy builds the immutable compiled policy snapshot shared by every
+// eBPF data plane created for this inbound.
+func (i *Inbound) compilePolicy() error {
+	i.policyAccess.Lock()
+	defer i.policyAccess.Unlock()
+	return i.compilePolicyLocked()
+}
+
+// policySnapshot returns the current compiled policy. Backends created after
+// start -- a shared interface that appears later -- must build from the live
+// snapshot rather than the one compiled at start, or a fake-ip range changed
+// by a reload would be missing from them.
+func (i *Inbound) policySnapshot() ECommon.CompiledPolicy {
+	i.policyAccess.RLock()
+	defer i.policyAccess.RUnlock()
+	return i.compiledPolicy
+}
+
+// compilePolicyLocked expects policyAccess to be held for writing.
+func (i *Inbound) compilePolicyLocked() error {
+	localPolicy := i.localPolicy
+	localPolicy.EnableBypassCIDR = true
+	policy, err := ECommon.CompilePolicy(ECommon.PolicyConfig{
+		EnableTCP:           i.enableTCP,
+		EnableUDP:           i.enableUDP,
+		Local:               localPolicy,
+		SharedDNSMode:       toCommonDNSMode(i.sharedDNSMode),
+		SharedBypassPrivate: i.sharedBypassPrivate,
+		FakeIPIPv4:          i.fakeIPIPv4Prefix,
+		FakeIPIPv6:          i.fakeIPIPv6Prefix,
+		IncludeSourceCIDR:   i.sharedOptions.IncludeSourceCIDR,
+		ExcludeSourceCIDR:   i.sharedOptions.ExcludeSourceCIDR,
+		IncludeSourceMAC:    i.sharedIncludeMAC,
+		ExcludeSourceMAC:    i.sharedExcludeMAC,
+		LocalBypassPort:     i.localBypassPort,
+		SharedBypassPort:    i.sharedBypassPort,
+	})
+	if err != nil {
+		return E.Cause(err, "compile eBPF policy")
 	}
-	for _, networkName := range networks {
-		switch strings.ToLower(networkName) {
-		case network.NetworkTCP:
-			tcp = true
-		case network.NetworkUDP:
-			udp = true
+	i.compiledPolicy = policy
+	return nil
+}
+
+func (i *Inbound) resolveProcessPolicy() error {
+	if i.localEnabled && i.androidUIDOptions != nil {
+		if err := i.resolveAndroidUIDPolicy(); err != nil {
+			return E.Cause(err, "resolve Android UID policy")
 		}
 	}
-	return
+	return nil
+}
+
+func containsNetwork(networks []string, target string) bool {
+	for _, network := range networks {
+		if network == target {
+			return true
+		}
+	}
+	return false
+}
+
+func joinStringList(values []string) string {
+	return strings.Join(values, ", ")
 }
 
 func (i *Inbound) start() error {
-	if err := i.prepareTCPSplice(); err != nil {
-		return err
-	}
-	if i.tcpSpliceBackend != nil {
-		N.RegisterTCPSplicer(func(local, remote net.Conn) bool {
-			return i.tryHandleSplice(local, remote, C.Direct)
-		})
-	}
-	if i.cgroupEnabled {
-		if i.androidUIDOptions != nil {
-			if err := i.resolveAndroidUIDPolicy(); err != nil {
-				return err
-			}
+	if i.localEnabled && i.androidUIDOptions != nil {
+		if err := i.resolveAndroidUIDPolicy(); err != nil {
+			return E.Cause(err, "resolve Android UID policy")
 		}
-		if err := i.refreshCgroupIPv6Availability(true); err != nil {
+	}
+	if i.selfBypass != nil {
+		dialer.RegisterSocketProtectFunc(func(_ context.Context, network, address string, rawConn syscall.RawConn) error {
+			return i.selfBypass.RegisterSocket(rawConn)
+		})
+		i.protectRegistered = true
+	}
+	if i.localEnabled {
+		if err := i.startSelfBypass(); err != nil {
+			log.Debugln("[EBPF] cgroup socket tracking unavailable; using socket-cookie registration: %s", err.Error())
+		}
+	}
+	if i.localEnabled {
+		i.startProcessTracker()
+	}
+	defaultInterface := i.currentDefaultInterfaceName()
+	hostAddresses := i.hostAddresses()
+	localInterface := ""
+	localTCEnabled := i.localTCEnabled()
+	sharedSocketAssignEnabled := i.sharedSocketAssignEnabled()
+	sharedRewriteEnabled := i.sharedRewriteEnabled()
+	if localTCEnabled {
+		localInterface = defaultInterface
+		if localInterface == "" {
+			log.Warnln("[EBPF] default interface unavailable; local TC eBPF interception is paused")
+		}
+	}
+	sharedInterfaces := activeSharedInterfaces(i.sharedOptions.Interface, defaultInterface)
+	tcSharedInterfaces := []string(nil)
+	if sharedSocketAssignEnabled {
+		tcSharedInterfaces = sharedInterfaces
+	}
+	if i.localEnabled || sharedSocketAssignEnabled {
+		if err := i.startTCListeners(); err != nil {
 			return err
 		}
-		policy := i.cgroupPolicy
-		policy.EnableBypassCIDR = true
-		// A fake-ip destination has to be intercepted even when it would
-		// otherwise be bypassed: the address only regains meaning once the
-		// tunnel maps it back to its domain.
-		fakeIPIPv4, fakeIPIPv6 := resolver.FakeIPRanges()
-		backend, err := ECommon.PrepareCgroup(ECommon.CgroupConfig{
-			Path:          i.cgroupPath,
-			EnableTCP:     i.enableTCP,
-			EnableUDP:     i.enableUDP,
-			EnableIPv6:    i.cgroupIPv6Enabled(),
-			AutoIPv6:      i.cgroupIPv6Mode == cgroupIPv6ModeAuto && i.cgroupIPv6Enabled(),
-			IPv6Available: i.cgroupIPv6Available,
-			RedirectIPv4:  i.redirectIPv4Prefix,
-			RedirectIPv6:  i.redirectIPv6Prefix,
-			FakeIPIPv4:    fakeIPIPv4,
-			FakeIPIPv6:    fakeIPIPv6,
-			MapCapacity:   i.cgroupMapCapacity,
-			UDPTimeout:    i.udpTimeout,
-			Policy:        policy,
-		})
+	}
+	if i.localCgroupEnabled() {
+		if err := i.prepareCgroupBackend(); err != nil {
+			return err
+		}
+		cgroupBackend := i.cgroupBackendInstance()
+		if err := cgroupBackend.UpdateHostAddresses(hostAddresses); err != nil {
+			return E.Cause(err, "initialize cgroup eBPF host address policy")
+		}
+		if err := cgroupBackend.LoadPrograms(i.listeners.selectedPort()); err != nil {
+			return err
+		}
+	}
+	if i.localCgroupEnabled() || sharedRewriteEnabled {
+		if err := i.setupLocalRoutes(); err != nil {
+			return E.Cause(err, "configure eBPF redirect routes")
+		}
+	}
+	var backend *ECommon.TCBackend
+	var dataPlane *tcDataPlane
+	if localTCEnabled || sharedSocketAssignEnabled {
+		backendConfig := ECommon.TCConfig{
+			ListenerPort:     i.listeners.selectedPort(),
+			EnableLocal:      localTCEnabled,
+			EnableShared:     sharedSocketAssignEnabled,
+			EnableIPv4:       true,
+			EnableLocalIPv6:  i.localIPv6,
+			EnableSharedIPv6: i.sharedIPv6,
+			EnableTCP:        i.enableTCP,
+			EnableUDP:        i.enableUDP,
+			Policy:           i.policySnapshot(),
+			TrackProcess:     i.processTracker != nil,
+		}
+		if i.selfBypass != nil {
+			backendConfig.SelfBypassMap = i.selfBypass.Map()
+		}
+		var err error
+		backend, err = ECommon.PrepareTC(backendConfig)
+		if err != nil && i.processTracker != nil {
+			trackingErr := err
+			_ = i.processTracker.Close()
+			i.processTracker = nil
+			backendConfig.TrackProcess = false
+			backend, err = ECommon.PrepareTC(backendConfig)
+			if err == nil {
+				log.Debugln("[EBPF] cgroup process tracking unavailable; using userspace process search: %s", trackingErr.Error())
+			}
+		}
 		if err != nil {
 			return err
 		}
-		i.setBackend(backend)
-
-		if protectFunc := backend.SocketProtectFunc(); protectFunc != nil {
-			dialer.RegisterSocketProtectFunc(func(_ context.Context, network, address string, rawConn syscall.RawConn) error {
-				return protectFunc(network, address, rawConn)
-			})
-			i.protectRegistered = true
+		if err = i.listeners.registerTCTCPListeners(backend); err != nil {
+			return E.Errors(err, backend.Close())
 		}
-
-		if err = i.startBypassRuleSets(); err != nil {
-			return err
-		}
-		if err = i.setupLocalRoutes(); err != nil {
-			return err
-		}
-		if err = i.listeners.start(
-			i.enableTCP,
-			i.enableUDP,
-			i.redirectIPv4Prefix.IsValid(),
-			i.cgroupIPv6Enabled(),
-			i.newListener,
-		); err != nil {
-			return err
-		}
-		if err = backend.LoadPrograms(i.listeners.selectedPort()); err != nil {
-			return err
-		}
-		if i.sharedNetwork != nil {
-			if err = i.sharedNetwork.Start(backend); err != nil {
-				return err
-			}
-		}
-		if err = backend.Attach(); err != nil {
-			return err
-		}
-
-		i.startUDPPeriodic()
-		i.startTCPRedirectJanitor()
-
-		bypassIPv4Count, bypassIPv6Count := backend.BypassCIDRCount()
-		if i.cgroupIPv6Mode == cgroupIPv6ModeAuto && i.cgroupIPv6Enabled() {
-			log.Infoln("[EBPF] local cgroup IPv6 interception: available=%v", i.cgroupIPv6Available)
-		}
-		log.Infoln("[EBPF] inbound attached: cgroup=%s, listen_port=%d, dns_mode=%s, local_ipv6_mode=%s, self_bypass=%s, redirect_address=[%s], bypass_cidr={ipv4:%d, ipv6:%d}, programs=[%s]",
-			backend.CgroupPath(),
-			i.listeners.selectedPort(),
-			i.dnsMode,
-			i.cgroupIPv6Mode,
-			backend.SelfBypassMode(),
-			strings.Join(i.redirectAddressStrings(), ", "),
-			bypassIPv4Count,
-			bypassIPv6Count,
-			strings.Join(backend.AttachedPrograms(), ", "),
+		tcIPv6Enabled := localTCEnabled && i.localIPv6 || sharedSocketAssignEnabled && i.sharedIPv6
+		dataPlane, err = startTCDataPlane(
+			backend,
+			localTCEnabled,
+			tcIPv6Enabled,
+			localInterface,
+			tcSharedInterfaces,
+			hostAddresses,
+			len(i.sharedIncludeMAC)+len(i.sharedExcludeMAC) > 0,
+			i.tcPriority,
 		)
-		if len(i.bypassRuleSet) > 0 {
-			log.Infoln("[EBPF] bypass_rule_set will populate after rule-providers finish loading; see the next 'refreshed bypass CIDR policy' log")
-		}
-	} else if i.sharedNetworkEnabled {
-		// Shared-only mode: the shared network backend does not need a cgroup
-		// backend, but the inbound must still create its listeners.
-		if err := i.listeners.start(
-			i.enableTCP,
-			i.enableUDP,
-			i.redirectIPv4Prefix.IsValid(),
-			false,
-			i.newListener,
-		); err != nil {
+		if err != nil {
 			return err
 		}
-		if i.sharedNetwork != nil {
-			if err := i.sharedNetwork.Start(nil); err != nil {
-				return err
-			}
+		i.setTCDataPlane(dataPlane)
+	}
+	if err := i.startBypassRuleSets(); err != nil {
+		return E.Cause(err, "initialize TC eBPF bypass_rule_set")
+	}
+	if sharedRewriteEnabled {
+		i.sharedRewrite = newSharedRewrite(i, i.sharedOptions)
+		if err := i.sharedRewrite.Start(sharedInterfaces, hostAddresses); err != nil {
+			return err
 		}
 	}
-	if i.cgroupEnabled {
-		i.startLocalNetworkMonitor()
+	if cgroupBackend := i.cgroupBackendInstance(); cgroupBackend != nil {
+		if err := cgroupBackend.Attach(); err != nil {
+			return err
+		}
+	}
+	if backend != nil {
+		if err := backend.Enable(); err != nil {
+			return err
+		}
+	}
+	if backend != nil || i.cgroupBackendInstance() != nil || i.sharedRewrite != nil {
+		if err := i.startTCInterfaceMonitor(); err != nil {
+			return err
+		}
 	}
 	// Publish the bypass policy even when no bypass_rule_set refresh will ever
-	// run (shared-only mode, or no rule sets configured), so the TUN listener
-	// can still report an overlap with the private ranges.
+	// run (no rule sets configured), so a TUN listener can still report an
+	// overlap with the private ranges and keep them off its routes.
 	i.bypassRuleSetAccess.Lock()
 	i.publishBypassPolicyLocked()
 	i.bypassRuleSetAccess.Unlock()
 	i.startFakeIPTracking()
-	reportKernelCapabilities(
-		i.kernelProbeMode(),
-		i.options.Network,
-		i.backendCgroupPath(),
-		i.firstSharedInterface(),
-	)
+	i.reportKernelCapabilities()
+	network := "tcp"
+	if i.enableTCP && i.enableUDP {
+		network = "tcp,udp"
+	} else if i.enableUDP {
+		network = "udp"
+	}
+	i.logInboundReady(network, defaultInterface, localInterface, sharedInterfaces, dataPlane)
 	return nil
 }
 
-func (i *Inbound) kernelProbeMode() ECommon.KernelProbeMode {
-	switch {
-	case i.cgroupEnabled && i.sharedNetworkEnabled:
-		return ECommon.KernelProbeModeAll
-	case i.sharedNetworkEnabled:
-		return ECommon.KernelProbeModeSharedNetwork
-	default:
-		return ECommon.KernelProbeModeLocal
+func (i *Inbound) logInboundReady(network, defaultInterface, localInterface string, sharedInterfaces []string, dataPlane *tcDataPlane) {
+	if dataPlane == nil && i.sharedRewrite == nil {
+		cgroupBackend := i.cgroupBackendInstance()
+		log.Infoln("[EBPF] cgroup active: mode=%s, network=%s, cgroup=%s, ipv6=%v, listeners=[%s], self_bypass=%s, process_tracking=%s, local_uid_include=%s, local_uid_exclude=%s",
+			i.mode,
+			network,
+			cgroupBackend.CgroupPath(),
+			i.cgroupIPv6Enabled(),
+			i.listeners.String(),
+			i.selfBypassMode(),
+			i.processTrackingMode(),
+			formatUIDRanges(i.localPolicy.IncludeUID),
+			formatUIDRanges(i.localPolicy.ExcludeUID),
+		)
+		return
 	}
+	log.Infoln("[EBPF] TC active: mode=%s, network=%s, local_data_plane=%s, shared_data_plane=%s, default_interface=%s, local_interface=%s, shared_interfaces=[%s], listeners=[%s], tc_priority=%d, local_uid_include=%s, local_uid_exclude=%s",
+		i.mode,
+		network,
+		func() string {
+			if !i.localEnabled {
+				return "off"
+			}
+			return i.localDataPlane
+		}(),
+		func() string {
+			if !i.sharedEnabled {
+				return "off"
+			}
+			return i.sharedDataPlane
+		}(),
+		defaultInterface,
+		localInterface,
+		joinStringList(sharedInterfaces),
+		i.listeners.String(),
+		i.tcPriority,
+		formatUIDRanges(i.localPolicy.IncludeUID),
+		formatUIDRanges(i.localPolicy.ExcludeUID),
+	)
 }
 
-func (i *Inbound) firstSharedInterface() string {
-	if i.sharedNetwork == nil || len(i.sharedNetwork.interfaces) == 0 {
-		return ""
+func (i *Inbound) selfBypassMode() string {
+	if !i.localEnabled || i.selfBypass == nil {
+		return "none"
 	}
-	return i.sharedNetwork.interfaces[0]
+	if i.selfBypassCgroup {
+		return "cgroup_socket_cookie"
+	}
+	return "userspace_socket_cookie"
+}
+
+func (i *Inbound) processTrackingMode() string {
+	if !i.localEnabled {
+		return "off"
+	}
+	if i.processTracker != nil {
+		return "cgroup_socket"
+	}
+	return "userspace"
+}
+
+func (i *Inbound) startSelfBypass() error {
+	if i.selfBypass == nil || i.selfBypassCgroup {
+		return nil
+	}
+	if err := i.selfBypass.AttachCgroup(ECommon.SelfBypassCgroupConfig{
+		EnableTCP:  i.enableTCP,
+		EnableUDP:  i.enableUDP,
+		EnableIPv6: i.localIPv6,
+	}); err != nil {
+		return err
+	}
+	i.selfBypassCgroup = true
+	return nil
+}
+
+func (i *Inbound) startProcessTracker() {
+	if i.processTracker != nil {
+		return
+	}
+	var metadataMap *CiliumEBPF.Map
+	if i.selfBypass != nil {
+		metadataMap = i.selfBypass.Map()
+	}
+	tracker, err := ECommon.AttachProcessTracker(ECommon.ProcessTrackerConfig{
+		EnableTCP:   i.enableTCP,
+		EnableUDP:   i.enableUDP,
+		EnableIPv6:  i.localIPv6,
+		LocalPolicy: i.localPolicy,
+		MetadataMap: metadataMap,
+	})
+	if err != nil {
+		log.Debugln("[EBPF] cgroup process tracking unavailable; using userspace process search: %s", err.Error())
+		return
+	}
+	i.processTracker = tracker
+}
+
+func (i *Inbound) setTCDataPlane(dataPlane *tcDataPlane) {
+	i.tcDataPlaneAccess.Lock()
+	i.tcDataPlane = dataPlane
+	i.tcDataPlaneAccess.Unlock()
+}
+
+func (i *Inbound) takeTCDataPlane() *tcDataPlane {
+	i.tcDataPlaneAccess.Lock()
+	dataPlane := i.tcDataPlane
+	i.tcDataPlane = nil
+	i.tcDataPlaneAccess.Unlock()
+	return dataPlane
+}
+
+func (i *Inbound) tcBackend() *ECommon.TCBackend {
+	i.tcDataPlaneAccess.RLock()
+	defer i.tcDataPlaneAccess.RUnlock()
+	if i.tcDataPlane == nil {
+		return nil
+	}
+	return i.tcDataPlane.backend
+}
+
+func (i *Inbound) reconcileTCDataPlane(localInterface string, sharedInterfaces []string, hostAddresses []netip.Addr) error {
+	i.tcDataPlaneAccess.RLock()
+	defer i.tcDataPlaneAccess.RUnlock()
+	if i.tcDataPlane == nil {
+		return nil
+	}
+	return i.tcDataPlane.reconcile(localInterface, sharedInterfaces, hostAddresses)
+}
+
+func (i *Inbound) cgroupBackendInstance() *ECommon.CgroupBackend {
+	i.cgroupBackendAccess.RLock()
+	defer i.cgroupBackendAccess.RUnlock()
+	return i.cgroupBackend
+}
+
+func (i *Inbound) setCgroupBackend(backend *ECommon.CgroupBackend) {
+	i.cgroupBackendAccess.Lock()
+	i.cgroupBackend = backend
+	i.cgroupBackendAccess.Unlock()
+}
+
+func (i *Inbound) takeCgroupBackend() *ECommon.CgroupBackend {
+	i.cgroupBackendAccess.Lock()
+	backend := i.cgroupBackend
+	i.cgroupBackend = nil
+	i.cgroupBackendAccess.Unlock()
+	return backend
+}
+
+func (i *Inbound) prepareCgroupBackend() error {
+	backendConfig := ECommon.CgroupConfig{
+		Path:          i.cgroupPath,
+		EnableTCP:     i.enableTCP,
+		EnableUDP:     i.enableUDP,
+		EnableIPv6:    i.cgroupIPv6Enabled(),
+		RedirectIPv4:  i.redirectIPv4Prefix,
+		RedirectIPv6:  i.redirectIPv6Prefix,
+		MapCapacity:   i.cgroupMapCapacity(),
+		UDPTimeout:    i.udpTimeout,
+		Policy:        i.policySnapshot(),
+		SelfBypassMap: i.selfBypass.Map(),
+	}
+	backend, err := ECommon.PrepareCgroup(backendConfig)
+	if err != nil {
+		return err
+	}
+	i.setCgroupBackend(backend)
+	return nil
+}
+
+// cgroupMapCapacity honours the legacy local.state-capacity knob: every
+// redirect and flow map is sized to it. The default layout is used when the
+// knob is unset.
+func (i *Inbound) cgroupMapCapacity() ECommon.CgroupMapCapacity {
+	capacity := ECommon.DefaultCgroupMapCapacity()
+	if i.localStateCapacity == 0 {
+		return capacity
+	}
+	capacity.TCPRedirect = i.localStateCapacity
+	capacity.UDPRedirect = i.localStateCapacity
+	capacity.UDPPeer = i.localStateCapacity
+	capacity.UDPFlow = i.localStateCapacity
+	capacity.SocketBypass = i.localStateCapacity
+	return capacity
+}
+
+// sharedMapCapacity honours the legacy shared.state-capacity knob for the
+// shared packet-rewrite flow tables.
+func (i *Inbound) sharedMapCapacity() ECommon.SharedNetworkMapCapacities {
+	capacity := ECommon.DefaultSharedNetworkMapCapacities()
+	if i.sharedStateCapacity != 0 {
+		capacity.Proxy = i.sharedStateCapacity
+		capacity.Bypass = i.sharedStateCapacity
+	}
+	return capacity
+}
+
+func (i *Inbound) isCgroupRedirectAddress(address netip.Addr) bool {
+	address = address.Unmap()
+	if address.Is4() {
+		return i.redirectIPv4Prefix.IsValid() && i.redirectIPv4Prefix.Contains(address)
+	}
+	return address.Is6() && i.redirectIPv6Prefix.IsValid() && i.redirectIPv6Prefix.Contains(address)
 }
 
 func (i *Inbound) Close() error {
 	var closeErr error
 	i.closeOnce.Do(func() {
-		N.RegisterTCPSplicer(nil)
-		i.stopTCPRedirectJanitor()
-		i.closeTCPSplice()
-		i.stopUDPPeriodic()
+		i.stopUDPJanitor()
+		i.stopDNSRelays()
+		if i.protectRegistered {
+			dialer.UnregisterSocketProtectFunc()
+			i.protectRegistered = false
+		}
 		i.stopFakeIPTracking()
-		i.stopLocalNetworkMonitor()
+		monitorErr := i.stopTCInterfaceMonitor()
 		i.stopBypassRuleSets()
+		// Remove only this inbound's contribution to the coexistence registry;
+		// another eBPF inbound may still be publishing.
 		i.bypassPublisher.Close()
-		if i.sharedNetwork != nil {
-			closeErr = i.sharedNetwork.Close()
+		var sharedRewriteErr error
+		if i.sharedRewrite != nil {
+			sharedRewriteErr = i.sharedRewrite.Close()
+			i.sharedRewrite = nil
 		}
-		backend := i.backendInstance()
-		if backend != nil {
-			closeErr = E.Errors(closeErr, backend.Close())
-			if backend.IsClosed() {
-				i.setBackend(nil)
-			}
+		dataPlane := i.takeTCDataPlane()
+		disableErr := dataPlane.disable()
+		cgroupBackend := i.takeCgroupBackend()
+		var cgroupErr error
+		if cgroupBackend != nil {
+			cgroupErr = cgroupBackend.Close()
 		}
-		i.unregisterSocketProtect()
-		closeErr = E.Errors(closeErr, i.listeners.close())
-		closeErr = E.Errors(closeErr, i.removeLocalRoutes())
+		listenerErr := i.listeners.close()
+		i.lifecycleAccess.Lock()
+		i.udpClientTable.expire(0, true)
+		i.lifecycleAccess.Unlock()
+		udpReplySocketErr := i.udpReplySockets.close()
+		dataPlaneErr := dataPlane.Close()
+		routeErr := i.removeLocalRoutes()
+		var processTrackerErr error
+		if i.processTracker != nil {
+			processTrackerErr = i.processTracker.Close()
+			i.processTracker = nil
+		}
+		var selfBypassErr error
+		if i.selfBypass != nil {
+			selfBypassErr = i.selfBypass.Close()
+			i.selfBypass = nil
+		}
+		closeErr = E.Errors(monitorErr, sharedRewriteErr, disableErr, listenerErr, udpReplySocketErr, dataPlaneErr, cgroupErr, routeErr, processTrackerErr, selfBypassErr)
 	})
 	return closeErr
 }
 
 func (i *Inbound) Address() string {
-	address := "eBPF(cgroup=" + i.backendCgroupPath() + ", listen_port=" + fmt.Sprintf("%d", i.listeners.selectedPort()) + ")"
-	return address
-}
-
-func (i *Inbound) backendCgroupPath() string {
-	if backend := i.backendInstance(); backend != nil {
-		return backend.CgroupPath()
+	if i.cgroupBackendInstance() != nil {
+		return "eBPF(cgroup=" + i.cgroupBackendInstance().CgroupPath() + ", listen_port=" + fmt.Sprint(i.listeners.selectedPort()) + ")"
 	}
-	return ""
-}
-
-func (i *Inbound) redirectAddressStrings() []string {
-	addresses := make([]string, 0, 2)
-	if i.redirectIPv4Prefix.IsValid() {
-		addresses = append(addresses, i.redirectIPv4Prefix.String())
+	if i.tcDataPlane != nil {
+		return "eBPF(TC, listen_port=" + fmt.Sprint(i.listeners.selectedPort()) + ")"
 	}
-	if i.redirectIPv6Prefix.IsValid() {
-		addresses = append(addresses, i.redirectIPv6Prefix.String())
-	}
-	return addresses
-}
-
-// sharedRedirectIPv6Prefix returns the shared-network IPv6 redirect prefix only
-// when shared IPv6 interception is enabled.
-func (i *Inbound) sharedRedirectIPv6Prefix() netip.Prefix {
-	if i.sharedIPv6Mode == sharedIPv6ModeAlways {
-		return i.redirectIPv6Prefix
-	}
-	return netip.Prefix{}
-}
-
-func (i *Inbound) backendInstance() *ECommon.CgroupBackend {
-	i.backendAccess.RLock()
-	defer i.backendAccess.RUnlock()
-	return i.backend
-}
-
-func (i *Inbound) setBackend(backend *ECommon.CgroupBackend) {
-	i.backendAccess.Lock()
-	i.backend = backend
-	i.backendAccess.Unlock()
-}
-
-func (i *Inbound) unregisterSocketProtect() {
-	if !i.protectRegistered {
-		return
-	}
-	dialer.UnregisterSocketProtectFunc()
-	i.protectRegistered = false
-}
-
-// InterfaceUpdated notifies the shared-network TC manager that interfaces may
-// have changed, so it can attach/detach downstream interfaces. It also refreshes
-// the local host-address maps (the bypass rule-set policy is untouched).
-func (i *Inbound) InterfaceUpdated() {
-	i.bypassRuleSetAccess.Lock()
-	if i.bypassRuleSetStarted {
-		if _, err := i.applyBypassCIDRLocked(); err != nil {
-			log.Warnln("[EBPF] refresh local interface host addresses: %s", err.Error())
-		}
-	}
-	i.bypassRuleSetAccess.Unlock()
-	if err := i.refreshCgroupIPv6Availability(false); err != nil {
-		log.Warnln("[EBPF] refresh local cgroup IPv6 availability: %s", err.Error())
-	}
-	if i.sharedNetwork != nil {
-		i.sharedNetwork.InterfaceUpdated()
-	}
-}
-
-func (i *Inbound) startUDPPeriodic() {
-	i.udpPeriodicStop = make(chan struct{})
-	i.udpPeriodicDone = make(chan struct{})
-	go i.udpPeriodicLoop(i.udpPeriodicStop, i.udpPeriodicDone)
-}
-
-func (i *Inbound) stopUDPPeriodic() {
-	if i.udpPeriodicStop == nil {
-		return
-	}
-	close(i.udpPeriodicStop)
-	<-i.udpPeriodicDone
-	i.udpPeriodicStop = nil
-}
-
-// resolveUDPTimeout converts the configured udp-timeout, which is expressed in
-// SECONDS exactly like listener/sing_tun does, into a duration.
-//
-// Reading the value as a raw time.Duration would interpret it as nanoseconds:
-// `udp-timeout: 300` became 300ns, which made every sweep tick consider every
-// client idle and tear down live UDP sessions (and their eBPF redirects) a few
-// seconds after they were established. The floor keeps a hand-written tiny
-// value from degenerating the sweeper the same way.
-func resolveUDPTimeout(configured int64) time.Duration {
-	if configured <= 0 {
-		return 5 * time.Minute
-	}
-	timeout := time.Second * time.Duration(configured)
-	if timeout < minimumUDPTimeout {
-		return minimumUDPTimeout
-	}
-	return timeout
-}
-
-func (i *Inbound) udpPeriodicLoop(stop <-chan struct{}, done chan<- struct{}) {
-	defer close(done)
-	interval := i.udpTimeout / 2
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
-	}
-	if interval > 30*time.Second {
-		interval = 30 * time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	bypassTicker := time.NewTicker(3 * time.Second)
-	defer bypassTicker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			i.udpClientTable.sweep(time.Now(), i.udpTimeout, func(releases []udpRedirectRelease) {
-				for _, release := range releases {
-					i.deleteUDPRedirects([]netip.Addr{release.reference.address})
-				}
-			})
-			if backend := i.backendInstance(); backend != nil && !backend.IsClosed() {
-				maxAge := 2 * i.udpTimeout
-				if maxAge < 30*time.Second {
-					maxAge = 30 * time.Second
-				}
-				if result, sweepErr := backend.SweepStaleTCPRedirects(maxAge, 1024); sweepErr != nil {
-					i.udpWarnings.cleanup.warn(i.logWarn, "sweep stale TCP redirects: ", sweepErr)
-				} else if result.Removed > 0 {
-					log.Debugln("[EBPF] swept %d stale TCP redirects", result.Removed)
-				}
-				if result, sweepErr := backend.SweepStaleUDPRedirects(maxAge, 1024); sweepErr != nil {
-					i.udpWarnings.cleanup.warn(i.logWarn, "sweep stale UDP redirects: ", sweepErr)
-				} else if result.Removed > 0 {
-					log.Debugln("[EBPF] swept %d stale UDP redirects", result.Removed)
-				}
-				// Report after sweeping: the sweep is what refreshes the count,
-				// and reading it first would warn on the pre-reclaim number.
-				tcpUsage, tcpUsageErr := backend.RedirectMapUsage(ECommon.ProtocolTCP)
-				i.tcpRedirectPressure.observe(i.logWarn, "cgroup_tcp_redirect", tcpUsage, tcpUsageErr)
-				udpUsage, udpUsageErr := backend.RedirectMapUsage(ECommon.ProtocolUDP)
-				i.udpRedirectPressure.observe(i.logWarn, "cgroup_udp_redirect", udpUsage, udpUsageErr)
-			}
-		case <-bypassTicker.C:
-			i.refreshBypassCIDRPeriodic()
-		}
-	}
-}
-
-func (i *Inbound) refreshBypassCIDRPeriodic() {
-	i.bypassRuleSetAccess.Lock()
-	defer i.bypassRuleSetAccess.Unlock()
-	if !i.bypassRuleSetStarted {
-		return
-	}
-	updated, err := i.refreshBypassCIDRsLocked()
-	if err != nil {
-		if backend := i.backendInstance(); backend != nil && !backend.IsClosed() {
-			log.Debugln("[EBPF] refresh bypass CIDR: %s", err.Error())
-		}
-		return
-	}
-	if updated {
-		i.logBypassCIDRUpdate()
-	}
-}
-
-func (i *Inbound) logBypassCIDRUpdate() {
-	backend := i.backendInstance()
-	if backend == nil {
-		return
-	}
-	ipv4Count, ipv6Count := backend.BypassCIDRCount()
-	log.Debugln("[EBPF] refreshed bypass CIDR policy: ipv4=%d, ipv6=%d", ipv4Count, ipv6Count)
-}
-
-// isRedirectListenerDestination reports whether the destination is one of this
-// inbound's internal token listener addresses (same port + redirect prefix).
-func (i *Inbound) isRedirectListenerDestination(destination netip.AddrPort, listenerPort uint16) bool {
-	if !destination.IsValid() || destination.Port() != listenerPort {
-		return false
-	}
-	address := destination.Addr().Unmap()
-	if address.Is4() {
-		return i.redirectIPv4Prefix.IsValid() && i.redirectIPv4Prefix.Contains(address)
-	}
-	return i.redirectIPv6Prefix.IsValid() && i.redirectIPv6Prefix.Contains(address)
-}
-
-func localInterfacePrefixes() []netip.Prefix {
-	iface.FlushCache()
-	networkInterfaces, _ := iface.Interfaces()
-	var prefixes []netip.Prefix
-	for _, networkInterface := range networkInterfaces {
-		for _, prefix := range networkInterface.Addresses {
-			if !prefix.IsValid() {
-				continue
-			}
-			address := prefix.Addr().Unmap()
-			if address.IsUnspecified() || address.IsLoopback() {
-				continue
-			}
-			prefixes = append(prefixes, netip.PrefixFrom(address, address.BitLen()))
-		}
-	}
-	return prefixes
+	return "eBPF"
 }

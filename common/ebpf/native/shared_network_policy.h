@@ -1,9 +1,10 @@
-// Copyright 2026, Asterisk4Magisk contributors
 // Copyright 2026, sing-box contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef SING_BOX_EBPF_SHARED_NETWORK_POLICY_H
 #define SING_BOX_EBPF_SHARED_NETWORK_POLICY_H
+
+#include "fakeip_policy.h"
 
 INLINE bool selected_protocol(__u8 protocol, const struct sb_shared_control *control) {
     if (protocol == IPPROTO_TCP_VALUE) return (control->flags & SB_SHARED_FLAG_TCP) != 0U;
@@ -56,6 +57,18 @@ INLINE bool source_mac_selected(const __u8 source[6], __u32 flags) {
         map_lookup(&shared_include_source_mac, &key) != 0;
 }
 
+INLINE bool shared_port_bypassed(
+    __u8 protocol,
+    __u16 destination_port,
+    const struct sb_shared_control *control) {
+    if ((control->flags & SB_SHARED_FLAG_BYPASS_PORT) == 0U) return false;
+    struct sb_shared_port_key key = {
+        .protocol = protocol,
+        .port = destination_port,
+    };
+    return map_lookup(&shared_bypass_port, &key) != 0;
+}
+
 INLINE bool ipv4_client_selected(
     const __u8 source_mac[6],
     const __u8 source[4],
@@ -74,23 +87,7 @@ INLINE bool ipv6_client_selected(
     return source_mac_selected(source_mac, flags) && ipv6_source_selected(source, flags);
 }
 
-INLINE bool shared_fakeip_ipv4(const __u8 destination[4], const struct sb_shared_control *control) {
-    return (control->flags & SB_SHARED_FLAG_FAKEIP_IPV4) != 0U &&
-        sb_ebpf_ipv4_prefix_match(
-            destination,
-            control->fakeip_ipv4_prefix,
-            control->fakeip_ipv4_mask);
-}
-
-INLINE bool shared_fakeip_ipv6(const __u8 destination[16], const struct sb_shared_control *control) {
-    return (control->flags & SB_SHARED_FLAG_FAKEIP_IPV6) != 0U &&
-        sb_ebpf_prefix_match(
-            destination,
-            control->fakeip_ipv6_prefix,
-            control->fakeip_ipv6_mask);
-}
-
-NOINLINE __u8 shared_dns_policy(
+INLINE __u8 shared_dns_policy(
     __u8 protocol,
     __u16 source_port,
     __u16 destination_port,
@@ -99,26 +96,31 @@ NOINLINE __u8 shared_dns_policy(
     if (destination_port != 53U) return SB_SHARED_POLICY_CONTINUE;
     if (control->dns_mode == SB_SHARED_DNS_MODE_OFF) return SB_SHARED_POLICY_BYPASS;
     if (control->dns_mode == SB_SHARED_DNS_MODE_HIJACK) return SB_SHARED_POLICY_PROXY;
-    return SB_SHARED_POLICY_CONTINUE;
+    return SB_SHARED_POLICY_RESPECT_SOURCE;
 }
 
-NOINLINE __u8 ipv4_policy(
+INLINE __u8 ipv4_policy(
     const __u8 destination[4],
     __u8 protocol,
     __u16 source_port,
     __u16 destination_port,
     const struct sb_shared_control *control) {
-    if (dhcp_packet(protocol, source_port, destination_port)) return SB_SHARED_POLICY_BYPASS;
     if (sb_ebpf_ipv4_safety_bypass(destination)) return SB_SHARED_POLICY_BYPASS;
+    bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv4(
+        destination,
+        control->flags,
+        SB_SHARED_FLAG_FAKEIP_IPV4,
+        control->fakeip_ipv4_prefix,
+        control->fakeip_ipv4_mask);
+    if (!force_fakeip && (control->flags & SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
+        sb_ebpf_ipv4_private_address(destination)) return SB_SHARED_POLICY_BYPASS;
     __u32 map_policy_flags = control->flags &
         (SB_SHARED_FLAG_HOST_IPV4 | SB_SHARED_FLAG_BYPASS_IPV4);
     struct sb_lpm4_key key = {.prefixlen = 32U};
     __builtin_memcpy(key.addr, destination, 4U);
     if ((map_policy_flags & SB_SHARED_FLAG_HOST_IPV4) != 0U &&
         map_lookup(&shared_host_ipv4, &key) != 0) return SB_SHARED_POLICY_BYPASS;
-    if (shared_fakeip_ipv4(destination, control)) return SB_SHARED_POLICY_PROXY;
-    if ((control->flags & SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
-        sb_ebpf_ipv4_private_address(destination)) return SB_SHARED_POLICY_BYPASS;
+    if (force_fakeip) return SB_SHARED_POLICY_PROXY;
     if (map_policy_flags == 0U) return SB_SHARED_POLICY_PROXY;
     if ((map_policy_flags & SB_SHARED_FLAG_BYPASS_IPV4) == 0U) return SB_SHARED_POLICY_PROXY;
     return map_lookup(&shared_bypass_ipv4, &key) == 0
@@ -126,14 +128,21 @@ NOINLINE __u8 ipv4_policy(
         : SB_SHARED_POLICY_CACHE_BYPASS;
 }
 
-NOINLINE __u8 ipv6_policy(
+INLINE __u8 ipv6_policy(
     const __u8 destination[16],
     __u8 protocol,
     __u16 source_port,
     __u16 destination_port,
     const struct sb_shared_control *control) {
-    if (dhcp_packet(protocol, source_port, destination_port)) return SB_SHARED_POLICY_BYPASS;
     if (sb_ebpf_ipv6_safety_bypass(destination)) return SB_SHARED_POLICY_BYPASS;
+    bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv6(
+        destination,
+        control->flags,
+        SB_SHARED_FLAG_FAKEIP_IPV6,
+        control->fakeip_ipv6_prefix,
+        control->fakeip_ipv6_mask);
+    if (!force_fakeip && (control->flags & SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
+        sb_ebpf_ipv6_private_address(destination)) return SB_SHARED_POLICY_BYPASS;
     __u32 map_policy_flags = control->flags &
         (SB_SHARED_FLAG_HOST_IPV6 | SB_SHARED_FLAG_BYPASS_IPV6);
     struct sb_lpm6_key key = {.prefixlen = 128U};
@@ -141,46 +150,12 @@ NOINLINE __u8 ipv6_policy(
     if ((map_policy_flags & SB_SHARED_FLAG_HOST_IPV6) != 0U && map_lookup(&shared_host_ipv6, &key) != 0) {
         return SB_SHARED_POLICY_BYPASS;
     }
-    if (shared_fakeip_ipv6(destination, control)) return SB_SHARED_POLICY_PROXY;
-    if ((control->flags & SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
-        sb_ebpf_ipv6_private_address(destination)) return SB_SHARED_POLICY_BYPASS;
+    if (force_fakeip) return SB_SHARED_POLICY_PROXY;
     if (map_policy_flags == 0U) return SB_SHARED_POLICY_PROXY;
     if ((map_policy_flags & SB_SHARED_FLAG_BYPASS_IPV6) == 0U) return SB_SHARED_POLICY_PROXY;
     return map_lookup(&shared_bypass_ipv6, &key) == 0
         ? SB_SHARED_POLICY_PROXY
         : SB_SHARED_POLICY_CACHE_BYPASS;
-}
-
-INLINE bool ipv4_policy_selected(
-    const __u8 source_mac[6],
-    const __u8 source[4],
-    const __u8 destination[4],
-    __u8 protocol,
-    __u16 source_port,
-    __u16 destination_port,
-    const struct sb_shared_control *control) {
-    __u8 dns_policy = shared_dns_policy(
-        protocol, source_port, destination_port, control);
-    if (dns_policy != SB_SHARED_POLICY_CONTINUE) return dns_policy == SB_SHARED_POLICY_PROXY;
-    if (!ipv4_client_selected(source_mac, source, control)) return false;
-    return ipv4_policy(destination, protocol, source_port, destination_port, control) ==
-        SB_SHARED_POLICY_PROXY;
-}
-
-INLINE bool ipv6_policy_selected(
-    const __u8 source_mac[6],
-    const __u8 source[16],
-    const __u8 destination[16],
-    __u8 protocol,
-    __u16 source_port,
-    __u16 destination_port,
-    const struct sb_shared_control *control) {
-    __u8 dns_policy = shared_dns_policy(
-        protocol, source_port, destination_port, control);
-    if (dns_policy != SB_SHARED_POLICY_CONTINUE) return dns_policy == SB_SHARED_POLICY_PROXY;
-    if (!ipv6_client_selected(source_mac, source, control)) return false;
-    return ipv6_policy(destination, protocol, source_port, destination_port, control) ==
-        SB_SHARED_POLICY_PROXY;
 }
 
 #endif

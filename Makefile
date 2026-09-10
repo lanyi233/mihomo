@@ -178,8 +178,9 @@ windows-arm64:
 windows-arm32v7:
 	GOARCH=arm GOOS=windows GOARM=7 $(GOBUILD) -o $(BINDIR)/$(NAME)-$@.exe
 
-# eBPF inbound builds require cgo, the with_ebpf build tag, and the generated
-# TC object (native/shared_network.bpf.o, compiled with clang -target bpfel).
+# eBPF inbound builds require the with_ebpf build tag and the pre-generated BPF
+# objects in common/ebpf/internal/bpfgen (bpf2go output, committed). The
+# cilium/ebpf loader is pure Go, so cgo is not required.
 EBPF_TAGS=with_gvisor with_ebpf
 
 ebpf_generate:

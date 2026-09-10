@@ -2,6 +2,7 @@ package lightgbm
 
 import (
 	"encoding/csv"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,19 +16,19 @@ import (
 )
 
 var (
-	collectMutex           sync.Mutex
-	smartCollector         *DataCollector
+	collectMutex   sync.Mutex
+	smartCollector *DataCollector
 )
 
 type DataCollector struct {
-	mutex                  sync.Mutex
-	sampleCount            int
-	dataPath               string
-	file                   *os.File
-	writer                 *csv.Writer
-	configured             bool
-	smartCollectorSize     int64
-	lastFileCheck          time.Time
+	mutex              sync.Mutex
+	sampleCount        int
+	dataPath           string
+	file               *os.File
+	writer             *csv.Writer
+	configured         bool
+	smartCollectorSize int64
+	lastFileCheck      time.Time
 }
 
 const (
@@ -43,13 +44,25 @@ func InitCollector(collectSize float64) {
 		smartCollectorSize = defaultSmartCollectorSize
 	}
 
-	smartCollector = &DataCollector{
-		dataPath:           filepath.Join(C.Path.HomeDir(), "smart_weight_data.csv"),
-		smartCollectorSize: smartCollectorSize,
+	collectMutex.Lock()
+	defer collectMutex.Unlock()
+
+	dataPath := filepath.Join(C.Path.HomeDir(), "smart_weight_data.csv")
+	if smartCollector == nil {
+		smartCollector = &DataCollector{
+			dataPath:           dataPath,
+			smartCollectorSize: smartCollectorSize,
+		}
+		return
+	}
+	if err := smartCollector.reconfigure(dataPath, smartCollectorSize); err != nil {
+		log.Warnln("[Smart] Failed to reconfigure data collector: %v", err)
 	}
 }
 
 func GetCollector() *DataCollector {
+	collectMutex.Lock()
+	defer collectMutex.Unlock()
 	return smartCollector
 }
 
@@ -61,7 +74,7 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, metadata *C.Metadata,
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.configured && time.Since(c.lastFileCheck) > 5 * time.Second {
+	if c.configured && time.Since(c.lastFileCheck) > 5*time.Second {
 		c.lastFileCheck = time.Now()
 		if _, err := os.Stat(c.dataPath); os.IsNotExist(err) {
 			log.Infoln("[Smart] Data file was deleted, reinitializing collector")
@@ -217,13 +230,13 @@ func (c *DataCollector) initializeWriter() error {
 	if fileExists {
 		if stat, err2 := file.Stat(); err2 == nil && stat.Size() > 0 {
 			last := make([]byte, 1)
-			if _, err2 = file.ReadAt(last, stat.Size() - 1); err2 == nil && last[0] != '\n' {
+			if _, err2 = file.ReadAt(last, stat.Size()-1); err2 == nil && last[0] != '\n' {
 				const scanSize = int64(65536)
 				readStart := stat.Size() - scanSize
 				if readStart < 0 {
 					readStart = 0
 				}
-				buf := make([]byte, stat.Size() - readStart)
+				buf := make([]byte, stat.Size()-readStart)
 				if _, err3 := file.ReadAt(buf, readStart); err3 == nil {
 					newlinePos := int64(-1)
 					for i := int64(len(buf)) - 1; i >= 0; i-- {
@@ -300,16 +313,36 @@ func (c *DataCollector) Close() error {
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	return c.closeLocked()
+}
 
+func (c *DataCollector) closeLocked() error {
+	var result error
 	if c.writer != nil {
 		c.writer.Flush()
+		result = c.writer.Error()
 	}
 
 	if c.file != nil {
-		return c.file.Close()
+		result = errors.Join(result, c.file.Close())
 	}
+	c.file = nil
+	c.writer = nil
+	c.configured = false
+	return result
+}
 
-	return nil
+func (c *DataCollector) reconfigure(dataPath string, collectorSize int64) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	var err error
+	if c.dataPath != dataPath {
+		err = c.closeLocked()
+		c.dataPath = dataPath
+	}
+	c.smartCollectorSize = collectorSize
+	return err
 }
 
 func CloseAllCollectors() {

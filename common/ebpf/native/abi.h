@@ -1,5 +1,5 @@
-// Copyright 2026, Asterisk4Magisk contributors
-// SPDX-License-Identifier: GPL-3.0
+// Copyright 2026, sing-box contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef SING_BOX_EBPF_ABI_H
 #define SING_BOX_EBPF_ABI_H
@@ -13,6 +13,10 @@
 #define SB_EBPF_UDP_FLOW_ACTION_PROXY 1U
 #define SB_EBPF_UDP_FLOW_ACTION_BYPASS 2U
 
+#define SB_EBPF_SOCKET_METADATA_SELF_BYPASS (1U << 0U)
+#define SB_EBPF_SOCKET_METADATA_POLICY_BYPASS (1U << 1U)
+#define SB_EBPF_SOCKET_METADATA_POLICY_INTERCEPT (1U << 2U)
+
 #define SB_EBPF_DNS_MODE_HIJACK 0U
 #define SB_EBPF_DNS_MODE_RESPECT_POLICY 1U
 #define SB_EBPF_DNS_MODE_OFF 2U
@@ -25,20 +29,16 @@
 #define SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS (1U << 6U)
 #define SB_EBPF_CGROUP_FLAG_BYPASS_IPV4 (1U << 7U)
 #define SB_EBPF_CGROUP_FLAG_BYPASS_IPV6 (1U << 8U)
-#define SB_EBPF_CGROUP_FLAG_AUTO_IPV6 (1U << 9U)
 #define SB_EBPF_CGROUP_FLAG_UDP_FLOW (1U << 10U)
 #define SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS (1U << 11U)
 #define SB_EBPF_CGROUP_FLAG_HOST_IPV4 (1U << 13U)
 #define SB_EBPF_CGROUP_FLAG_HOST_IPV6 (1U << 14U)
 #define SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4 (1U << 15U)
 #define SB_EBPF_CGROUP_FLAG_FAKEIP_IPV6 (1U << 16U)
-#define SB_EBPF_CGROUP_STAT_TCP_REDIRECT_FAILURE 0U
-#define SB_EBPF_CGROUP_STAT_UDP_REDIRECT_FAILURE 1U
-#define SB_EBPF_CGROUP_STAT_COUNT 2U
-
+#define SB_EBPF_CGROUP_FLAG_BYPASS_PORT (1U << 17U)
 struct sb_ebpf_cgroup_control {
     __u32 flags;
-    __u32 self_tgid;
+	__u32 reserved;
     __u32 udp_timeout_seconds;
     __u32 redirect_ipv4_prefix;
     __u32 redirect_ipv4_host_mask;
@@ -111,6 +111,12 @@ _Static_assert(sizeof(struct sb_ebpf_udp_flow_value) == 32U, "unexpected UDP flo
 struct sb_ebpf_uid_lpm_key {
     __u32 prefixlen;
     __u8 uid[4];
+};
+
+struct sb_ebpf_port_key {
+    __u8 protocol;
+    __u8 reserved;
+    __u16 port;
 };
 
 struct sb_ebpf_ipv4_cidr_lpm_key {

@@ -1,4 +1,3 @@
-// Copyright 2026, Asterisk4Magisk contributors
 // Copyright 2026, sing-box contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -26,7 +25,6 @@
 #define IPV6_TRANSPORT_MIN_OFFSET 54U
 #define IPV6_TRANSPORT_MAX_OFFSET 6206U
 #define IPV6_TRANSPORT_MASK 0x1fffU
-#define IPV6_FRAGMENT_STATE_SHIFT 13U
 #define IPV6_TRANSPORT_BYPASS 0xffffffffU
 #define IPV6_TRANSPORT_DROP 0xfffffffeU
 

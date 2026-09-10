@@ -1,18 +1,20 @@
-// Copyright 2026, Asterisk4Magisk contributors
 // Copyright 2026, sing-box contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef SING_BOX_EBPF_SHARED_NETWORK_REWRITE_H
 #define SING_BOX_EBPF_SHARED_NETWORK_REWRITE_H
 
-INLINE __u64 checksum_flags(__u8 protocol, __u64 size) {
+INLINE __u64 checksum_flags(__u8 protocol, __u64 size, bool ipv6) {
 	__u64 flags = size;
-	if (protocol == IPPROTO_UDP_VALUE) flags |= BPF_F_MARK_MANGLED_0 | BPF_F_MARK_ENFORCE;
+	if (protocol == IPPROTO_UDP_VALUE) {
+        flags |= BPF_F_MARK_MANGLED_0;
+        if (ipv6) flags |= BPF_F_MARK_ENFORCE;
+    }
 	return flags;
 }
 
-INLINE __u64 pseudo_header_checksum_flags(__u8 protocol, __u64 size) {
-	return checksum_flags(protocol, size) | BPF_F_PSEUDO_HDR;
+INLINE __u64 pseudo_header_checksum_flags(__u8 protocol, __u64 size, bool ipv6) {
+	return checksum_flags(protocol, size, ipv6) | BPF_F_PSEUDO_HDR;
 }
 
 INLINE int rewrite_ipv4(
@@ -32,8 +34,6 @@ INLINE int rewrite_ipv4(
 	__u32 checksum_offset = l4_offset + (protocol == IPPROTO_TCP_VALUE
 		? __builtin_offsetof(struct tcp_header_min, checksum)
 		: __builtin_offsetof(struct udp_header_min, checksum));
-	__s64 address_diff = csum_diff(&old_address, 4U, &new_address, 4U, 0U);
-	if (address_diff < 0) return TC_ACT_SHOT;
 	if (l3_csum_replace(
 			skb,
             l3_offset + __builtin_offsetof(struct ipv4_header, checksum),
@@ -42,12 +42,23 @@ INLINE int rewrite_ipv4(
 			4U) != 0) {
 		return TC_ACT_SHOT;
 	}
-	if (l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U)) != 0 ||
-		l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U)) != 0 ||
-        skb_store_bytes(skb, address_offset, &new_address, sizeof(new_address), 0U) != 0 ||
-        skb_store_bytes(skb, port_offset, &new_port, sizeof(new_port), 0U) != 0) {
+	if (l4_csum_replace(skb, checksum_offset, old_address, new_address, pseudo_header_checksum_flags(protocol, 4U, false)) != 0 ||
+		l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U, false)) != 0) {
         return TC_ACT_SHOT;
     }
+    /* Checksum helpers invalidate all prior packet bounds. */
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    /* Callers bound offsets below 8192. Keep the mask and pointer addition
+     * together: 5.4 loses scalar bounds when LLVM spills between them. */
+    void *address = data + (address_offset & 0x1fffU);
+    __u64 bounded_port_offset = port_offset;
+    void *port = data;
+    asm volatile("%1 &= 8191\n%0 += %1"
+        : "+r"(port), "+r"(bounded_port_offset));
+    if (address + 4U > data_end || port + sizeof(new_port) > data_end) return TC_ACT_SHOT;
+    __builtin_memcpy(address, &new_address, 4U);
+    __builtin_memcpy(port, &new_port, sizeof(new_port));
     return TC_ACT_OK;
 }
 
@@ -75,49 +86,25 @@ INLINE int rewrite_ipv6(
         ? __builtin_offsetof(struct ipv6_header, source)
         : __builtin_offsetof(struct ipv6_header, destination));
     __u32 port_offset = l4_offset + (source ? 0U : 2U);
-	if (l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U)) != 0 ||
-        l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U)) != 0 ||
-        skb_store_bytes(skb, address_offset, new_address, 16U, 0U) != 0 ||
-        skb_store_bytes(skb, port_offset, &new_port, sizeof(new_port), 0U) != 0) {
+	if (l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U, true)) != 0 ||
+        l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U, true)) != 0) {
         return TC_ACT_SHOT;
     }
+    /* Checksum helpers invalidate all prior packet bounds. */
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    /* Callers bound offsets below 8192. Keep the mask and pointer addition
+     * together: 5.4 loses scalar bounds when LLVM spills between them. */
+    void *address = data + (address_offset & 0x1fffU);
+    __u64 bounded_port_offset = port_offset;
+    void *port = data;
+    asm volatile("%1 &= 8191\n%0 += %1"
+        : "+r"(port), "+r"(bounded_port_offset));
+    if (address + 16U > data_end || port + sizeof(new_port) > data_end) return TC_ACT_SHOT;
+    __builtin_memcpy(address, new_address, 16U);
+    __builtin_memcpy(port, &new_port, sizeof(new_port));
     return TC_ACT_OK;
 }
-
-INLINE int rewrite_ipv4_fragment(
-    struct __sk_buff *skb,
-    __u32 l3_offset,
-    bool source,
-    __be32 old_address,
-    __be32 new_address) {
-    __u32 address_offset = l3_offset + (source
-        ? __builtin_offsetof(struct ipv4_header, source)
-        : __builtin_offsetof(struct ipv4_header, destination));
-    if (l3_csum_replace(
-            skb,
-            l3_offset + __builtin_offsetof(struct ipv4_header, checksum),
-            old_address,
-            new_address,
-            4U) != 0 ||
-        skb_store_bytes(skb, address_offset, &new_address, sizeof(new_address), 0U) != 0) {
-        return TC_ACT_SHOT;
-    }
-    return TC_ACT_OK;
-}
-
-INLINE int rewrite_ipv6_fragment(
-    struct __sk_buff *skb,
-    __u32 l3_offset,
-    bool source,
-    const __u8 new_address[16]) {
-    __u32 address_offset = l3_offset + (source
-        ? __builtin_offsetof(struct ipv6_header, source)
-        : __builtin_offsetof(struct ipv6_header, destination));
-    return skb_store_bytes(skb, address_offset, new_address, 16U, 0U) == 0
-        ? TC_ACT_OK
-        : TC_ACT_SHOT;
-}
-
 
 INLINE bool ipv4_token_address(__be32 address, const struct sb_shared_control *control) {
     __u32 host = swap32(address);

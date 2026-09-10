@@ -11,61 +11,18 @@ import (
 	E "github.com/metacubex/sing/common/exceptions"
 )
 
-const (
-	sharedNetworkStatTokenReservationFailure = 0
-	sharedNetworkStatTokenPublishRetry       = 1
-	sharedNetworkStatOriginalPublishFailure  = 2
-	sharedNetworkStatEgressFlowMiss          = 3
-	sharedNetworkStatSocketAssignment        = 4
-	sharedNetworkStatSocketAssignFailure     = 5
-	sharedNetworkStatUDPSocketAssignment     = 6
-	sharedNetworkStatUDPSocketAssignFailure  = 7
-)
-
-type SharedNetworkStatistics struct {
-	TokenReservationFailures uint64 `json:"token_reservation_failures"`
-	TokenPublishRetries      uint64 `json:"token_publish_retries"`
-	OriginalPublishFailures  uint64 `json:"original_publish_failures"`
-	EgressFlowMisses         uint64 `json:"egress_flow_misses"`
-	SocketAssignments        uint64 `json:"socket_assignments"`
-	SocketAssignFailures     uint64 `json:"socket_assign_failures"`
-	UDPSocketAssignments     uint64 `json:"udp_socket_assignments"`
-	UDPSocketAssignFailures  uint64 `json:"udp_socket_assign_failures"`
-	TokenLookupMisses        uint64 `json:"token_lookup_misses"`
-	GenerationLookupMisses   uint64 `json:"generation_lookup_misses"`
-	GenerationMismatches     uint64 `json:"generation_mismatches"`
-}
-
 const sharedNetworkTCPReleaseGrace = time.Second
 
-const (
-	sharedNetworkScratchSize         = 272
-	sharedNetworkFragmentKeySize     = 44
-	sharedNetworkFragmentValueSize   = 32
-	sharedNetworkBypassFlowValueSize = 16
-)
-
 type SharedNetworkConfig struct {
-	ListenerPort         uint16
-	EnableTCP            bool
-	EnableUDP            bool
-	DNSMode              DNSMode
-	BypassPrivateAddress bool
-	RedirectIPv4         netip.Prefix
-	RedirectIPv6         netip.Prefix
-	FakeIPIPv4           netip.Prefix
-	FakeIPIPv6           netip.Prefix
-	IncludeSourceCIDR    []netip.Prefix
-	ExcludeSourceCIDR    []netip.Prefix
-	IncludeSourceMAC     []MACAddress
-	ExcludeSourceMAC     []MACAddress
-	MapCapacity          SharedNetworkMapCapacities
-	UDPTimeout           time.Duration
-	DataPlane            string
-	RoutingMark          uint32
+	ListenerPort uint16
+	EnableTCP    bool
+	EnableUDP    bool
+	RedirectIPv4 netip.Prefix
+	RedirectIPv6 netip.Prefix
+	Policy       CompiledPolicy
+	MapCapacity  SharedNetworkMapCapacities
+	UDPTimeout   time.Duration
 }
-
-type MACAddress [6]byte
 
 type sharedNetworkMACKey struct {
 	Address  MACAddress
@@ -87,62 +44,18 @@ type sharedNetworkControl struct {
 	FakeIPIPv4Mask      [4]byte
 	FakeIPIPv6Prefix    [16]byte
 	FakeIPIPv6Mask      [16]byte
-	RoutingMark         uint32
-	Reserved3           uint32
-}
-
-type sharedNetworkAssignKey struct {
-	Family       uint8
-	Protocol     uint8
-	ClientPort   uint16
-	OriginalPort uint16
-	Reserved     uint16
-	ClientAddr   [16]byte
-	OriginalAddr [16]byte
-}
-
-type sharedNetworkAssignValue struct {
-	InterfaceIndex uint32
-	SourceMAC      [6]byte
-	Reserved       [2]byte
-}
-
-func makeSharedNetworkAssignKey(protocol uint8, client, destination netip.AddrPort) (sharedNetworkAssignKey, error) {
-	var key sharedNetworkAssignKey
-	key.Protocol = protocol
-	key.ClientPort = client.Port()
-	key.OriginalPort = destination.Port()
-	if err := encodeAddress(&key.Family, &key.ClientAddr, client.Addr()); err != nil {
-		return key, E.Cause(err, "invalid shared-network assignment client")
-	}
-	var destinationFamily uint8
-	if err := encodeAddress(&destinationFamily, &key.OriginalAddr, destination.Addr()); err != nil {
-		return key, E.Cause(err, "invalid shared-network assignment destination")
-	}
-	if destinationFamily != key.Family {
-		return key, E.New("shared-network assignment address families do not match")
-	}
-	return key, nil
 }
 
 func sharedNetworkUDPTimeoutSeconds(timeout time.Duration) (uint32, error) {
-	return normalizedUDPTimeoutSeconds("shared-network", timeout)
-}
-
-func cgroupUDPTimeoutSeconds(timeout time.Duration) (uint32, error) {
-	return normalizedUDPTimeoutSeconds("local cgroup", timeout)
-}
-
-func normalizedUDPTimeoutSeconds(scope string, timeout time.Duration) (uint32, error) {
 	if timeout <= 0 {
-		return 0, E.New("invalid ", scope, " UDP timeout: ", timeout)
+		return 0, E.New("invalid shared packet-rewrite UDP timeout: ", timeout)
 	}
 	seconds := uint64(timeout / time.Second)
 	if timeout%time.Second != 0 {
 		seconds++
 	}
 	if seconds > math.MaxUint32 {
-		return 0, E.New(scope, " UDP timeout is too large: ", timeout)
+		return 0, E.New("shared packet-rewrite UDP timeout is too large: ", timeout)
 	}
 	return uint32(seconds), nil
 }
@@ -216,11 +129,9 @@ const (
 	sharedNetworkFlagExcludeSourceMAC
 	sharedNetworkFlagBypassPrivateAddress
 	sharedNetworkFlagBypassFlowCache
-	_
+	sharedNetworkFlagBypassPort
 	sharedNetworkFlagFakeIPIPv4
 	sharedNetworkFlagFakeIPIPv6
-	sharedNetworkFlagSocketAssignTCP
-	sharedNetworkFlagSocketAssignUDP
 )
 
 const sharedNetworkPolicyFlags = sharedNetworkFlagHostIPv4 |
