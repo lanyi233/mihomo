@@ -76,15 +76,22 @@ func runTemplateCommand(command string) (string, error) {
 		cmd = shellTemplateCommand(ctx, command)
 		commandName = shellCommandName()
 	} else {
-		args, err := splitTemplateCommand(command)
+		args, err := splitTemplateCommandArgs(command)
 		if err != nil {
 			return "", err
 		}
 		if len(args) == 0 {
 			return "", fmt.Errorf("command is empty")
 		}
-		cmd = exec.CommandContext(ctx, args[0], args[1:]...)
-		commandName = args[0]
+		values := make([]string, len(args))
+		for index, arg := range args {
+			if arg.expandable {
+				arg.value = expandTemplateCommandEnv(arg.value)
+			}
+			values[index] = arg.value
+		}
+		cmd = exec.CommandContext(ctx, values[0], values[1:]...)
+		commandName = values[0]
 	}
 	cmd.Env = templateCommandEnv()
 
@@ -117,13 +124,6 @@ func shellCommandName() string {
 		return "cmd.exe"
 	}
 	return "/bin/sh"
-}
-
-func shellTemplateCommand(ctx context.Context, command string) *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		return exec.CommandContext(ctx, "cmd.exe", "/C", command)
-	}
-	return exec.CommandContext(ctx, "/bin/sh", "-c", command)
 }
 
 func templateCommandEnv() []string {
@@ -164,18 +164,41 @@ func containsTemplatePipeline(command string) bool {
 	return false
 }
 
+// templateCommandArg is a single argument produced by the splitter. expandable
+// records whether the argument contains any text that was not wrapped in
+// single quotes, mirroring shell semantics where only unquoted and
+// double-quoted $VAR references are expanded.
+type templateCommandArg struct {
+	value      string
+	expandable bool
+}
+
 func splitTemplateCommand(command string) ([]string, error) {
-	var args []string
+	args, err := splitTemplateCommandArgs(command)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]string, len(args))
+	for index, arg := range args {
+		values[index] = arg.value
+	}
+	return values, nil
+}
+
+func splitTemplateCommandArgs(command string) ([]templateCommandArg, error) {
+	var args []templateCommandArg
 	var current strings.Builder
 	var quote rune
 	escaped := false
 	hasValue := false
+	expandable := false
 
 	flush := func() {
 		if hasValue {
-			args = append(args, current.String())
+			args = append(args, templateCommandArg{value: current.String(), expandable: expandable})
 			current.Reset()
 			hasValue = false
+			expandable = false
 		}
 	}
 
@@ -185,6 +208,7 @@ func splitTemplateCommand(command string) ([]string, error) {
 		if escaped {
 			current.WriteRune(char)
 			hasValue = true
+			expandable = true
 			escaped = false
 			continue
 		}
@@ -192,10 +216,12 @@ func splitTemplateCommand(command string) ([]string, error) {
 			if index+1 < len(chars) && (chars[index+1] == '\\' || chars[index+1] == '"' || chars[index+1] == ' ' || chars[index+1] == '\t' || chars[index+1] == '\n' || chars[index+1] == '\r') {
 				escaped = true
 				hasValue = true
+				expandable = true
 				continue
 			}
 			current.WriteRune(char)
 			hasValue = true
+			expandable = true
 			continue
 		}
 		if quote != 0 {
@@ -204,6 +230,11 @@ func splitTemplateCommand(command string) ([]string, error) {
 			} else {
 				current.WriteRune(char)
 				hasValue = true
+				// Double quotes still allow variable expansion; single quotes
+				// make the contents fully literal.
+				if quote != '\'' {
+					expandable = true
+				}
 			}
 			continue
 		}
@@ -216,6 +247,7 @@ func splitTemplateCommand(command string) ([]string, error) {
 		default:
 			current.WriteRune(char)
 			hasValue = true
+			expandable = true
 		}
 	}
 
@@ -227,6 +259,76 @@ func splitTemplateCommand(command string) ([]string, error) {
 	}
 	flush()
 	return args, nil
+}
+
+// lookupTemplateCommandEnv resolves an environment variable the same way the
+// spawned command sees it, including the runtime variables injected by
+// templateCommandEnv.
+func lookupTemplateCommandEnv(name string) string {
+	if value, ok := templateCommandRuntimeEnv(name); ok {
+		return value
+	}
+	return os.Getenv(name)
+}
+
+// expandTemplateCommandEnv expands environment variable references in an
+// argument. On the direct exec path no shell is involved, so nothing else
+// would perform this substitution; doing it here keeps `cmd` usable for paths
+// built from the runtime variables on every platform.
+//
+// The syntax follows the platform shell: `$VAR`/`${VAR}` on Unix, `%VAR%` on
+// Windows.
+func expandTemplateCommandEnv(value string) string {
+	if runtime.GOOS == "windows" {
+		return expandWindowsTemplateCommandEnv(value)
+	}
+	return os.Expand(value, lookupTemplateCommandEnv)
+}
+
+// expandWindowsTemplateCommandEnv replaces %NAME% references, leaving a
+// reference untouched when the variable is not set, matching cmd.exe.
+func expandWindowsTemplateCommandEnv(value string) string {
+	var out strings.Builder
+	for index := 0; index < len(value); {
+		if value[index] != '%' {
+			out.WriteByte(value[index])
+			index++
+			continue
+		}
+		end := strings.IndexByte(value[index+1:], '%')
+		if end == 0 {
+			// "%%" is an escaped percent sign in batch files.
+			out.WriteByte('%')
+			index += 2
+			continue
+		}
+		if end < 0 {
+			out.WriteString(value[index:])
+			break
+		}
+		name := value[index+1 : index+1+end]
+		if resolved, ok := os.LookupEnv(name); ok {
+			out.WriteString(resolved)
+		} else if runtimeValue, ok := templateCommandRuntimeEnv(name); ok {
+			out.WriteString(runtimeValue)
+		} else {
+			out.WriteString(value[index : index+end+2])
+		}
+		index += end + 2
+	}
+	return out.String()
+}
+
+func templateCommandRuntimeEnv(name string) (string, bool) {
+	switch name {
+	case "MIHOMO_VERSION":
+		return C.Version, true
+	case "MIHOMO_CFG_DIR":
+		return filepath.Dir(C.Path.Config()), true
+	case "MIHOMO_CFG_FILE":
+		return C.Path.Config(), true
+	}
+	return "", false
 }
 
 type limitedCommandOutput struct {

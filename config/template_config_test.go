@@ -13,6 +13,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const templateCommandHelperFlag = "-mihomo-template-cmd-helper"
+
+func runTemplateCommandHelper(mode string, args []string) {
+	switch mode {
+	case "echo-args":
+		fmt.Printf("%s|%s|%s", args[0], args[1], args[2])
+	case "echo-env":
+		fmt.Printf("%s|%s|%s", os.Getenv("MIHOMO_VERSION"), os.Getenv("MIHOMO_CFG_DIR"), os.Getenv("MIHOMO_CFG_FILE"))
+	case "print":
+		fmt.Print(args[0])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown helper mode %q", mode)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestMain(m *testing.M) {
+	if len(os.Args) > 2 && os.Args[1] == templateCommandHelperFlag {
+		runTemplateCommandHelper(os.Args[2], os.Args[3:])
+	}
+	os.Exit(m.Run())
+}
+
+func templateCommandHelperPath(t *testing.T) string {
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	return exe
+}
+
+func quoteTemplateCommandArg(path string) string {
+	return `"` + path + `"`
+}
+
 func TestRenderTemplate(t *testing.T) {
 	t.Setenv("MIHOMO_TEMPLATE_VALUE", "one")
 	buf, err := renderTemplate([]byte(`{{- $base := "https://example.test" -}}
@@ -115,41 +149,87 @@ func TestSplitTemplateCommand(t *testing.T) {
 }
 
 func TestRunTemplateCommand(t *testing.T) {
-	output, err := runTemplateCommand(`printf 'hello %s' world`)
-	require.NoError(t, err)
-	require.Equal(t, "hello world", output)
+	if runtime.GOOS == "windows" {
+		output, err := runTemplateCommand(`cmd.exe /d /s /c "echo hello world"`)
+		require.NoError(t, err)
+		require.Equal(t, "hello world", strings.TrimSpace(output))
+	} else {
+		output, err := runTemplateCommand(`printf 'hello %s' world`)
+		require.NoError(t, err)
+		require.Equal(t, "hello world", output)
+	}
 
-	_, err = runTemplateCommand("command-that-does-not-exist")
+	_, err := runTemplateCommand("command-that-does-not-exist")
 	require.Error(t, err)
 }
 
 func TestRunTemplateCommandPipeline(t *testing.T) {
-	output, err := runTemplateCommand(`(printf 'hello') | (tr 'a-z' 'A-Z')`)
-	require.NoError(t, err)
-	require.Equal(t, "HELLO", output)
+	helper := templateCommandHelperPath(t)
+	if runtime.GOOS == "windows" {
+		output, err := runTemplateCommand(fmt.Sprintf(`%s %s print hello | findstr hello`, quoteTemplateCommandArg(helper), templateCommandHelperFlag))
+		require.NoError(t, err)
+		require.Equal(t, "hello", strings.TrimSpace(output))
+	} else {
+		output, err := runTemplateCommand(fmt.Sprintf(`%s %s print hello | cat`, quoteTemplateCommandArg(helper), templateCommandHelperFlag))
+		require.NoError(t, err)
+		require.Equal(t, "hello", output)
+	}
 }
 
 func TestRunTemplateCommandWithQuotedPathAndArguments(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "program with spaces")
-	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s|%s|%s' \"$1\" \"$2\" \"$3\"\n"), 0o700))
-	output, err := runTemplateCommand(fmt.Sprintf("%q 1 2 3", path))
+	source := templateCommandHelperPath(t)
+	data, err := os.ReadFile(source)
 	require.NoError(t, err)
-	require.Equal(t, "1|2|3", output)
+	name := "program with spaces"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	path := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(path, data, 0o700))
+
+	output, err := runTemplateCommand(fmt.Sprintf(`%s %s echo-args 1 2 3`, quoteTemplateCommandArg(path), templateCommandHelperFlag))
+	require.NoError(t, err)
+	require.Equal(t, "1|2|3", strings.TrimSpace(output))
 }
 
 func TestRunTemplateCommandRuntimeEnv(t *testing.T) {
-	// shell pipeline branch
-	output, err := runTemplateCommand(`printf '%s' "$MIHOMO_VERSION" | cat`)
-	require.NoError(t, err)
-	require.Equal(t, C.Version, output)
-
-	// direct exec branch
-	dir := t.TempDir()
-	script := filepath.Join(dir, "env.sh")
-	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s|%s|%s' \"$MIHOMO_VERSION\" \"$MIHOMO_CFG_DIR\" \"$MIHOMO_CFG_FILE\"\n"), 0o700))
-	output, err = runTemplateCommand(script)
-	require.NoError(t, err)
+	helper := quoteTemplateCommandArg(templateCommandHelperPath(t))
 	configFile := C.Path.Config()
-	require.Equal(t, C.Version+"|"+filepath.Dir(configFile)+"|"+configFile, output)
+	expected := C.Version + "|" + filepath.Dir(configFile) + "|" + configFile
+
+	if runtime.GOOS == "windows" {
+		output, err := runTemplateCommand(fmt.Sprintf(`%s %s print %%MIHOMO_VERSION%% | findstr .`, helper, templateCommandHelperFlag))
+		require.NoError(t, err)
+		require.Equal(t, C.Version, strings.TrimSpace(output))
+	} else {
+		output, err := runTemplateCommand(fmt.Sprintf(`%s %s print "$MIHOMO_VERSION" | cat`, helper, templateCommandHelperFlag))
+		require.NoError(t, err)
+		require.Equal(t, C.Version, output)
+	}
+
+	output, err := runTemplateCommand(fmt.Sprintf(`%s %s echo-env`, helper, templateCommandHelperFlag))
+	require.NoError(t, err)
+	require.Equal(t, expected, strings.TrimSpace(output))
+}
+
+func TestRunTemplateCommandEnvExpansion(t *testing.T) {
+	helper := quoteTemplateCommandArg(templateCommandHelperPath(t))
+	configFile := C.Path.Config()
+
+	// direct exec branch: the runner expands environment variable
+	// references itself, following the platform shell syntax.
+	if runtime.GOOS == "windows" {
+		output, err := runTemplateCommand(fmt.Sprintf(`%s %s print %%MIHOMO_CFG_FILE%%`, helper, templateCommandHelperFlag))
+		require.NoError(t, err)
+		require.Equal(t, configFile, strings.TrimSpace(output))
+	} else {
+		output, err := runTemplateCommand(fmt.Sprintf(`%s %s print $MIHOMO_CFG_FILE`, helper, templateCommandHelperFlag))
+		require.NoError(t, err)
+		require.Equal(t, configFile, output)
+	}
+
+	// single quotes keep the reference literal, matching shell semantics.
+	output, err := runTemplateCommand(fmt.Sprintf(`%s %s print '$MIHOMO_CFG_FILE'`, helper, templateCommandHelperFlag))
+	require.NoError(t, err)
+	require.Equal(t, "$MIHOMO_CFG_FILE", strings.TrimSpace(output))
 }
