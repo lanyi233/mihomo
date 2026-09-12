@@ -12,6 +12,7 @@ import (
 
 	"github.com/metacubex/mihomo/component/age"
 	"github.com/metacubex/mihomo/config"
+	C "github.com/metacubex/mihomo/constant"
 )
 
 func templateMain(args []string) int {
@@ -38,6 +39,11 @@ func templateMain(args []string) int {
 	}
 
 	inputPath := flags.Arg(0)
+	if inputPath != "-" {
+		if abs, err := filepath.Abs(inputPath); err == nil {
+			C.SetConfig(abs)
+		}
+	}
 	data, err := readTemplateInput(inputPath)
 	if err != nil {
 		fatalTemplateCommand(err)

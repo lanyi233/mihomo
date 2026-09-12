@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"text/template"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/metacubex/mihomo/component/age"
+	C "github.com/metacubex/mihomo/constant"
 )
 
 const maxTemplateOutput = 8 << 20
@@ -84,6 +86,7 @@ func runTemplateCommand(command string) (string, error) {
 		cmd = exec.CommandContext(ctx, args[0], args[1:]...)
 		commandName = args[0]
 	}
+	cmd.Env = templateCommandEnv()
 
 	var stdout, stderr limitedCommandOutput
 	stdout.limit = maxTemplateOutput
@@ -121,6 +124,15 @@ func shellTemplateCommand(ctx context.Context, command string) *exec.Cmd {
 		return exec.CommandContext(ctx, "cmd.exe", "/C", command)
 	}
 	return exec.CommandContext(ctx, "/bin/sh", "-c", command)
+}
+
+func templateCommandEnv() []string {
+	configFile := C.Path.Config()
+	return append(os.Environ(),
+		"MIHOMO_VERSION="+C.Version,
+		"MIHOMO_CFG_DIR="+filepath.Dir(configFile),
+		"MIHOMO_CFG_FILE="+configFile,
+	)
 }
 
 func containsTemplatePipeline(command string) bool {

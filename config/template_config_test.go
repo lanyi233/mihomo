@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/metacubex/mihomo/component/age"
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/stretchr/testify/require"
 )
 
@@ -135,4 +136,20 @@ func TestRunTemplateCommandWithQuotedPathAndArguments(t *testing.T) {
 	output, err := runTemplateCommand(fmt.Sprintf("%q 1 2 3", path))
 	require.NoError(t, err)
 	require.Equal(t, "1|2|3", output)
+}
+
+func TestRunTemplateCommandRuntimeEnv(t *testing.T) {
+	// shell pipeline branch
+	output, err := runTemplateCommand(`printf '%s' "$MIHOMO_VERSION" | cat`)
+	require.NoError(t, err)
+	require.Equal(t, C.Version, output)
+
+	// direct exec branch
+	dir := t.TempDir()
+	script := filepath.Join(dir, "env.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s|%s|%s' \"$MIHOMO_VERSION\" \"$MIHOMO_CFG_DIR\" \"$MIHOMO_CFG_FILE\"\n"), 0o700))
+	output, err = runTemplateCommand(script)
+	require.NoError(t, err)
+	configFile := C.Path.Config()
+	require.Equal(t, C.Version+"|"+filepath.Dir(configFile)+"|"+configFile, output)
 }
