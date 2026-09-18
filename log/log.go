@@ -55,6 +55,14 @@ func Errorln(format string, v ...any) {
 }
 
 func Debugln(format string, v ...any) {
+	// A debug event has exactly two consumers: print, which drops it below the
+	// current level, and live log subscribers - which is what DebugEnabled
+	// tests. Checking here keeps the formatting and the unbuffered channel
+	// handoff off every caller's path, instead of asking each of the couple of
+	// hundred call sites to remember the guard.
+	if !DebugEnabled() {
+		return
+	}
 	event := newLog(DEBUG, format, v...)
 	logCh <- event
 	print(event)

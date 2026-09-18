@@ -174,26 +174,91 @@ func (i *Inbound) updateFakeIPRanges(ipv4 netip.Prefix, ipv6 netip.Prefix) {
 		return
 	}
 	i.policyAccess.Unlock()
-	i.applyFakeIPRanges(ipv4, ipv6)
+	i.noteFakeIPRangeOutcome(i.applyFakeIPRanges(ipv4, ipv6))
 }
 
-// applyFakeIPRanges pushes the ranges into every backend that is live. A
-// backend that does not exist yet picks them up from the recompiled policy.
-func (i *Inbound) applyFakeIPRanges(ipv4 netip.Prefix, ipv6 netip.Prefix) {
+// noteFakeIPRangeOutcome records whether every live backend took the ranges,
+// and wakes the interface-update scheduler when one did not.
+//
+// This converges rather than rolling back, which is the opposite of what the
+// bypass policy does, and deliberately: there the planes had to agree and
+// nothing would ever ask again, so a transaction was the only way to stay
+// coherent. Here the desired end state is every plane on the NEW ranges --
+// rolling back moves away from it, leaving each plane agreeing on ranges the
+// DNS pool has already left, so no fake address is force-intercepted anywhere.
+// Retrying moves toward it, and the scheduler is a driver the bypass policy did
+// not have. A DNS config change is the only other thing that would ask, and it
+// will not happen again just because one backend refused the write.
+func (i *Inbound) noteFakeIPRangeOutcome(complete bool) {
+	i.policyAccess.Lock()
+	i.fakeIPRangeNeedsRetry = !complete
+	i.policyAccess.Unlock()
+	if !complete {
+		i.notifyTCInterfaceUpdate()
+	}
+}
+
+// retryFakeIPRangesIfNeeded is the scheduler's hook. Like the bypass_rule_set
+// hook it costs a lock and a boolean while everything is healthy.
+func (i *Inbound) retryFakeIPRangesIfNeeded() tcSharedRewriteOutcome {
+	i.policyAccess.RLock()
+	pending := i.fakeIPRangeNeedsRetry
+	ipv4, ipv6 := i.fakeIPIPv4Prefix, i.fakeIPIPv6Prefix
+	i.policyAccess.RUnlock()
+	if !pending {
+		return tcSharedRewriteSettled
+	}
+	if i.applyFakeIPRanges(ipv4, ipv6) {
+		i.policyAccess.Lock()
+		i.fakeIPRangeNeedsRetry = false
+		i.policyAccess.Unlock()
+		return tcSharedRewriteSettled
+	}
+	// A backend that has invalidated itself refuses every later write, so
+	// retrying it can never succeed; the inbound needs rebuilding instead.
+	if i.fakeIPRangeBackendRequiresRebuild() {
+		i.policyAccess.Lock()
+		i.fakeIPRangeNeedsRetry = false
+		i.policyAccess.Unlock()
+		return tcSharedRewriteUnrecoverable
+	}
+	return tcSharedRewriteRecoverable
+}
+
+func (i *Inbound) fakeIPRangeBackendRequiresRebuild() bool {
+	if i.cgroupBackendInstance().RequiresRebuild() || i.tcBackend().RequiresRebuild() {
+		return true
+	}
+	return i.sharedRewrite != nil && i.sharedRewrite.sharedBackendInstance().RequiresRebuild()
+}
+
+// applyFakeIPRanges pushes the ranges into every backend that is live, and
+// reports whether all of them took them. A backend that does not exist yet
+// picks them up from the recompiled policy.
+//
+// Every backend is attempted even after one fails: they hold independent
+// copies, so getting the ranges into two of three is strictly better than one,
+// and the caller retries whatever is left.
+func (i *Inbound) applyFakeIPRanges(ipv4 netip.Prefix, ipv6 netip.Prefix) bool {
+	complete := true
 	if backend := i.cgroupBackendInstance(); backend != nil {
 		changed, err := backend.SetFakeIPRanges(ipv4, ipv6)
 		logFakeIPRangeUpdate("local cgroup", ipv4, ipv6, changed, err)
+		complete = complete && err == nil
 	}
 	if backend := i.tcBackend(); backend != nil {
 		changed, err := backend.SetFakeIPRanges(ipv4, ipv6)
 		logFakeIPRangeUpdate("TC", ipv4, ipv6, changed, err)
+		complete = complete && err == nil
 	}
 	if shared := i.sharedRewrite; shared != nil {
 		if backend := shared.sharedBackendInstance(); backend != nil && !backend.IsClosed() {
 			changed, err := backend.SetFakeIPRanges(ipv4, ipv6)
 			logFakeIPRangeUpdate("shared packet-rewrite", ipv4, ipv6, changed, err)
+			complete = complete && err == nil
 		}
 	}
+	return complete
 }
 
 func logFakeIPRangeUpdate(scope string, ipv4 netip.Prefix, ipv6 netip.Prefix, changed bool, err error) {

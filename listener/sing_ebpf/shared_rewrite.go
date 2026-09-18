@@ -56,7 +56,7 @@ type sharedRewrite struct {
 func newSharedRewrite(inbound *Inbound, options LC.EBPFShared) *sharedRewrite {
 	mapCapacity := effectiveSharedNetworkMapCapacity(
 		inbound.sharedMapCapacity(),
-		len(inbound.bypassRuleSet) > 0 ||
+		len(inbound.bypassRuleSetTags) > 0 ||
 			len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 			len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0,
 	)
@@ -100,14 +100,15 @@ func (s *sharedRewrite) prepareBackend() (*ECommon.SharedNetworkBackend, error) 
 	}
 	cgroupBackend := s.inbound.cgroupBackendInstance()
 	backend, err := ECommon.PrepareSharedNetwork(cgroupBackend, ECommon.SharedNetworkConfig{
-		ListenerPort: s.listeners.selectedPort(),
-		EnableTCP:    s.inbound.enableTCP,
-		EnableUDP:    s.inbound.enableUDP,
-		RedirectIPv4: s.inbound.redirectIPv4Prefix,
-		RedirectIPv6: redirectIPv6,
-		Policy:       s.inbound.policySnapshot(),
-		MapCapacity:  s.mapCapacity,
-		UDPTimeout:   s.inbound.udpTimeout,
+		ListenerPort:    s.listeners.selectedPort(),
+		EnableTCP:       s.inbound.enableTCP,
+		EnableUDP:       s.inbound.enableUDP,
+		RedirectIPv4:    s.inbound.redirectIPv4Prefix,
+		RedirectIPv6:    redirectIPv6,
+		Policy:          s.inbound.policySnapshot(),
+		MapCapacity:     s.mapCapacity,
+		UDPTimeout:      s.inbound.udpTimeoutValue(),
+		FakeIPICMPReply: s.inbound.fakeIPICMPReply,
 	})
 	if err != nil {
 		return nil, err

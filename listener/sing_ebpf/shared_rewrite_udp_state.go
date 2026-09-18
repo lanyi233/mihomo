@@ -9,23 +9,15 @@ import (
 	"sync/atomic"
 
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
-	N "github.com/metacubex/mihomo/common/net"
-	C "github.com/metacubex/mihomo/constant"
 )
 
 type sharedUDPClientTable struct {
-	clientShards       [sharedUDPClientShardCount]sharedUDPClientShard
+	clientShards       [sharedUDPClientShardCount]udpClientShard[sharedUDPClientState]
 	redirectAccess     sync.Mutex
 	redirectReferences map[sharedUDPRedirectReference]uint32
 }
 
 const sharedUDPClientShardCount = 16
-
-type sharedUDPClientShard struct {
-	sweep   udpSweepQueue
-	access  sync.RWMutex
-	clients map[netip.AddrPort]*sharedUDPClientState
-}
 
 type sharedUDPClientState struct {
 	sweep                udpSweepEntry
@@ -90,10 +82,12 @@ func (t *sharedUDPClientTable) loadOrCreate(client netip.AddrPort) *sharedUDPCli
 	shard := t.clientShard(client)
 	shard.access.Lock()
 	defer shard.access.Unlock()
-	return shard.loadOrCreateLocked(client)
+	return sharedLoadOrCreateLocked(shard, client)
 }
 
-func (s *sharedUDPClientShard) loadOrCreateLocked(client netip.AddrPort) *sharedUDPClientState {
+// sharedLoadOrCreateLocked is a function rather than a method because the shard
+// type is generic and Go has no method specialisation. Callers hold s.access.
+func sharedLoadOrCreateLocked(s *udpClientShard[sharedUDPClientState], client netip.AddrPort) *sharedUDPClientState {
 	if clientState, loaded := s.clients[client]; loaded {
 		return clientState
 	}
@@ -103,6 +97,7 @@ func (s *sharedUDPClientShard) loadOrCreateLocked(client netip.AddrPort) *shared
 	clientState := &sharedUDPClientState{
 		bindings:  make(map[netip.AddrPort]sharedUDPRedirectBinding),
 		originals: make(map[netip.Addr]sharedUDPOriginalDestination),
+		lAddr:     newUDPClientAddr(client),
 	}
 	clientState.activity.touch()
 	s.clients[client] = clientState
@@ -110,29 +105,12 @@ func (s *sharedUDPClientShard) loadOrCreateLocked(client netip.AddrPort) *shared
 	return clientState
 }
 
-// localAddr returns the address the tunnel keys its NAT table on. It is the
-// same for every packet of a client, so it is built once rather than
-// formatted and allocated per packet on the read loop.
-func (s *sharedUDPClientState) localAddr(client netip.AddrPort) net.Addr {
-	s.access.RLock()
-	lAddr := s.lAddr
-	s.access.RUnlock()
-	if lAddr != nil {
-		return lAddr
-	}
-	s.access.Lock()
-	if s.lAddr == nil {
-		s.lAddr = N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client))
-	}
-	lAddr = s.lAddr
-	s.access.Unlock()
-	return lAddr
-}
+// localAddr is fixed at construction from the client key, so reading it on the
+// packet path needs no lock. See newUDPClientAddr.
+func (s *sharedUDPClientState) localAddr() net.Addr { return s.lAddr }
 
-func (t *sharedUDPClientTable) clientShard(client netip.AddrPort) *sharedUDPClientShard {
-	port := client.Port()
-	index := (port ^ port>>8) & (sharedUDPClientShardCount - 1)
-	return &t.clientShards[index]
+func (t *sharedUDPClientTable) clientShard(client netip.AddrPort) *udpClientShard[sharedUDPClientState] {
+	return &t.clientShards[shardIndexForAddrPort(client, sharedUDPClientShardCount)]
 }
 
 func (t *sharedUDPClientTable) cachedOriginal(client netip.AddrPort, redirectAddress netip.Addr) (sharedUDPOriginalDestination, bool) {
@@ -275,7 +253,7 @@ func (t *sharedUDPClientTable) setBindingState(
 	shard.access.RUnlock()
 
 	shard.access.Lock()
-	clientState = shard.loadOrCreateLocked(client)
+	clientState = sharedLoadOrCreateLocked(shard, client)
 	released, installed := t.setClientBinding(clientState, redirectAddress, reference, original)
 	shard.access.Unlock()
 	return released, installed

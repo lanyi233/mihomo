@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"strings"
@@ -23,35 +24,35 @@ var (
 )
 
 type StatsRecord struct {
-	Success            int64                   `json:"success"`
-	Failure            int64                   `json:"failure"`
-	ConnectTime        int64                   `json:"connect_time"`
-	Latency            int64                   `json:"latency"`
-	LastUsed           int64                   `json:"last_used"`
-	Weights            map[string]float64      `json:"weights"`
-	UploadTotal        float64                 `json:"upload_total"`
-	DownloadTotal      float64                 `json:"download_total"`
-	MaxUploadRate      float64                 `json:"max_upload_rate"`
-	MaxDownloadRate    float64                 `json:"max_download_rate"`
-	ConnectionDuration float64                 `json:"connection_duration"`
-	LossRate           float64                 `json:"loss_rate,omitempty"`
-	CumulSent          uint64                  `json:"cumul_sent,omitempty"`
-	CumulRetrans       uint64                  `json:"cumul_retrans,omitempty"`
+	Success            int64              `json:"success"`
+	Failure            int64              `json:"failure"`
+	ConnectTime        int64              `json:"connect_time"`
+	Latency            int64              `json:"latency"`
+	LastUsed           int64              `json:"last_used"`
+	Weights            map[string]float64 `json:"weights"`
+	UploadTotal        float64            `json:"upload_total"`
+	DownloadTotal      float64            `json:"download_total"`
+	MaxUploadRate      float64            `json:"max_upload_rate"`
+	MaxDownloadRate    float64            `json:"max_download_rate"`
+	ConnectionDuration float64            `json:"connection_duration"`
+	LossRate           float64            `json:"loss_rate,omitempty"`
+	CumulSent          uint64             `json:"cumul_sent,omitempty"`
+	CumulRetrans       uint64             `json:"cumul_retrans,omitempty"`
 }
 
 type NodeState struct {
-	Name               string         `json:"name"`
-	LastChecked        int64          `json:"last_checked"`
-	BlockedUntil       int64          `json:"blocked_until"`
-	ThresholdGrade     int            `json:"threshold_grade,omitempty"`
+	Name           string `json:"name"`
+	LastChecked    int64  `json:"last_checked"`
+	BlockedUntil   int64  `json:"blocked_until"`
+	ThresholdGrade int    `json:"threshold_grade,omitempty"`
 }
 
 type AtomicStatsRecord struct {
-	success         atomic.Int64
-	failure         atomic.Int64
-	connectTime     atomic.Int64
-	latency         atomic.Int64
-	lastUsed        atomic.Int64
+	success     atomic.Int64
+	failure     atomic.Int64
+	connectTime atomic.Int64
+	latency     atomic.Int64
+	lastUsed    atomic.Int64
 
 	uploadTotal     atomic.Float64
 	downloadTotal   atomic.Float64
@@ -62,7 +63,44 @@ type AtomicStatsRecord struct {
 	cumulSent       atomic.Int64
 	cumulRetrans    atomic.Int64
 
-	weights         *lru.LruCache[string, float64]
+	weights *lru.LruCache[string, float64]
+}
+
+// BlockCode says why a node is excluded from a target. The values are the keys
+// of HostStatus.Codes and are persisted, so they are an on-disk format: they
+// can be added to, never renumbered.
+//
+// They are ordered by severity, lowest first, and UpdateHostStatus relies on
+// that -- a new verdict that is numerically lower replaces a higher one, and a
+// higher one is discarded while a lower one stands.
+type BlockCode int
+
+const (
+	// BlockNone is not a block. It is what a healthy close reports, and what
+	// tells UpdateHostStatus to clear the node instead of recording anything.
+	BlockNone BlockCode = 0
+	// BlockManual is the dashboard's block. Permanent, never probed, and never
+	// cleared by anything the network does -- it is the user's decision.
+	BlockManual BlockCode = 1
+	// BlockAbnormalStatus is a status test through the node answering badly.
+	// The only code a recovery probe can itself raise.
+	BlockAbnormalStatus BlockCode = 2
+	// BlockDialFailure accumulates: it counts failures and only blocks once
+	// they reach maxFailedTimes.
+	BlockDialFailure BlockCode = 3
+	// BlockNoResponse is a request that went out and got nothing back.
+	BlockNoResponse BlockCode = 4
+	// BlockLowWeight is a computed weight under AllowedWeight.
+	BlockLowWeight BlockCode = 5
+	// BlockPacketLoss is loss over the threshold.
+	BlockPacketLoss BlockCode = 6
+)
+
+// Recoverable reports whether a probe may return this node to service. Only
+// BlockManual is excluded: it is the user's decision, not the network's, and
+// nothing should undo it behind their back.
+func (c BlockCode) Recoverable() bool {
+	return c != BlockNone && c != BlockManual
 }
 
 type CodeNodeSet struct {
@@ -72,12 +110,12 @@ type CodeNodeSet struct {
 }
 
 type HostStatus struct {
-	initOnce    sync.Once            `json:"-"`
-	mu          sync.RWMutex         `json:"-"`
-	LastFailure int64                `json:"last_failure,omitempty"`
-	LastCheck   int64                `json:"last_check,omitempty"`
-	Blocked     bool                 `json:"blocked,omitempty"`
-	Codes       map[int]*CodeNodeSet `json:"codes,omitempty"`
+	initOnce    sync.Once                  `json:"-"`
+	mu          sync.RWMutex               `json:"-"`
+	LastFailure int64                      `json:"last_failure,omitempty"`
+	LastCheck   int64                      `json:"last_check,omitempty"`
+	Blocked     bool                       `json:"blocked,omitempty"`
+	Codes       map[BlockCode]*CodeNodeSet `json:"codes,omitempty"`
 }
 
 type ActiveTarget struct {
@@ -94,8 +132,8 @@ type NodeRankItem struct {
 }
 
 type NodeRank struct {
-	LastUpdated int64           `json:"last_updated"`
-	Result      []NodeRankItem  `json:"result"`
+	LastUpdated int64          `json:"last_updated"`
+	Result      []NodeRankItem `json:"result"`
 }
 
 type targetMinHeap []ActiveTarget
@@ -473,7 +511,7 @@ func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.
 
 	for _, node := range proxyNames {
 		score := nodeScores[node]
-		percentScore := math.Round(score / maxScore * 100 * 100) / 100
+		percentScore := math.Round(score/maxScore*100*100) / 100
 		resultItems = append(resultItems, NodeRankItem{Name: node, Weight: percentScore, Rank: ""})
 	}
 
@@ -502,22 +540,22 @@ func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.
 		}
 
 		if aliveCount > 0 && positiveAliveCount > 0 {
-				mostUsedBound := int(float64(positiveAliveCount) * 0.2)
-				if mostUsedBound < 1 {
-					mostUsedBound = 1
-				}
+			mostUsedBound := int(float64(positiveAliveCount) * 0.2)
+			if mostUsedBound < 1 {
+				mostUsedBound = 1
+			}
 
-				occasionalBound := mostUsedBound + int(float64(positiveAliveCount)*0.5)
+			occasionalBound := mostUsedBound + int(float64(positiveAliveCount)*0.5)
 
-				for i := 0; i < mostUsedBound; i++ {
-					resultItems[i].Rank = RankMostUsed
-				}
-				for i := mostUsedBound; i < occasionalBound; i++ {
-					resultItems[i].Rank = RankOccasional
-				}
-				for i := occasionalBound; i < aliveCount; i++ {
-					resultItems[i].Rank = RankRarelyUsed
-				}
+			for i := 0; i < mostUsedBound; i++ {
+				resultItems[i].Rank = RankMostUsed
+			}
+			for i := mostUsedBound; i < occasionalBound; i++ {
+				resultItems[i].Rank = RankOccasional
+			}
+			for i := occasionalBound; i < aliveCount; i++ {
+				resultItems[i].Rank = RankRarelyUsed
+			}
 		}
 
 		for i := aliveCount; i < len(resultItems); i++ {
@@ -527,9 +565,9 @@ func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.
 		wrapper := NodeRank{LastUpdated: time.Now().Unix(), Result: resultItems}
 		s.StoreNodeWeightRanking(group, config, wrapper)
 		return wrapper, nil
-    }
+	}
 
-    return NodeRank{}, nil
+	return NodeRank{}, nil
 }
 
 // 存储节点权重排名
@@ -590,12 +628,12 @@ func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, i
 				if record.Weights == nil {
 					continue
 				}
-				
+
 				weight, ok := record.Weights[asnWeightType]
 				if !ok || weight <= 0 {
 					continue
 				}
-				
+
 				timeDecay := getTimeDecay(record.LastUsed)
 				decayedWeight := weight * timeDecay
 				nodesWithWeight[nodeName] += decayedWeight
@@ -664,9 +702,9 @@ func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, i
 }
 
 // 获取活跃域名
-func (h targetMinHeap) Len() int           { return len(h) }
-func (h targetMinHeap) Less(i, j int) bool { return h[i].LastUsed < h[j].LastUsed }
-func (h targetMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h targetMinHeap) Len() int            { return len(h) }
+func (h targetMinHeap) Less(i, j int) bool  { return h[i].LastUsed < h[j].LastUsed }
+func (h targetMinHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
 func (h *targetMinHeap) Push(x interface{}) { *h = append(*h, x.(ActiveTarget)) }
 func (h *targetMinHeap) Pop() interface{} {
 	old := *h
@@ -781,7 +819,7 @@ func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget
 	for h.Len() > 0 {
 		sorted = append(sorted, heap.Pop(h).(ActiveTarget))
 	}
-	for i, j := 0, len(sorted) - 1; i < j; i, j = i + 1, j - 1 {
+	for i, j := 0, len(sorted)-1; i < j; i, j = i+1, j-1 {
 		sorted[i], sorted[j] = sorted[j], sorted[i]
 	}
 
@@ -812,13 +850,13 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 	}
 
 	type asnCacheKey struct {
-		asnNumber   string
-		isUDP       bool
+		asnNumber string
+		isUDP     bool
 	}
 
 	type asnCacheValue struct {
-		nodes       []string
-		weights     []float64
+		nodes   []string
+		weights []float64
 	}
 
 	asnCache := make(map[asnCacheKey]asnCacheValue)
@@ -838,8 +876,8 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 			} else {
 				bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 				asnCache[key] = asnCacheValue{
-					nodes:      bestNodes,
-					weights:    bestWeights,
+					nodes:   bestNodes,
+					weights: bestWeights,
 				}
 			}
 		} else {
@@ -918,7 +956,7 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 					newW := item.bestWeights[i]
 					if oldW, exists := finalNodeMap[newNode]; exists {
 						// prevent degrade recovery too fast
-						if oldW <= 0 || math.Abs(newW - oldW) / oldW > 0.1 {
+						if oldW <= 0 || math.Abs(newW-oldW)/oldW > 0.1 {
 							finalNodeMap[newNode] = newW
 							needUpdate = true
 						}
@@ -979,8 +1017,8 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 			if item.asnNumber != "" && !CdnASNs[item.asnNumber] {
 				key := asnCacheKey{item.asnNumber, item.isUDP}
 				asnCache[key] = asnCacheValue{
-					nodes:      sortedNodes,
-					weights:    sortedWeights,
+					nodes:   sortedNodes,
+					weights: sortedWeights,
 				}
 			}
 		}
@@ -1096,7 +1134,7 @@ func (s *Store) GetStatsForTarget(group, config, target, proxy string) (map[stri
 		}
 	} else {
 		for fullPath, data := range rawResult {
-			nodeName := fullPath[strings.LastIndexByte(fullPath, '/') + 1:]
+			nodeName := fullPath[strings.LastIndexByte(fullPath, '/')+1:]
 			result[nodeName] = data
 		}
 	}
@@ -1185,7 +1223,7 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 	nodeStatesData, err := s.GetSubBytesByPath(nodesPath)
 	if err == nil {
 		for key := range nodeStatesData {
-			nodeName := key[strings.LastIndexByte(key, '/') + 1:]
+			nodeName := key[strings.LastIndexByte(key, '/')+1:]
 			if nodeName != "" {
 				nodesMap[nodeName] = true
 			}
@@ -1199,7 +1237,7 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 			if strings.Count(key, "/") < 5 {
 				continue
 			}
-			nodeName := key[strings.LastIndexByte(key, '/') + 1:]
+			nodeName := key[strings.LastIndexByte(key, '/')+1:]
 			if nodeName != "" {
 				nodesMap[nodeName] = true
 			}
@@ -1214,10 +1252,10 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 }
 
 // 域名失败屏蔽
-func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimit int, extraTargets ...string) (failNodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
+func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimit int, extraTargets ...string) (failNodes map[string]BlockCode, lastCheck int64, lastFailure int64, blocked bool) {
 	now := time.Now().Unix()
 
-	lookup := func(pathPrefix string) (nodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
+	lookup := func(pathPrefix string) (nodes map[string]BlockCode, lastCheck int64, lastFailure int64, blocked bool) {
 		hs, _ := hostStatusCache.GetOrStore(pathPrefix, func() *HostStatus { return &HostStatus{} })
 		hs.initOnce.Do(func() {
 			if rawResult, err := s.GetSubBytesByPath(pathPrefix); err == nil {
@@ -1238,13 +1276,13 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimi
 			for nodeName, nodeEntry := range codeSet.Nodes {
 				if nodeEntry == 0 || nodeEntry > now {
 					if nodes == nil {
-						nodes = make(map[string]int)
+						nodes = make(map[string]BlockCode)
 					}
 					if oldCode, exists := nodes[nodeName]; !exists || code < oldCode {
 						nodes[nodeName] = code
 					}
 				}
-				if code != 1 && nodeEntry > now {
+				if code.Recoverable() && nodeEntry > now {
 					blockingCount++
 				}
 			}
@@ -1275,19 +1313,53 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimi
 	return
 }
 
-func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata *C.Metadata, name string, maxFailedTimes int, hostFailLimit int, failure, checked bool, statusCode int64) bool {
+// cloneForSaveLocked copies everything the persisted form needs. Callers hold
+// hs.mu; the result is owned by the caller and safe to encode without it.
+func (hs *HostStatus) cloneForSaveLocked() *HostStatus {
+	clone := &HostStatus{
+		LastFailure: hs.LastFailure,
+		LastCheck:   hs.LastCheck,
+		Blocked:     hs.Blocked,
+	}
+	if len(hs.Codes) == 0 {
+		return clone
+	}
+	clone.Codes = make(map[BlockCode]*CodeNodeSet, len(hs.Codes))
+	for code, codeSet := range hs.Codes {
+		if codeSet == nil {
+			continue
+		}
+		// maps.Clone copies a nil map as nil, which costs nothing for the
+		// sets a given code does not use. It is not what keeps them out of the
+		// encoded form -- omitempty drops an empty map just the same.
+		clone.Codes[code] = &CodeNodeSet{
+			Nodes:      maps.Clone(codeSet.Nodes),
+			FailCounts: maps.Clone(codeSet.FailCounts),
+			NodeHosts:  maps.Clone(codeSet.NodeHosts),
+		}
+	}
+	return clone
+}
+
+func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata *C.Metadata, name string, maxFailedTimes int, hostFailLimit int, failure, checked bool, statusCode BlockCode) bool {
 	if !checked {
 		return false
 	}
 
-	newCode := int(statusCode)
+	newCode := statusCode
 
-	var host string
-	if failure && newCode == 2 {
-		if metadata.Host == "" {
-			return false
-		}
-		host = metadata.Host
+	// The host is where a recovery probe is aimed, so every code that can block
+	// has to record it -- not just code 2, the one code that was reached by
+	// probing in the first place. Without it a blocked node has nothing to test
+	// and stays excluded until the TTL drops it a day later.
+	//
+	// Code 2 still refuses a block it could never retry: it is only ever raised
+	// by a status test, which had a host by definition. The other codes come
+	// from traffic that may carry none (a bare IP destination), and for those
+	// the TTL remains the only way back, exactly as before.
+	host := metadata.Host
+	if failure && newCode == BlockAbnormalStatus && host == "" {
+		return false
 	}
 
 	pathPrefix := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
@@ -1309,10 +1381,9 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 	})
 
 	hs.mu.Lock()
-	defer hs.mu.Unlock()
 
 	if hs.Codes == nil {
-		hs.Codes = make(map[int]*CodeNodeSet)
+		hs.Codes = make(map[BlockCode]*CodeNodeSet)
 	}
 
 	for code, codeSet := range hs.Codes {
@@ -1320,29 +1391,18 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			delete(hs.Codes, code)
 			continue
 		}
-		if code == 1 {
+		if code == BlockManual {
 			continue
 		}
-		if code == 2 {
-			for nodeName, nodeEntry := range codeSet.Nodes {
-				if nodeEntry != 0 && nodeEntry <= now {
-					delete(codeSet.Nodes, nodeName)
-					if codeSet.NodeHosts != nil {
-						delete(codeSet.NodeHosts, nodeName)
-					}
-				}
-			}
-			if len(codeSet.Nodes) == 0 {
-				delete(hs.Codes, code)
-			}
-			continue
-		}
+		// One expiry rule for every code now that all of them carry a probe
+		// target: delete on a nil map is a no-op, so the sets a given code does
+		// not use cost nothing. Code 2 never populates FailCounts, so folding
+		// its old branch in here leaves its condition unchanged.
 		for nodeName, nodeEntry := range codeSet.Nodes {
 			if nodeEntry != 0 && nodeEntry <= now {
 				delete(codeSet.Nodes, nodeName)
-				if codeSet.FailCounts != nil {
-					delete(codeSet.FailCounts, nodeName)
-				}
+				delete(codeSet.FailCounts, nodeName)
+				delete(codeSet.NodeHosts, nodeName)
 			}
 		}
 		if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 {
@@ -1351,15 +1411,26 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 	}
 
 	oldLastFailure := hs.LastFailure
-	currentCode := -1
+	currentCode := BlockCode(-1)
+	// What this node is already blocked with, if anything: the deadline, which
+	// blockNode refuses to push out, and the host a probe would aim at, which
+	// it inherits when this update carries none. See blockNode for both.
+	currentExpiry := int64(0)
+	currentHost := ""
 
 	for code, codeSet := range hs.Codes {
 		if codeSet == nil {
 			continue
 		}
-		if _, ok := codeSet.Nodes[name]; ok {
+		if nodeEntry, ok := codeSet.Nodes[name]; ok {
 			if currentCode == -1 || code < currentCode {
 				currentCode = code
+			}
+			if nodeEntry > now && (currentExpiry == 0 || nodeEntry < currentExpiry) {
+				currentExpiry = nodeEntry
+			}
+			if currentHost == "" {
+				currentHost = codeSet.NodeHosts[name]
 			}
 		}
 		if codeSet.FailCounts != nil {
@@ -1371,9 +1442,9 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		}
 	}
 
-	if !failure && newCode == 0 {
+	if !failure && newCode == BlockNone {
 		for code, codeSet := range hs.Codes {
-			if code == 1 || codeSet == nil {
+			if code == BlockManual || codeSet == nil {
 				continue
 			}
 			delete(codeSet.Nodes, name)
@@ -1405,7 +1476,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		}
 	}
 
-	if failure || newCode == 3 {
+	if failure || newCode == BlockDialFailure {
 		hs.LastFailure = now
 
 		if hs.Codes[newCode] == nil {
@@ -1418,16 +1489,52 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			codeSet.Nodes = make(map[string]int64)
 		}
 
-		switch newCode {
-		case 1:
-			codeSet.Nodes[name] = 0 // TTL=0 means permanent
-		case 2:
-			codeSet.Nodes[name] = time.Now().Add(HostFailureNodeTTL).Unix()
+		blockNode := func() {
+			expiry := time.Now().Add(HostFailureNodeTTL).Unix()
+			// A re-block never pushes an existing deadline further out. The
+			// recovery probe is the only thing that re-blocks a node it has
+			// just tested, and letting its failure mint a fresh TTL is what
+			// turns a bounded exclusion into a permanent one: a host that
+			// answers a bare GET with 403, 405 or a timeout -- most API and
+			// telemetry endpoints, and exactly what a zero-traffic or
+			// low-weight block lands on -- fails every probe, and the probe
+			// keeps coming round. HostFailureNodeTTL is a bound on
+			// how long we stay away from a node, so repeated evidence must not
+			// be able to remove the bound. A block that has already lapsed does
+			// not count: currentExpiry only holds deadlines still in the future.
+			if currentExpiry > 0 && currentExpiry < expiry {
+				expiry = currentExpiry
+			}
+			codeSet.Nodes[name] = expiry
+			// A demotion empties the old code set for this node, probe target
+			// and all, and the connection that caused the demotion may carry no
+			// hostname of its own -- a bare-IP destination reports none.
+			// Inheriting the target keeps the block probeable; dropping it
+			// leaves the node excluded for the rest of the TTL with nothing
+			// able to test it, which is the state recording a target for every
+			// blocking code was meant to end.
+			probeHost := host
+			if probeHost == "" {
+				probeHost = currentHost
+			}
+			if probeHost == "" {
+				return
+			}
 			if codeSet.NodeHosts == nil {
 				codeSet.NodeHosts = make(map[string]string)
 			}
-			codeSet.NodeHosts[name] = host
-		case 3:
+			codeSet.NodeHosts[name] = probeHost
+		}
+
+		switch newCode {
+		case BlockManual:
+			// The dashboard's manual block. Deliberately permanent, and
+			// deliberately given no probe target: nothing may return it to
+			// service behind the user's back.
+			codeSet.Nodes[name] = 0 // TTL=0 means permanent
+		case BlockAbnormalStatus:
+			blockNode()
+		case BlockDialFailure:
 			if codeSet.FailCounts == nil {
 				codeSet.FailCounts = make(map[string]int)
 			}
@@ -1438,14 +1545,14 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 				count++
 			}
 			if count >= maxFailedTimes {
-				codeSet.Nodes[name] = time.Now().Add(HostFailureNodeTTL).Unix()
+				blockNode()
 				delete(codeSet.FailCounts, name)
 				failedBlock = true
 			} else {
 				codeSet.FailCounts[name] = count
 			}
 		default:
-			codeSet.Nodes[name] = time.Now().Add(HostFailureNodeTTL).Unix()
+			blockNode()
 		}
 	}
 
@@ -1454,7 +1561,7 @@ saveAndReturn:
 	hostBlockingCount := 0
 
 	for code, cs := range hs.Codes {
-		if code != 1 && cs != nil {
+		if code.Recoverable() && cs != nil {
 			hostBlockingCount += len(cs.Nodes)
 		}
 	}
@@ -1471,8 +1578,16 @@ saveAndReturn:
 		}
 	}
 
-	if len(hs.Codes) > 0 {
-		data, err := json.Marshal(&hs)
+	// Copied, then encoded with the mutex released. GetHostStatus read-locks the
+	// same mutex on the dial path, so a dial for this target would otherwise
+	// queue behind a close encoding the whole record -- up to six code sets of
+	// three maps each, keyed by node name. The copy walks the same entries but
+	// at map-insert cost rather than JSON-encode cost.
+	saved := hs.cloneForSaveLocked()
+	hs.mu.Unlock()
+
+	if len(saved.Codes) > 0 {
+		data, err := json.Marshal(saved)
 		if err != nil {
 			return failedBlock
 		}
@@ -1535,7 +1650,7 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 		cacheHS.mu.Lock()
 		hostBlockingCount := 0
 		for code, cs := range cacheHS.Codes {
-			if code != 1 && cs != nil {
+			if code.Recoverable() && cs != nil {
 				for _, nodeEntry := range cs.Nodes {
 					if nodeEntry == 0 || nodeEntry > now {
 						hostBlockingCount++
@@ -1556,11 +1671,28 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 			}
 		}
 
+		// Every code but 1 is recoverable, and each one excludes its node at
+		// dial time for the full TTL. Sweeping code 2 alone -- the only code a
+		// probe itself can raise -- meant a node blocked for a dial failure,
+		// zero traffic, a low weight or packet loss was gone for a day with no
+		// way back, however healthy it became in the meantime. A probe that
+		// fails re-blocks as code 2, so nothing here needs to preserve the
+		// original code.
 		retryHosts := make(map[string]string)
-		codeSet, ok := cacheHS.Codes[2]
-		if ok && codeSet != nil && codeSet.NodeHosts != nil {
+		for code, codeSet := range cacheHS.Codes {
+			if !code.Recoverable() || codeSet == nil || codeSet.NodeHosts == nil {
+				continue
+			}
 			for nodeName, nodeEntry := range codeSet.Nodes {
-				if nodeEntry == 0 || nodeEntry-now > int64((HostFailureNodeTTL-hostStatusRetryAfter).Seconds()) {
+				// Permanent (0), still inside hostStatusRetryAfter, or already
+				// lapsed. A lapsed entry is not excluding the node from
+				// anything any more, so probing it can only mint a new block
+				// for a node that is serving fine -- nothing sweeps expired
+				// entries except a later update on the same target, which never
+				// comes for a target that went quiet -- and it spends budget a
+				// live block needs.
+				if nodeEntry == 0 || nodeEntry <= now ||
+					nodeEntry-now > int64((HostFailureNodeTTL-hostStatusRetryAfter).Seconds()) {
 					continue
 				}
 				if host := codeSet.NodeHosts[nodeName]; host != "" {
@@ -1797,7 +1929,7 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 				} else {
 					hostBlockingCount := 0
 					for code, cs := range hs.Codes {
-						if code != 1 && cs != nil {
+						if code.Recoverable() && cs != nil {
 							hostBlockingCount += len(cs.Nodes)
 						}
 					}
@@ -1851,9 +1983,9 @@ func (s *Store) CleanupOldRecords(group, config string) {
 		}
 
 		type targetInfo struct {
-			time    time.Time
-			value   float64
-			target  string
+			time   time.Time
+			value  float64
+			target string
 		}
 		targetMap := make(map[string]*targetInfo)
 		var toDelete []string
@@ -1909,9 +2041,9 @@ func (s *Store) CleanupOldRecords(group, config string) {
 			}
 
 			targetMap[path] = &targetInfo{
-				time:    time.Unix(lastTime, 0),
-				value:   value,
-				target:  target,
+				time:   time.Unix(lastTime, 0),
+				value:  value,
+				target: target,
 			}
 		}
 
@@ -1971,7 +2103,7 @@ func (s *Store) CleanupOldRecords(group, config string) {
 				hostStatusCache.RemoveByKeyPrefix(pathPrefix)
 			}
 			log.Debugln("[SmartStore] Cleaned up [%d] old [%s] records, group [%s] keeping [%d] valuable and recent data...",
-				deleted, keyType, group, totalRecords - deleted)
+				deleted, keyType, group, totalRecords-deleted)
 		}
 	}
 

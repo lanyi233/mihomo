@@ -48,8 +48,11 @@ func TestAdjustCacheParametersConcurrentRecordCreation(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("cache adjustment deadlocked with record creation")
+	case <-time.After(60 * time.Second):
+		// Only a hang guard: the assertions below are what this test is about.
+		// Keep the budget far above any plausible runtime so a slow CI runner
+		// never turns this into a flake.
+		t.Fatal("cache adjustment did not finish alongside record creation")
 	}
 
 	require.Same(t, originalTargetCache, targetCache)

@@ -45,7 +45,7 @@ func (s *sharedRewrite) NewConnection(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	if s.inbound.hijackDNS(original.Destination) {
+	if s.inbound.hijackSharedDNS(original.Destination) {
 		s.inbound.startTCPDNSRelay(&sharedRewriteConn{Conn: conn, shared: s, flow: flow})
 		return
 	}
@@ -129,7 +129,7 @@ func (s *sharedRewrite) NewPacket(data []byte, oob []byte, source netip.AddrPort
 		}
 		s.releaseFlows(released)
 	}
-	if s.inbound.hijackDNS(original.Destination) {
+	if s.inbound.hijackSharedDNS(original.Destination) {
 		clientState := s.sharedUDPClientTable.loadOrCreate(client)
 		// Resolving may take a network round trip; never do that on the read
 		// loop, which every UDP client of the shared interfaces shares.
@@ -156,7 +156,7 @@ func (s *sharedRewrite) forwardSharedUDP(data []byte, client netip.AddrPort, des
 		client:      client,
 		clientState: clientState,
 		data:        data,
-		lAddr:       clientState.localAddr(client),
+		lAddr:       clientState.localAddr(),
 	}
 	s.inbound.tunnel.HandleUDPPacket(packet, metadata)
 }

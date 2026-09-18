@@ -42,6 +42,10 @@ type GroupBase struct {
 	getProxiesMutex  sync.Mutex
 	providerVersions []uint32
 	providerProxies  []C.Proxy
+	// proxiesByName indexes providerProxies, cached with it because it changes
+	// only when it does. Callers that need the index were rebuilding it per
+	// connection over the whole pool.
+	proxiesByName map[string]C.Proxy
 }
 
 type GroupBaseOption struct {
@@ -239,6 +243,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	// only cache when proxies not empty
 	gb.providerVersions = providerVersions
 	gb.providerProxies = proxies
+	gb.proxiesByName = nil
 
 	// Capability preferences are applied by the ranking groups (see
 	// adapter.CapabilityPenalty), not here. Narrowing the pool at this layer
@@ -349,4 +354,31 @@ func (gb *GroupBase) onDialSuccess() {
 	gb.failedTestMux.Lock()
 	gb.failedTimes = 0
 	gb.failedTestMux.Unlock()
+}
+
+// GetProxiesByName returns GetProxies' result together with a name index over
+// it, unambiguous names only. Both the smart group's selection path and its
+// filter need the index on every connection and were each building it from
+// scratch: two fresh maps over the entire pool per call, which on a large
+// provider is tens of microseconds and tens of kilobytes of garbage for a
+// mapping that only changes when the providers do.
+//
+// The index is cached beside providerProxies and invalidated with it. GetProxies
+// deliberately does not cache its empty fallback, so this checks whether it got
+// the cached slice back rather than assuming: comparing the backing array is
+// exact and costs nothing, where re-deriving the answer would not be.
+func (gb *GroupBase) GetProxiesByName(touch bool) ([]C.Proxy, map[string]C.Proxy) {
+	proxies := gb.GetProxies(touch)
+
+	gb.getProxiesMutex.Lock()
+	defer gb.getProxiesMutex.Unlock()
+	cached := len(proxies) == len(gb.providerProxies) &&
+		(len(proxies) == 0 || &proxies[0] == &gb.providerProxies[0])
+	if !cached {
+		return proxies, uniqueProxiesByName(proxies)
+	}
+	if gb.proxiesByName == nil {
+		gb.proxiesByName = uniqueProxiesByName(proxies)
+	}
+	return proxies, gb.proxiesByName
 }

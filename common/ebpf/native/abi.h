@@ -108,6 +108,52 @@ _Static_assert(sizeof(struct sb_ebpf_udp_peer_value) == 20U, "unexpected UDP pee
 _Static_assert(sizeof(struct sb_ebpf_udp_flow_key) == 32U, "unexpected UDP flow key ABI");
 _Static_assert(sizeof(struct sb_ebpf_udp_flow_value) == 32U, "unexpected UDP flow value ABI");
 
+// Per-packet TC datapath degradation counters, indexed by the SB_TC_STAT_*
+// keys below and held in tc.bpf.c's tc_stats PERCPU_ARRAY. They are declared
+// here, next to the rest of the userspace-visible ABI, because the keys are a
+// contract with Go: common/ebpf/tc_stats.go mirrors them and there is no
+// generated binding on either side to keep the two honest.
+//
+// Every path these keys mark gives up on a packet without this data plane
+// having handled it -- it is either dropped or passed through unproxied -- and
+// none of them logs anything by itself. That is the whole reason they exist:
+// from outside, a datapath with any of these advancing looks exactly like a
+// healthy one. The comment on each key says what a non-zero value means for
+// the operator, not which line incremented it.
+
+// A flow this data plane had already selected for interception was dropped
+// because no transparent listener socket could be found for it. Non-zero means
+// clients are being blackholed rather than proxied: the listener is gone, it is
+// bound to a port other than the one the control map advertises, or (TCP) the
+// listener SOCKMAP was never populated.
+#define SB_TC_STAT_LISTENER_SOCKET_MISSING 0U
+// The kernel refused sk_assign for a listener socket that was found, and the
+// packet was dropped. Non-zero means steering to the listener is failing below
+// this program -- an unusable socket state, or a kernel that will not assign
+// this socket -- so selected flows stall instead of being proxied.
+#define SB_TC_STAT_SK_ASSIGN_FAILED 1U
+// The assignment table refused to store a selected flow's entry, and the packet
+// was dropped. Non-zero means the datapath cannot remember which socket a flow
+// belongs to, so that flow's reply path and per-flow state are lost.
+#define SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED 2U
+// A locally-originated packet could not be given the delivery Ethernet header,
+// so it was never redirected to the delivery interface. Non-zero means local
+// traffic is escaping this data plane unproxied, or being dropped half-rewritten
+// -- a leak rather than a stall, and the one counter here that a firewall or a
+// capture would not explain.
+#define SB_TC_STAT_DELIVERY_REWRITE_FAILED 3U
+#define SB_TC_STAT_COUNT 4U
+
+// The keys index a fixed-size array map, so a reorder would silently re-label a
+// counter on the Go side rather than fail to build. Pin each key's value, not
+// just the count: pinning the count alone lets two keys swap places and still
+// build, which is exactly the mistake that would be invisible afterwards.
+_Static_assert(SB_TC_STAT_LISTENER_SOCKET_MISSING == 0U, "TC stat ABI reordered");
+_Static_assert(SB_TC_STAT_SK_ASSIGN_FAILED == 1U, "TC stat ABI reordered");
+_Static_assert(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED == 2U, "TC stat ABI reordered");
+_Static_assert(SB_TC_STAT_DELIVERY_REWRITE_FAILED == 3U, "TC stat ABI reordered");
+_Static_assert(SB_TC_STAT_COUNT == 4U, "unexpected TC datapath stat ABI");
+
 struct sb_ebpf_uid_lpm_key {
     __u32 prefixlen;
     __u8 uid[4];

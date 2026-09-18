@@ -135,3 +135,99 @@ func TestCleanupClearsTheTunStateItInvalidated(t *testing.T) {
 		t.Fatalf("expected the recorded route exclusion to be cleared, got %v", lastTunEBPFExclude)
 	}
 }
+
+type stubUpdatableListener struct {
+	stubInboundListener
+	updates   int
+	handled   bool
+	updateErr error
+	applied   C.InboundConfig
+}
+
+func (s *stubUpdatableListener) Update(newConfig C.InboundConfig) (bool, error) {
+	s.updates++
+	if s.updateErr != nil {
+		return false, s.updateErr
+	}
+	if s.handled {
+		s.applied = newConfig
+	}
+	return s.handled, nil
+}
+
+// Rebuilding the eBPF inbound destroys every kernel map it owns, so a listener
+// that can take the difference in place keeps running and the replacement is
+// discarded unused.
+func TestPatchInboundListenersKeepsAListenerThatAbsorbedTheChange(t *testing.T) {
+	running := &stubUpdatableListener{handled: true}
+	running.name = "ebpf"
+	withInboundListeners(t, map[string]C.InboundListener{"ebpf": running})
+
+	replacement := &stubInboundListener{name: "ebpf-changed"}
+	PatchInboundListeners(map[string]C.InboundListener{"ebpf": replacement}, nil, true)
+
+	if running.updates != 1 {
+		t.Fatalf("expected the running listener to be offered the change once, got %d", running.updates)
+	}
+	if running.closes != 0 {
+		t.Fatal("expected a listener that absorbed the change to stay running")
+	}
+	if replacement.listens != 0 {
+		t.Fatal("expected the replacement to be discarded unused")
+	}
+	if inboundListeners["ebpf"] != C.InboundListener(running) {
+		t.Fatal("expected the running listener to stay registered")
+	}
+	if running.applied == nil {
+		t.Fatal("expected the new config to be handed to the running listener")
+	}
+}
+
+// Anything the listener will not take falls back to exactly what used to
+// happen, so a listener can implement Update for one field and stay correct.
+func TestPatchInboundListenersRebuildsWhatTheListenerDeclines(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		listener *stubUpdatableListener
+	}{
+		{name: "declined", listener: &stubUpdatableListener{handled: false}},
+		{name: "failed", listener: &stubUpdatableListener{updateErr: errors.New("map is full")}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			running := testCase.listener
+			running.name = "ebpf"
+			withInboundListeners(t, map[string]C.InboundListener{"ebpf": running})
+
+			replacement := &stubInboundListener{name: "ebpf-changed"}
+			PatchInboundListeners(map[string]C.InboundListener{"ebpf": replacement}, nil, true)
+
+			if running.closes != 1 {
+				t.Fatalf("expected the declined listener to be closed, got %d close(s)", running.closes)
+			}
+			if replacement.listens != 1 {
+				t.Fatalf("expected the replacement to be started, got %d listen(s)", replacement.listens)
+			}
+			if inboundListeners["ebpf"] != C.InboundListener(replacement) {
+				t.Fatal("expected the replacement to be registered")
+			}
+		})
+	}
+}
+
+// An unchanged config never reaches Update at all: there is nothing to apply,
+// and asking would make every reload do work for no reason.
+func TestPatchInboundListenersDoesNotOfferAnUnchangedConfig(t *testing.T) {
+	running := &stubUpdatableListener{handled: true}
+	running.name = "ebpf"
+	withInboundListeners(t, map[string]C.InboundListener{"ebpf": running})
+
+	replacement := &stubInboundListener{name: "ebpf"}
+	PatchInboundListeners(map[string]C.InboundListener{"ebpf": replacement}, nil, true)
+
+	if running.updates != 0 {
+		t.Fatalf("expected no update for an unchanged config, got %d", running.updates)
+	}
+	if running.closes != 0 || replacement.listens != 0 {
+		t.Fatal("expected an unchanged config to leave both listeners alone")
+	}
+}

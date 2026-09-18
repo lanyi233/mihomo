@@ -15,7 +15,7 @@ func TestUDPIdleExpiryProtectsQueuedPacketsAndReplies(t *testing.T) {
 	var table udpClientTable
 	client := netip.MustParseAddrPort("192.0.2.1:1234")
 	dest := netip.MustParseAddrPort("1.1.1.1:443")
-	table.setDirectBinding(client, dest, nil, 0)
+	table.setDirectBinding(client, dest, nil, 0, false)
 	state, _ := table.load(client)
 	state.activity.last.Store(1)
 	state.activity.pending.Store(1)
@@ -65,7 +65,8 @@ func TestSharedUDPPurgeReleasesReferences(t *testing.T) {
 	}
 }
 func TestUDPJanitorStopsOnClose(t *testing.T) {
-	i := &Inbound{enableUDP: true, udpTimeout: time.Minute}
+	i := &Inbound{enableUDP: true}
+	i.udpTimeout.Store(int64(time.Minute))
 	i.startUDPJanitor()
 	i.stopUDPJanitor()
 	select {

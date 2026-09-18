@@ -61,15 +61,62 @@ const (
 	floodWindow    = 2 * time.Second
 	floodThreshold = 50
 
-	hostRecoveryProbeBudget  = 8
-	hostRecoveryActiveWindow = 15 * time.Minute
+	// Blocking a (host, node) pair is a hard exclusion at dial time, not a
+	// ranking penalty, and the store drops the pair on its own only after
+	// HostFailureNodeTTL (24h). Recovery probing therefore has to get all the
+	// way round the blocked set well inside that window: at 64 per tick a group
+	// with 400 blocked pairs is fully swept in ~3h.
+	hostRecoveryProbeBudget = 64
+	// Must be at least one tick, otherwise a group used in short regular bursts
+	// can land in the "wrong" half of every cycle and deterministically never
+	// probe - the scheduler's jitter is computed once at start, so its phase is
+	// fixed for the process lifetime.
+	hostRecoveryActiveWindow = 2 * hostStatusCheckInterval
 	hostRecoveryBackoffBase  = 2 * hostStatusCheckInterval
-	hostRecoveryBackoffMax   = 8 * time.Hour
+	// This is now the only thing spacing repeat probes of the same pair. The
+	// store's own gate only withholds a pair for the first hostStatusRetryAfter
+	// of its block: it was implemented by a failed probe resetting the deadline
+	// to now+TTL, and a re-block no longer moves the deadline, precisely so a
+	// host that fails every probe cannot stay blocked for good. Backing off
+	// past a few hours only delays recovery, and this map is lost on restart --
+	// after which the 64-per-tick budget is what bounds the catch-up.
+	hostRecoveryBackoffMax = 4 * time.Hour
 )
 
+// A failed attempt downloads ASN.mmdb with a 90s timeout, and InitSmart runs
+// inline on the config-parse path, so retries have to be spaced out: without
+// this every smart group in the config would pay that timeout again on every
+// reload.
+const asnInitRetryAfter = 5 * time.Minute
+
 var (
-	initASNSmartOnce sync.Once
+	asnInitAccess    sync.Mutex
+	asnInitDone      bool
+	asnInitLastTried time.Time
 )
+
+// initASNDatabase loads the ASN database once, but only latches on success. The
+// usual failure is that the download could not run yet - no connectivity at
+// boot is routine on mobile - and a later config reload has to be able to retry
+// it. Latching on failure left prefer-asn silently degraded, with getASNCode
+// returning "" for the rest of the process lifetime.
+func initASNDatabase() {
+	asnInitAccess.Lock()
+	defer asnInitAccess.Unlock()
+	if asnInitDone {
+		return
+	}
+	if now := time.Now(); asnInitLastTried.IsZero() || now.Sub(asnInitLastTried) >= asnInitRetryAfter {
+		asnInitLastTried = now
+	} else {
+		return
+	}
+	if err := geodata.InitASN(); err != nil {
+		log.Warnln("[Smart] Failed to load ASN database: %v", err)
+		return
+	}
+	asnInitDone = true
+}
 
 type SmartOption struct {
 	PolicyPriority string  `group:"policy-priority,omitempty"`
@@ -344,6 +391,19 @@ func (s *Smart) adoptUnwrapWinner(metadata *C.Metadata, asnNumber string, p C.Pr
 	case len(existing) == 0:
 		s.store.StoreUnwrapResult(s.Name(), s.configName, target, asnNumber, wildcard, []C.Proxy{p})
 	case existing[0] == p.Name():
+		// The winner did not move, so there is nothing to consolidate onto it:
+		// whatever was on a superseded node was swept when the winner last
+		// changed. This is the overwhelmingly common case, and returning here
+		// is what keeps a steady-state dial off the scan below.
+		//
+		// The bucket is keyed by the matched rule, so it holds every live
+		// connection that rule routed. Scanning it per dial costs dial-rate x
+		// bucket-size, and bucket size is itself dial-rate x connection
+		// lifetime -- quadratic in load, for a scan that in steady state closes
+		// nothing. A connection that a parallel dial placed on another node
+		// after the winner settled now survives until it ends on its own, which
+		// is the better outcome anyway: it is working traffic.
+		return
 	default:
 		s.store.DeleteUnwrapResult(s.Name(), s.configName, target, asnNumber, wildcard)
 		s.store.StoreUnwrapResult(s.Name(), s.configName, target, asnNumber, wildcard, []C.Proxy{p})
@@ -653,13 +713,31 @@ func uniqueProxiesByName(proxies []C.Proxy) map[string]C.Proxy {
 	return byName
 }
 
+// proxyIndexFor returns the cached name index when all is the group's own
+// current proxy list, which is what every caller on the connection path passes.
+// A caller holding some other slice gets a freshly derived index.
+func (s *Smart) proxyIndexFor(all []C.Proxy) map[string]C.Proxy {
+	s.getProxiesMutex.Lock()
+	cached := len(all) == len(s.providerProxies) &&
+		(len(all) == 0 || &all[0] == &s.providerProxies[0])
+	if cached && s.proxiesByName == nil {
+		s.proxiesByName = uniqueProxiesByName(all)
+	}
+	byName := s.proxiesByName
+	s.getProxiesMutex.Unlock()
+	if !cached {
+		return uniqueProxiesByName(all)
+	}
+	return byName
+}
+
 func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
 	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, int(s.hostFailLimit.Load()), metadata.SmartTarget)
 
 	var proxyByName map[string]C.Proxy
 	if len(names) > 0 {
-		proxyByName = uniqueProxiesByName(all)
+		proxyByName = s.proxyIndexFor(all)
 	}
 
 	checkNodeUsed := make(map[string]bool, len(names))
@@ -679,8 +757,8 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 		if weights != nil && w < smart.AllowedWeight {
 			continue
 		}
-		if wtFailNodes[name] != 0 {
-			if !wtBlocked || wtFailNodes[name] == 1 {
+		if wtFailNodes[name] != smart.BlockNone {
+			if !wtBlocked || wtFailNodes[name] == smart.BlockManual {
 				continue
 			}
 		}
@@ -758,8 +836,8 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 		if checkNodeUsed[adapter.ProxyIdentity(p)] {
 			continue
 		}
-		if wtFailNodes[name] != 0 {
-			if !wtBlocked || wtFailNodes[name] == 1 {
+		if wtFailNodes[name] != smart.BlockNone {
+			if !wtBlocked || wtFailNodes[name] == smart.BlockManual {
 				continue
 			}
 		}
@@ -882,8 +960,7 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 		if len(names) == 0 {
 			return
 		}
-		allProxies := s.GetProxies(true)
-		proxyByName := uniqueProxiesByName(allProxies)
+		_, proxyByName := s.GetProxiesByName(true)
 		resultProxies := make([]C.Proxy, 0, len(names))
 		for _, name := range names {
 			if p, ok := proxyByName[name]; ok {
@@ -924,11 +1001,7 @@ func (s *Smart) InitSmart() {
 	s.recoveryBackoff = make(map[string]hostRecoveryState)
 
 	if s.preferASN {
-		initASNSmartOnce.Do(func() {
-			if err := geodata.InitASN(); err != nil {
-				log.Warnln("[Smart] Failed to load ASN database: %v", err)
-			}
-		})
+		initASNDatabase()
 	}
 
 	s.global = globalSmartTasks.acquire(s)
@@ -1481,6 +1554,44 @@ func updateEMAFloat(oldValue, newValue float64) float64 {
 	return newValue
 }
 
+// admitConnectionStats is failure-flood suppression: once recent failures reach
+// the threshold, the heavy per-connection work is skipped so a burst of dead
+// connections cannot turn into a disconnect storm of its own. It reports
+// whether to go on, and whether this call is the one that armed the suppressor
+// (the caller owns the store write that follows).
+//
+// A connection the group closed itself is evidence of nothing and must not
+// clear the suppressor. It reports no read or write error -- closeErr is
+// derived from those alone -- so it used to arrive indistinguishable from a
+// healthy close and reset the counter to zero. Every victim of a sweep did
+// that, which meant the one mechanism written to stop a disconnect storm was
+// held open by the storm it was meant to stop.
+func (s *Smart) admitConnectionStats(metadata *C.Metadata, err error, now int64) (proceed bool, tripped bool) {
+	// Neither direction: a connection this group closed says nothing about the
+	// network, so it must not clear the suppressor and must not count toward
+	// arming it either. A victim usually reports no error, but one whose first
+	// read had already failed before the sweep reached it arrives here with
+	// both an error and the marker -- and arming is not the safe direction it
+	// looks like, because tripping runs ClearFloodRecordsByGroup, which
+	// discards the group's queued stat and host-status writes.
+	if metadata.SmartBlock == "degraded" {
+		return true, false
+	}
+	if err == nil {
+		s.suppressStats.Store(false)
+		s.suppressCount.Store(0)
+		return true, false
+	}
+	if now-s.suppressLast.Load() > int64(floodWindow.Seconds()) {
+		s.suppressCount.Store(0)
+	}
+	s.suppressLast.Store(now)
+	if s.suppressCount.Add(1) >= floodThreshold {
+		tripped = s.suppressStats.CompareAndSwap(false, true)
+	}
+	return !s.suppressStats.Load(), tripped
+}
+
 func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
 	connectionDuration int64, tcpStats *tcpstats.Stats, err error) {
@@ -1489,24 +1600,13 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		return
 	}
 
-	// failure flood suppression: short-circuit heavy work when recent failures reach the threshold to avoid a disconnect storm (including Direct nodes)
 	now := time.Now().Unix()
-	if err == nil {
-		s.suppressStats.Store(false)
-		s.suppressCount.Store(0)
-	} else {
-		if now-s.suppressLast.Load() > int64(floodWindow.Seconds()) {
-			s.suppressCount.Store(0)
-		}
-		s.suppressLast.Store(now)
-		if s.suppressCount.Add(1) >= floodThreshold {
-			if s.suppressStats.CompareAndSwap(false, true) {
-				s.store.ClearFloodRecordsByGroup(s.Name(), s.configName)
-			}
-		}
-		if s.suppressStats.Load() {
-			return
-		}
+	proceed, tripped := s.admitConnectionStats(metadata, err, now)
+	if tripped {
+		s.store.ClearFloodRecordsByGroup(s.Name(), s.configName)
+	}
+	if !proceed {
+		return
 	}
 
 	var lossRate float64
@@ -1681,8 +1781,12 @@ func (s *Smart) submitConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	go func() {
 		defer s.finishBackgroundWork()
-		if markCloseFailure && err != nil {
-			s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
+		// The degraded marker means this group closed the connection itself, so
+		// nothing about the close is the node's doing. checkNodeQuality honours
+		// it; this path did not, and a connection whose first read had already
+		// failed before the sweep reached it was blamed with code 3 anyway.
+		if markCloseFailure && err != nil && metadata.SmartBlock != "degraded" {
+			s.markNodeFailure(metadata, proxy.Name(), true, true, smart.BlockDialFailure)
 		}
 		s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, err)
 	}()
@@ -1773,10 +1877,10 @@ func (s *Smart) checkNodeQuality(
 	addressDisplay, proxyName string,
 	newWeight, oldWeight float64,
 	connectionDuration int64, uploadTotal, downloadTotal float64,
-	networkType string, asnNumber string, isUDP bool, lossRate, emaLossRate float64) (float64, bool, bool, int64) {
+	networkType string, asnNumber string, isUDP bool, lossRate, emaLossRate float64) (float64, bool, bool, smart.BlockCode) {
 
 	if s.selected != "" {
-		return newWeight, false, false, 0
+		return newWeight, false, false, smart.BlockNone
 	}
 
 	now := time.Now().Unix()
@@ -1785,44 +1889,86 @@ func (s *Smart) checkNodeQuality(
 	if metadata.SmartBlock == "blocked" {
 		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected manual block...",
 			s.Name(), proxyName, networkType, addressDisplay)
-		return newWeight, true, true, 1
+		return newWeight, true, true, smart.BlockManual
 	}
 
 	// force-closed connection, skip quality check to avoid erroneous downgrade
 	if metadata.SmartBlock == "degraded" {
-		return oldWeight, false, false, 0
+		return oldWeight, false, false, smart.BlockNone
 	}
 
 	wtFailNodes, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, int(s.hostFailLimit.Load()), metadata.SmartTarget)
 
+	// The safety valve: so many nodes are blocked for this target that
+	// filterProxies has started letting blocked ones back into the pool, and no
+	// further blocking verdict should be recorded while that lasts. A clean
+	// close over a node that is itself blocked still has to be reported, and
+	// for the same reason as below -- draining the blocks is the only way the
+	// valve ever closes, and reporting it unchecked left the recovery probe as
+	// the only route out of a state the probe could not even see, since it
+	// swept code 2 alone.
 	if wtBlocked {
-		return newWeight, false, false, 0
+		return newWeight, false, err == nil && wtFailNodes[proxyName] != smart.BlockNone, smart.BlockNone
 	}
 
 	if newWeight > 0 && newWeight < smart.AllowedWeight {
-		return newWeight, true, true, 5
+		return newWeight, true, true, smart.BlockLowWeight
 	}
 
 	if err != nil {
-		return newWeight, false, true, 3
+		return newWeight, false, true, smart.BlockDialFailure
 	}
 
-	if wtFailNodes[proxyName] != 0 {
-		return newWeight, false, false, 0
+	// The node is already blocked for this target and still carried this
+	// connection through -- the hostFailLimit safety valve lets blocked nodes
+	// back into the pool once too many of them are out, and a recovery probe
+	// clears the way for the rest. Skipping the quality checks for it is right;
+	// reporting it unchecked was not, because UpdateHostStatus returns at once
+	// on !checked and its clearing branch is the only thing that lifts a block.
+	// Success could therefore never undo one: a blocked node waited out the
+	// full 24-hour TTL or a recovery probe, however well it was working.
+	if wtFailNodes[proxyName] != smart.BlockNone {
+		return newWeight, false, true, smart.BlockNone
 	}
 
-	// zero-traffic connection
-	if connectionDuration > 100 && downloadTotal == 0 && uploadTotal == 0 && metadata.DstPort == 443 && !isUDP {
-		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected zero-traffic...",
+	// A connection that carried a request and got nothing back. The node
+	// accepted the flow and then swallowed it, which is a failure no dial error
+	// reports.
+	//
+	// It used to require uploadTotal == 0 as well, which inverted the
+	// attribution: the client had not sent a byte, so the node never had a
+	// chance to answer and could not be at fault. That fires on every
+	// speculative TLS connection a browser opens and closes unused, and on
+	// every idle HTTP/2 spare -- each one costing the node that happened to
+	// carry it a 24-hour block for the target. The fork's own stall detector
+	// already draws the line here: tunnel/statistic/tracker.go refuses to
+	// record a stall unless the upload counter moved.
+	if connectionDuration > 100 && downloadTotal == 0 && uploadTotal > 0 && metadata.DstPort == 443 && !isUDP {
+		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected no response to a sent request...",
 			s.Name(), proxyName, networkType, addressDisplay)
-		return newWeight, true, true, 4
+		return newWeight, true, true, smart.BlockNoResponse
 	}
 
 	// abnormal status code detection
 	if downloadTotal < 0.03 && metadata.Host != "" && metadata.DstPort == 443 && !isUDP && metadata.Type != C.INNER {
 		var failure bool
 		var checked bool
-		if now-wtLastCheck > 300 || now-wtLastFailure < 300 {
+		// A probe is a live HTTPS request through the proxy -- a fresh
+		// transport, a TLS handshake, up to three redirects, a 10s client
+		// timeout -- and it runs with this connection's shard lock held. The
+		// rate limit is what keeps that bounded.
+		//
+		// The second clause used to remove the limit outright for 300s after
+		// any failure on this target, so during exactly the churn that produces
+		// failures, every qualifying close launched its own probe: unbounded,
+		// while the scheduled path doing the same work budgets itself to 64
+		// probes per half hour. Recent trouble now shortens the interval rather
+		// than removing it, so the eagerness survives and the storm does not.
+		probeInterval := int64(300)
+		if now-wtLastFailure < 300 {
+			probeInterval = 30
+		}
+		if now-wtLastCheck > probeInterval {
 			checked = true
 			status, ok, err := s.StatusTest(proxy, metadata.Host)
 			if err == nil {
@@ -1834,28 +1980,28 @@ func (s *Smart) checkNodeQuality(
 			}
 		}
 		if failure {
-			return newWeight, true, checked, 2
+			return newWeight, true, checked, smart.BlockAbnormalStatus
 		}
-		return newWeight, false, checked, 0
+		return newWeight, false, checked, smart.BlockNone
 	}
 
 	// high packet loss detection
 	if lossRate >= 0.1 || emaLossRate >= 0.05 {
 		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected high packet loss [current: %.2f%%, history EMA: %.2f%%]...",
 			s.Name(), proxyName, networkType, addressDisplay, lossRate*100, emaLossRate*100)
-		return newWeight, true, true, 6
+		return newWeight, true, true, smart.BlockPacketLoss
 	}
 
-	return newWeight, false, false, 0
+	return newWeight, false, false, smart.BlockNone
 }
 
-func (s *Smart) markNodeFailure(metadata *C.Metadata, proxyName string, isDegraded bool, checked bool, blockCode int64) bool {
+func (s *Smart) markNodeFailure(metadata *C.Metadata, proxyName string, isDegraded bool, checked bool, blockCode smart.BlockCode) bool {
 	wildcardTarget := metadata.WildcardTarget
 	target := metadata.SmartTarget
 
 	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, int(s.hostFailLimit.Load()), isDegraded, checked, blockCode)
 
-	if isDegraded || failedBlock {
+	if hostStatusAppliesToEveryScope(isDegraded, failedBlock, checked, blockCode) {
 		if target != "" && target != wildcardTarget {
 			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, int(s.hostFailLimit.Load()), isDegraded, checked, blockCode)
 		}
@@ -1864,7 +2010,24 @@ func (s *Smart) markNodeFailure(metadata *C.Metadata, proxyName string, isDegrad
 	return failedBlock
 }
 
+// hostStatusAppliesToEveryScope reports whether a host-status update changes a
+// block, and so has to reach the SmartTarget records as well as the wildcard
+// ones. GetHostStatus unions the two scopes, so a block written to both and
+// lifted from one still excludes the node at dial time -- which is what used to
+// happen, because only the blocking verdicts propagated.
+func hostStatusAppliesToEveryScope(isDegraded, failedBlock, checked bool, blockCode smart.BlockCode) bool {
+	if isDegraded || failedBlock {
+		return true
+	}
+	// A clear. UpdateHostStatus drops the node from every code set but the
+	// manual one when it is told the connection succeeded, and does nothing at
+	// all when the verdict was never checked.
+	return checked && blockCode == smart.BlockNone
+}
+
 func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target, asnNumber string, force bool) {
+	// Loop-invariant: depends only on asnNumber.
+	cdnASN := asnNumber != "" && smart.CdnASNs[asnNumber]
 	statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
 		if id == metadata.UUID {
 			return true
@@ -1876,21 +2039,46 @@ func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target, asn
 		if !lo.Contains(tracker.Chains(), s.Name()) {
 			return true
 		}
+		// Cheapest rejection first. On the dial path this test rejects nearly
+		// every tracker -- they are already on the winning node -- and the ASN
+		// comparison below dereferences the tracker's info and can memoise an
+		// ASN lookup into its metadata, which is wasted on a tracker that is
+		// not a candidate for closing in the first place.
+		if !force && (proxyName == "" || lo.Contains(tracker.Chains(), proxyName)) {
+			return true
+		}
 		if asnNumber != "" {
-			if !smart.CdnASNs[asnNumber] && s.getASNCode(tracker.Info().Metadata) != asnNumber {
+			if !cdnASN && s.getASNCode(tracker.Info().Metadata) != asnNumber {
 				return true
 			}
 		} else if s.getASNCode(tracker.Info().Metadata) != "" {
 			return true
 		}
-		if force {
-			tracker.Info().Metadata.SmartBlock = "degraded"
-			_ = tracker.Close()
-		} else if proxyName != "" {
-			if !lo.Contains(tracker.Chains(), proxyName) {
-				_ = tracker.Close()
-			}
-		}
+		// Marked before it is closed, in both modes. checkNodeQuality reads this
+		// to skip a connection the group killed itself, and leaving the
+		// non-force branch unmarked is what turned one sweep into the next: a
+		// connection closed moments after it was established has moved no
+		// bytes, which is exactly the zero-traffic rule's idea of a broken
+		// node, so every idle HTTPS victim -- a browser's pre-connected spares,
+		// above all -- earned its own node a 24-hour block. Those blocks carry
+		// code 4, and CheckHostStatus only ever probes code 2, so nothing
+		// releases them before the TTL. The degrade then force-closes the whole
+		// target, producing the next round of victims from a pool one node
+		// smaller. Closing a connection is this group's own decision and says
+		// nothing about the node that carried it.
+		//
+		// The write reaches the reader that matters without synchronisation:
+		// closeCallbackConn.Close runs its callback synchronously in this
+		// goroutine, so the stats goroutine it spawns is created after this
+		// write. It does race with GET /connections marshalling the same field
+		// for display, which predates this and costs at most a garbled string
+		// in one dashboard row -- torn reads here can only produce a value
+		// matching none of the three constants, which every comparison treats
+		// as "not ours". Closing it properly means making Metadata
+		// non-copyable, and it is copied by value in three places including
+		// TUIC's UoT path.
+		tracker.Info().Metadata.SmartBlock = "degraded"
+		_ = tracker.Close()
 		return true
 	})
 }

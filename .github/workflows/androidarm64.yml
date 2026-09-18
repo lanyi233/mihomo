@@ -99,7 +99,10 @@ jobs:
       uses: nttld/setup-ndk@v1
       id: setup-ndk
       with:
-        ndk-version: r29-beta1
+        # This job runs `make ebpf_generate`, whose toolchain guard accepts
+        # only the Clang build recorded in manifest.txt. r29-beta1 is a
+        # different one, so the job could never have got past it.
+        ndk-version: r29
 
     - name: Set NDK environment
       run: |

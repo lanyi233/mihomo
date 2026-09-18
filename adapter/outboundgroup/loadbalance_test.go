@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -333,5 +334,43 @@ func TestUniqueProxiesByNameDropsAmbiguousNames(t *testing.T) {
 
 	if len(uniqueProxiesByName([]C.Proxy{nil, unique})) != 1 {
 		t.Fatal("nil 节点应被跳过而不是引发 panic")
+	}
+}
+
+// The name index changes only when the proxies do, so it is cached with them.
+// Both the selection path and the filter need it on every connection and were
+// each rebuilding two maps over the whole pool.
+//
+// Invalidation is not covered here: it is a single statement beside the
+// assignment it pairs with in GetProxies, and reaching it from a test needs a
+// provider whose version moves, which this package has no fixture for. Faking
+// the clear would only assert the test's own stub.
+func TestProxyNameIndexIsCachedWithTheProxies(t *testing.T) {
+	gb := &GroupBase{}
+	gb.providerProxies = strategyProxies("node-a", "node-b")
+	gb.providerVersions = []uint32{}
+
+	proxies, first := gb.GetProxiesByName(false)
+	if len(proxies) != 2 || first["node-a"] == nil {
+		t.Fatalf("index = %v over %d proxies", first, len(proxies))
+	}
+	_, second := gb.GetProxiesByName(false)
+	if reflect.ValueOf(first).Pointer() != reflect.ValueOf(second).Pointer() {
+		t.Fatal("the index was rebuilt for an unchanged proxy list")
+	}
+
+}
+
+// A caller holding a slice that is not the group's own gets an index over what
+// it actually passed, not the cached one.
+func TestProxyIndexForAForeignSliceIsNotTheCachedOne(t *testing.T) {
+	s := &Smart{GroupBase: &GroupBase{}}
+	s.providerProxies = strategyProxies("node-a")
+	s.proxiesByName = uniqueProxiesByName(s.providerProxies)
+
+	foreign := strategyProxies("node-z")
+	got := s.proxyIndexFor(foreign)
+	if got["node-z"] == nil || got["node-a"] != nil {
+		t.Fatalf("index = %v, want it to describe the slice that was passed", got)
 	}
 }

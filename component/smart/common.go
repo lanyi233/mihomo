@@ -3,23 +3,20 @@ package smart
 import (
 	"errors"
 	"math"
-	"os"
-	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/metacubex/bbolt"
-	"github.com/metacubex/mihomo/common/atomic"
-	"github.com/metacubex/mihomo/common/cmd"
 	"github.com/metacubex/mihomo/log"
 
 	"golang.org/x/net/publicsuffix"
 )
 
 const (
-	OpSaveNodeState         = iota
+	OpSaveNodeState = iota
 	OpSaveStats
 	OpSavePrefetch
 	OpSaveRanking
@@ -28,43 +25,43 @@ const (
 )
 
 const (
-	KeyTypePrefetch         = "prefetch"
-	KeyTypeNode             = "node"
-	KeyTypeStats            = "stats"
-	KeyTypeRanking          = "ranking"
-	KeyTypeHostFailures     = "failures"
+	KeyTypePrefetch     = "prefetch"
+	KeyTypeNode         = "node"
+	KeyTypeStats        = "stats"
+	KeyTypeRanking      = "ranking"
+	KeyTypeHostFailures = "failures"
 
-	WeightTypeTCP           = "tcp"
-	WeightTypeUDP           = "udp"
-	WeightTypeTCPASN        = "tcp_asn"
-	WeightTypeUDPASN        = "udp_asn"
+	WeightTypeTCP    = "tcp"
+	WeightTypeUDP    = "udp"
+	WeightTypeTCPASN = "tcp_asn"
+	WeightTypeUDPASN = "udp_asn"
 )
 
 const (
-	DefaultMinSampleCount   = 2
+	DefaultMinSampleCount = 2
 
-	MaxTargetsLimit         = 5000
-	MinTargetsLimit         = 500
-	MaxBatchThreshLimit     = 300
-	MinBatchThreshLimit     = 50
+	MaxTargetsLimit     = 5000
+	MinTargetsLimit     = 500
+	MaxBatchThreshLimit = 300
+	MinBatchThreshLimit = 50
 
-	RecordExpiredTime       = 7 * 24 * time.Hour
+	RecordExpiredTime = 7 * 24 * time.Hour
 
-	HostFailureNodeTTL      = 24 * time.Hour
-	hostStatusRetryAfter    = 4 * time.Hour
+	HostFailureNodeTTL   = 24 * time.Hour
+	hostStatusRetryAfter = 4 * time.Hour
 
-	AllowedWeight           = 0.4
+	AllowedWeight = 0.4
 
-	RankMostUsed            = "MostUsed"
-	RankOccasional          = "OccasionalUsed"
-	RankRarelyUsed          = "RarelyUsed"
+	RankMostUsed   = "MostUsed"
+	RankOccasional = "OccasionalUsed"
+	RankRarelyUsed = "RarelyUsed"
 )
 
 var (
-	db *bbolt.DB
+	db               *bbolt.DB
 	bucketSmartStats = []byte("smart_stats")
 
-	globalOperationQueue atomic.TypedValue[[]StoreOperation]
+	globalOperationQueue operationQueue
 
 	globalCacheParams struct {
 		BatchSaveThreshold int
@@ -109,7 +106,7 @@ var CdnASNs = map[string]bool{
 }
 
 type (
-	Store struct {}
+	Store struct{}
 
 	StoreOperation struct {
 		Type    int
@@ -380,52 +377,12 @@ func GetBatchSaveThreshold() int {
 }
 
 // 获取系统内存使用情况
+//
+// systemMemoryUsage is provided per platform; when it cannot read the system
+// figures we fall back to a neutral 0.5 so cache sizing stays in its mid range.
 func GetSystemMemoryUsage() float64 {
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		if usage, ok := readProcMemoryUsage(os.ReadFile); ok {
-			return usage
-		}
-		return 0.5
-	}
-
-	var total float64 = 0.0
-	var available float64 = 0.0
-	var output string
-	var err error
-
-	// 获取总内存
-	if runtime.GOOS == "windows" {
-		output, err = cmd.ExecCmd("wmic OS get TotalVisibleMemorySize")
-		if err == nil {
-			lines := strings.Split(output, "\n")
-			if len(lines) >= 2 {
-				memStr := strings.TrimSpace(lines[1])
-				memKB, parseErr := strconv.ParseFloat(memStr, 64)
-				if parseErr == nil {
-					total = memKB / 1024.0
-				}
-			}
-		}
-	}
-
-	// 获取可用内存
-	if runtime.GOOS == "windows" {
-		output, err = cmd.ExecCmd("wmic OS get FreePhysicalMemory")
-		if err == nil {
-			lines := strings.Split(output, "\n")
-			if len(lines) >= 2 {
-				memStr := strings.TrimSpace(lines[1])
-				memKB, parseErr := strconv.ParseFloat(memStr, 64)
-				if parseErr == nil {
-					available = memKB / 1024.0
-				}
-			}
-		}
-	}
-
-	if total > 0 {
-		used := total - available
-		return math.Max(0, math.Min(used/total, 1.0))
+	if usage, ok := systemMemoryUsage(); ok {
+		return usage
 	}
 	return 0.5
 }
@@ -469,142 +426,143 @@ func readProcMemoryUsage(readFile func(string) ([]byte, error)) (float64, bool) 
 	return float64(totalKB-availableKB) / float64(totalKB), true
 }
 
-func InitQueue()  {
-	threshold := GetBatchSaveThreshold()
-	emptyQueue := make([]StoreOperation, 0, threshold)
-	replaceGlobalQueue(emptyQueue)
+// operationQueue is the set of writes waiting to be flushed: a map for
+// deduplication and a slice for order, so an append costs O(1).
+//
+// It was a slice inside an atomic value, rebuilt in full on every append -- a
+// fresh map over every pending entry, a formatOperationKey (with its string
+// build) for each, then a fresh slice. Filling the queue to its flush threshold
+// therefore cost O(threshold^2) key formats and allocations, and
+// AdjustCacheParameters raises that threshold when memory is free, so a machine
+// with more RAM paid quadratically more for it. Under a burst of closes the CAS
+// loop degenerated into a spin lock around an O(n) critical section.
+//
+// Deduplication stays. BatchSave would dedupe again at flush time, but dropping
+// it here would make the threshold count raw appends instead of distinct keys,
+// so the queue would flush more often -- and every flush is a bbolt commit with
+// an fsync, which on the flash storage these run on is the expensive part.
+type operationQueue struct {
+	access   sync.Mutex
+	position map[string]int
+	ops      []StoreOperation
+}
+
+// add records the operations and returns a batch to flush when the queue has
+// reached the threshold, or nil.
+func (q *operationQueue) add(operations []StoreOperation) []StoreOperation {
+	q.access.Lock()
+	defer q.access.Unlock()
+	for i := range operations {
+		key := formatOperationKey(&operations[i])
+		if key == "" {
+			continue
+		}
+		if at, seen := q.position[key]; seen {
+			// Last write wins, in the place the key already holds: there is
+			// only ever one entry per key, so position carries no meaning
+			// beyond keeping the flush order stable.
+			q.ops[at] = operations[i]
+			continue
+		}
+		if q.position == nil {
+			q.position = make(map[string]int)
+		}
+		q.position[key] = len(q.ops)
+		q.ops = append(q.ops, operations[i])
+	}
+	if len(q.ops) < GetBatchSaveThreshold() {
+		return nil
+	}
+	return q.takeLocked()
+}
+
+// drain returns the pending batch, emptying the queue, when it has reached the
+// threshold or the caller insists.
+func (q *operationQueue) drain(force bool) []StoreOperation {
+	q.access.Lock()
+	defer q.access.Unlock()
+	if len(q.ops) == 0 || (!force && len(q.ops) < GetBatchSaveThreshold()) {
+		return nil
+	}
+	return q.takeLocked()
+}
+
+func (q *operationQueue) takeLocked() []StoreOperation {
+	ops := q.ops
+	q.ops = make([]StoreOperation, 0, GetBatchSaveThreshold())
+	q.position = make(map[string]int, GetBatchSaveThreshold())
+	return ops
+}
+
+// snapshot copies the pending operations, for readers that answer a query from
+// the queue before it reaches the store.
+func (q *operationQueue) snapshot() []StoreOperation {
+	q.access.Lock()
+	defer q.access.Unlock()
+	return slices.Clone(q.ops)
+}
+
+// retain drops every operation the predicate rejects, rebuilding the index.
+// Only the flood suppressor and config teardown do this, so the O(n) rebuild
+// is not on any hot path.
+func (q *operationQueue) retain(keep func(StoreOperation) bool) {
+	q.access.Lock()
+	defer q.access.Unlock()
+	kept := make([]StoreOperation, 0, len(q.ops))
+	position := make(map[string]int, len(q.ops))
+	for _, op := range q.ops {
+		if !keep(op) {
+			continue
+		}
+		if key := formatOperationKey(&op); key != "" {
+			position[key] = len(kept)
+		}
+		kept = append(kept, op)
+	}
+	q.ops = kept
+	q.position = position
+}
+
+func (q *operationQueue) reset() {
+	q.access.Lock()
+	defer q.access.Unlock()
+	q.takeLocked()
+}
+
+func (q *operationQueue) length() int {
+	q.access.Lock()
+	defer q.access.Unlock()
+	return len(q.ops)
+}
+
+func InitQueue() {
+	globalOperationQueue.reset()
 }
 
 func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	if len(operations) == 0 {
 		return
 	}
-
-	shouldFlush := false
-	var snapshot []StoreOperation
-
-	globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
-		opMap := make(map[string]StoreOperation, len(old)+len(operations))
-
-		for i := range old {
-			key := formatOperationKey(&old[i])
-			if key != "" {
-				opMap[key] = old[i]
-			}
-		}
-
-		for i := range operations {
-			key := formatOperationKey(&operations[i])
-			if key != "" {
-				opMap[key] = operations[i]
-			}
-		}
-
-		newQueue := make([]StoreOperation, 0, len(opMap))
-		for _, op := range opMap {
-			newQueue = append(newQueue, op)
-		}
-
-		threshold := GetBatchSaveThreshold()
-		if len(newQueue) >= threshold {
-			shouldFlush = true
-			snapshot = make([]StoreOperation, len(newQueue))
-			copy(snapshot, newQueue)
-			return make([]StoreOperation, 0, threshold)
-		}
-
-		return newQueue
-	})
-
-	if shouldFlush && len(snapshot) > 0 {
-		go func() {
-			if err := s.BatchSave(snapshot); err == nil {
-				log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
-			}
-		}()
+	snapshot := globalOperationQueue.add(operations)
+	if len(snapshot) == 0 {
+		return
 	}
-}
-
-func replaceGlobalQueue(newQueue []StoreOperation) {
-	globalOperationQueue.Store(newQueue)
-}
-
-func getGlobalQueueSnapshot() []StoreOperation {
-	current := globalOperationQueue.Load()
-	snapshot := make([]StoreOperation, len(current))
-	copy(snapshot, current)
-	return snapshot
-}
-
-func updateGlobalQueue(updateFunc func([]StoreOperation) []StoreOperation) {
-	globalOperationQueue.Update(updateFunc)
-}
-
-func drainGlobalQueue(force bool) []StoreOperation {
-	threshold := GetBatchSaveThreshold()
-	var snapshot []StoreOperation
-
-	globalOperationQueue.Update(func(current []StoreOperation) []StoreOperation {
-		if len(current) == 0 {
-			return current
+	go func() {
+		if err := s.BatchSave(snapshot); err == nil {
+			log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
 		}
-		if !force && len(current) < threshold {
-			return current
-		}
-
-		snapshot = make([]StoreOperation, len(current))
-		copy(snapshot, current)
-		return make([]StoreOperation, 0, threshold)
-	})
-
-	return snapshot
-}
-
-func removeFromGlobalQueue(shouldRemove func(StoreOperation) bool) {
-	updateGlobalQueue(func(currentQueue []StoreOperation) []StoreOperation {
-		newQueue := make([]StoreOperation, 0, len(currentQueue))
-		for _, op := range currentQueue {
-			if !shouldRemove(op) {
-				newQueue = append(newQueue, op)
-			}
-		}
-		return newQueue
-	})
-}
-
-func filterQueueByConfig(config string) {
-	updateGlobalQueue(func(currentQueue []StoreOperation) []StoreOperation {
-		newQueue := make([]StoreOperation, 0, len(currentQueue))
-		for _, op := range currentQueue {
-			if op.Config != config {
-				newQueue = append(newQueue, op)
-			}
-		}
-		return newQueue
-	})
-}
-
-func filterQueueByGroup(group, config string) {
-	updateGlobalQueue(func(currentQueue []StoreOperation) []StoreOperation {
-		newQueue := make([]StoreOperation, 0, len(currentQueue))
-		for _, op := range currentQueue {
-			if !(op.Group == group && op.Config == config) {
-				newQueue = append(newQueue, op)
-			}
-		}
-		return newQueue
-	})
+	}()
 }
 
 func (s *Store) ClearFloodRecordsByGroup(group, config string) {
-	removeFromGlobalQueue(func(op StoreOperation) bool {
+	globalOperationQueue.retain(func(op StoreOperation) bool {
 		if op.Group == group && op.Config == config {
 			switch op.Type {
 			case OpSaveStats, OpSaveHostFailures, OpSaveNodeState:
-				return true
+				return false
 			}
 		}
-		return false
+		return true
 	})
 
 	blockedNodesCache.Delete(FormatDBKey(config, group))
@@ -616,12 +574,12 @@ func removeNodesFromQueue(group, config string, nodes []string) {
 	for _, n := range nodes {
 		nodeSet[n] = struct{}{}
 	}
-	removeFromGlobalQueue(func(op StoreOperation) bool {
+	globalOperationQueue.retain(func(op StoreOperation) bool {
 		if op.Group == group && op.Config == config {
-			_, found := nodeSet[op.Node]
-			return found
+			_, dropped := nodeSet[op.Node]
+			return !dropped
 		}
-		return false
+		return true
 	})
 }
 
@@ -634,9 +592,11 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 	if level == "all" {
 		InitQueue()
 	} else if level == "config" {
-		filterQueueByConfig(config)
+		globalOperationQueue.retain(func(op StoreOperation) bool { return op.Config != config })
 	} else if level == "group" {
-		filterQueueByGroup(group, config)
+		globalOperationQueue.retain(func(op StoreOperation) bool {
+			return op.Group != group || op.Config != config
+		})
 	}
 
 	s.clearCache(level, config, group)
@@ -666,7 +626,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 
 // 清空所有缓存
 func (s *Store) FlushAll() error {
-	log.Debugln("[SmartStore] Starting FlushAll, current queue length: %d", len(globalOperationQueue.Load()))
+	log.Debugln("[SmartStore] Starting FlushAll, current queue length: %d", globalOperationQueue.length())
 	err := s.FlushByLevel("all", "", "")
 	if err == nil {
 		log.Debugln("[SmartStore] All Smart data cleared")

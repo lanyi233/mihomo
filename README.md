@@ -143,6 +143,14 @@ listeners:
     # 不再进规则引擎。默认 true。见上面「和 TUN 共存」
     bypass-tun-direct: true
 
+    # 是否在内核里替 fake-ip 地址回 ICMP Echo Reply，默认 off。
+    # 填 reply 时要求配了 fake-ip 段，且有 TC 挂载点能带上这个程序：
+    # local.data-plane: tc，或者开了 shared（两种 shared.data-plane 都行）。
+    # local.data-plane: cgroup 且没开 shared 会被拒绝 —— connect()/sendmsg()
+    # 这类 hook 根本看不到 ICMP。注意回包只说明这是个 fake-ip 地址，
+    # 不代表域名解析得动、也不代表它的代理是通的
+    fakeip-icmp: off
+
     # dns-mode 和 bypass-private-address 写在顶层会套用到所有启用的角色上，
     # 角色自己写了的以自己的为准
 

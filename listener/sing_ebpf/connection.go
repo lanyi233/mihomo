@@ -111,13 +111,13 @@ func (i *Inbound) newTCConnection(backend *ECommon.TCBackend, conn net.Conn, des
 		_ = conn.Close()
 		return
 	}
-	_, err := backend.LookupAssignment(ECommon.ProtocolTCP, source, destination, 0, true)
+	assignment, err := backend.LookupAssignment(ECommon.ProtocolTCP, source, destination, 0, true)
 	if err != nil {
 		i.udpWarnings.cleanup.warn(i.logWarn, "lookup TC eBPF TCP assignment: ", err)
 		_ = conn.Close()
 		return
 	}
-	if i.hijackDNS(destination) {
+	if i.hijackTCDNS(destination, assignment.Path == ECommon.TCPathShared) {
 		i.startTCPDNSRelay(conn)
 		return
 	}
@@ -207,7 +207,8 @@ func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, destinati
 	// The assignment record only carries per-flow facts (source MAC, socket
 	// cookie, path), so it is read once per client/destination pair. Every
 	// later packet of the flow skips the map syscall and the state write.
-	if !i.udpClientTable.hasDirectBinding(client, destination) {
+	bound, sharedPath := i.udpClientTable.hasDirectBinding(client, destination)
+	if !bound {
 		assignment, err := backend.LookupAssignment(ECommon.ProtocolUDP, client, destination, interfaceIndex, false)
 		if err != nil && interfaceIndex != 0 {
 			assignment, err = backend.LookupAssignment(ECommon.ProtocolUDP, client, destination, 0, false)
@@ -217,13 +218,14 @@ func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, destinati
 			_ = pool.Put(data)
 			return
 		}
+		sharedPath = assignment.Path == ECommon.TCPathShared
 		var sourceMAC net.HardwareAddr
-		if assignment.Path == ECommon.TCPathShared && assignment.SourceMACValid != 0 {
+		if sharedPath && assignment.SourceMACValid != 0 {
 			sourceMAC = net.HardwareAddr(assignment.SourceMAC[:])
 		}
-		i.udpClientTable.setDirectBinding(client, destination, sourceMAC, assignment.SocketCookie)
+		i.udpClientTable.setDirectBinding(client, destination, sourceMAC, assignment.SocketCookie, sharedPath)
 	}
-	if i.hijackDNS(destination) {
+	if i.hijackTCDNS(destination, sharedPath) {
 		clientState := i.udpClientTable.loadOrCreate(client)
 		i.startUDPDNSRelay(data, client, clientState, destination)
 		return
@@ -252,13 +254,34 @@ func (i *Inbound) forwardLocalUDP(data []byte, client netip.AddrPort, destinatio
 		client:      client,
 		clientState: clientState,
 		data:        data,
-		lAddr:       clientState.localAddr(client),
+		lAddr:       clientState.localAddr(),
 	}
 	i.tunnel.HandleUDPPacket(packet, metadata)
 }
 
+// hijackDNS reports whether a port-53 flow the local role delivered should be
+// relayed through the resolver. The shared role carries its own dns-mode and
+// must ask hijackSharedDNS instead: the kernel honours the two settings
+// separately, so answering a shared flow with the local mode sends it to the
+// client's original DNS server whenever the two differ.
 func (i *Inbound) hijackDNS(destination netip.AddrPort) bool {
 	return i.localDNSMode != dnsModeOff && destination.Port() == 53
+}
+
+// hijackSharedDNS is hijackDNS for the shared role.
+func (i *Inbound) hijackSharedDNS(destination netip.AddrPort) bool {
+	return i.sharedDNSMode != dnsModeOff && destination.Port() == 53
+}
+
+// hijackTCDNS is hijackDNS for the TC data plane, which carries local egress
+// and shared socket-assignment flows on one listener. sharedPath comes from the
+// kernel assignment that steered the flow here, so each one is judged by the
+// dns-mode of the role that actually selected it.
+func (i *Inbound) hijackTCDNS(destination netip.AddrPort, sharedPath bool) bool {
+	if sharedPath {
+		return i.hijackSharedDNS(destination)
+	}
+	return i.hijackDNS(destination)
 }
 
 type udpPacket struct {

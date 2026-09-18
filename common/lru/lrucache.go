@@ -307,12 +307,6 @@ type entry[K comparable, V any] struct {
 	expires int64
 }
 
-func ResetLRU[K comparable, V any](oldCache *LruCache[K, V], newSize int, options ...Option[K, V]) *LruCache[K, V] {
-	newCache := New[K, V](append(options, WithSize[K, V](newSize))...)
-	oldCache.CloneTo(newCache)
-	return newCache
-}
-
 func (c *LruCache[K, V]) FilterByKeyPrefix(prefix string) map[string]V {
 	c.mu.Lock()
 	defer c.mu.Unlock()

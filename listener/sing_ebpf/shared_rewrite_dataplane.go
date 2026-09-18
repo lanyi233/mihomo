@@ -23,6 +23,16 @@ import (
 const (
 	sharedRewriteIngressFilterHandle = 0x5342
 	sharedRewriteEgressFilterHandle  = 0x5343
+	// The permanent fakeip_icmp handle has to sit BELOW the ingress base, not
+	// above it: it shares the ingress parent with the temporary ingress handles,
+	// which run base+sequence over a 12-bit sequence and therefore cover
+	// [0x5343, 0x6341]. A permanent handle inside that window collides with the
+	// 4096th-and-every-4096th rebuild, and attachTCFilter only clears a stale
+	// filter by name -- a handle clash is a hard error that rolls the whole
+	// reconcile back.
+	sharedRewriteICMPFilterHandle = 0x5341
+	// Likewise the temporary ICMP range starts above the temporary ingress one.
+	sharedRewriteICMPTemporaryHandleBase = 0x6400
 )
 
 var sharedRewriteAttachmentSequence atomic.Uint32
@@ -48,17 +58,25 @@ type sharedRewriteDataPlane struct {
 }
 
 type sharedRewriteAttachment struct {
-	interfaceName   string
-	interfaceIndex  int
-	lock            io.Closer
-	ingressFilter   *netlink.BpfFilter
-	egressFilter    *netlink.BpfFilter
-	ingressName     string
-	egressName      string
-	ingressHandle   uint16
-	egressHandle    uint16
-	ingressLink     link.Link
-	egressLink      link.Link
+	interfaceName  string
+	interfaceIndex int
+	lock           io.Closer
+	ingressFilter  *netlink.BpfFilter
+	egressFilter   *netlink.BpfFilter
+	ingressName    string
+	egressName     string
+	icmpName       string
+	ingressHandle  uint16
+	egressHandle   uint16
+	icmpHandle     uint16
+	ingressLink    link.Link
+	egressLink     link.Link
+	// icmpFilter/icmpLink are the fakeip_icmp shared-reply filter, attached
+	// alongside ingressFilter/ingressLink (same interface, same direction)
+	// only when backend.FakeIPICMPEnabled(); nil whenever that feature is
+	// off, the same as every other field here is nil when it does not apply.
+	icmpFilter      *netlink.BpfFilter
+	icmpLink        link.Link
 	restoreLocalnet bool
 	// restoreArpAnnounce is the arp_announce value the interface had before
 	// the attachment raised it to 2, or "" when it was already 2. See
@@ -176,7 +194,7 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 			if arpOriginal != "" && previous.restoreArpAnnounce == "" {
 				previous.restoreArpAnnounce = arpOriginal
 			}
-			healthy, err := previous.healthy(device, d.priority)
+			healthy, err := previous.healthy(device, d.priority, backend.FakeIPICMPEnabled())
 			if err != nil {
 				return cleanupCandidates(E.Cause(err, "inspect shared packet-rewrite attachment on ", name))
 			}
@@ -369,8 +387,10 @@ func attachSharedRewriteInterfaceWithOptions(
 	}
 	attachment.ingressName = "sb_share_in"
 	attachment.egressName = "sb_share_out"
+	attachment.icmpName = "sb_icmp_share"
 	attachment.ingressHandle = sharedRewriteIngressFilterHandle
 	attachment.egressHandle = sharedRewriteEgressFilterHandle
+	attachment.icmpHandle = sharedRewriteICMPFilterHandle
 	if options.temporary {
 		sequence := sharedRewriteAttachmentSequence.Add(1) & 0x0fff
 		if sequence == 0 {
@@ -379,8 +399,10 @@ func attachSharedRewriteInterfaceWithOptions(
 		suffix := strconv.FormatUint(uint64(sequence), 16)
 		attachment.ingressName = "sbi" + suffix
 		attachment.egressName = "sbo" + suffix
+		attachment.icmpName = "sbc" + suffix
 		attachment.ingressHandle += uint16(sequence)
 		attachment.egressHandle += uint16(sequence)
+		attachment.icmpHandle = sharedRewriteICMPTemporaryHandleBase + uint16(sequence)
 	}
 	attachment.restoreLocalnet, err = enableSharedRewriteLocalnet(name)
 	if err != nil {
@@ -400,6 +422,13 @@ func attachSharedRewriteInterfaceWithOptions(
 			attachment.ingressLink, err = link.AttachTCX(link.TCXOptions{
 				Interface: device.Attrs().Index,
 				Program:   backend.IngressProgram(),
+				Attach:    CiliumEBPF.AttachTCXIngress,
+			})
+		}
+		if err == nil && backend.FakeIPICMPEnabled() {
+			attachment.icmpLink, err = link.AttachTCX(link.TCXOptions{
+				Interface: device.Attrs().Index,
+				Program:   backend.FakeIPICMPSharedReplyProgram(ECommon.TCLinkFramingEthernet),
 				Attach:    CiliumEBPF.AttachTCXIngress,
 			})
 		}
@@ -425,23 +454,48 @@ func attachSharedRewriteInterfaceWithOptions(
 	if err != nil {
 		return cleanup(err)
 	}
+	if backend.FakeIPICMPEnabled() {
+		attachment.icmpFilter, err = attachTCFilter(
+			device,
+			netlink.HANDLE_MIN_INGRESS,
+			backend.FakeIPICMPSharedReplyProgramFD(ECommon.TCLinkFramingEthernet),
+			attachment.icmpName,
+			attachment.icmpHandle,
+			priority,
+		)
+		if err != nil {
+			return cleanup(err)
+		}
+	}
 	attachment.attachmentType = "clsact"
 	return attachment, nil
 }
 
-func (a *sharedRewriteAttachment) healthy(device netlink.Link, priority uint16) (bool, error) {
+// healthy reports whether every program this attachment installed is still
+// attached. fakeIPICMPEnabled comes from the backend: when the feature is off
+// a nil icmpLink/icmpFilter is the correct state rather than a fault, so the
+// ICMP check is skipped entirely.
+func (a *sharedRewriteAttachment) healthy(device netlink.Link, priority uint16, fakeIPICMPEnabled bool) (bool, error) {
 	if a.ingressLink != nil || a.egressLink != nil {
 		ingress, err := tcxLinkAttached(a.ingressLink, a.interfaceIndex, CiliumEBPF.AttachTCXIngress)
 		if err != nil || !ingress {
 			return false, err
 		}
-		return tcxLinkAttached(a.egressLink, a.interfaceIndex, CiliumEBPF.AttachTCXEgress)
+		egress, err := tcxLinkAttached(a.egressLink, a.interfaceIndex, CiliumEBPF.AttachTCXEgress)
+		if err != nil || !egress || !fakeIPICMPEnabled {
+			return egress, err
+		}
+		return tcxLinkAttached(a.icmpLink, a.interfaceIndex, CiliumEBPF.AttachTCXIngress)
 	}
 	ingress, err := tcFilterAttached(device, netlink.HANDLE_MIN_INGRESS, a.ingressName, a.ingressHandle, priority)
 	if err != nil || !ingress {
 		return false, err
 	}
-	return tcFilterAttached(device, netlink.HANDLE_MIN_EGRESS, a.egressName, a.egressHandle, priority)
+	egress, err := tcFilterAttached(device, netlink.HANDLE_MIN_EGRESS, a.egressName, a.egressHandle, priority)
+	if err != nil || !egress || !fakeIPICMPEnabled {
+		return egress, err
+	}
+	return tcFilterAttached(device, netlink.HANDLE_MIN_INGRESS, a.icmpName, a.icmpHandle, priority)
 }
 
 func (a *sharedRewriteAttachment) closeLinks() error {
@@ -454,6 +508,10 @@ func (a *sharedRewriteAttachment) closeLinks() error {
 		closeErr = E.Errors(closeErr, a.egressLink.Close())
 		a.egressLink = nil
 	}
+	if a.icmpLink != nil {
+		closeErr = E.Errors(closeErr, a.icmpLink.Close())
+		a.icmpLink = nil
+	}
 	return closeErr
 }
 
@@ -461,9 +519,15 @@ func (a *sharedRewriteAttachment) Close() error {
 	if a == nil {
 		return nil
 	}
-	closeErr := E.Errors(a.closeLinks(), detachTCFilter(a.ingressFilter), detachTCFilter(a.egressFilter))
+	closeErr := E.Errors(
+		a.closeLinks(),
+		detachTCFilter(a.ingressFilter),
+		detachTCFilter(a.egressFilter),
+		detachTCFilter(a.icmpFilter),
+	)
 	a.ingressFilter = nil
 	a.egressFilter = nil
+	a.icmpFilter = nil
 	if a.restoreLocalnet {
 		closeErr = E.Errors(closeErr, restoreSharedRewriteLocalnet(a.interfaceName))
 		a.restoreLocalnet = false

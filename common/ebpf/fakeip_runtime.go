@@ -114,10 +114,19 @@ func (b *TCBackend) SetFakeIPRanges(ipv4 netip.Prefix, ipv6 netip.Prefix) (bool,
 		b.control.FakeIPIPv6Mask = prefixMask16(normalizedIPv6.Bits())
 	}
 	if b.control == previous {
-		return false, nil
+		// Still push the ranges down: the responder keeps its own copy of them,
+		// and a previous partial failure could have left it behind.
+		return b.fakeIPICMP.SetFakeIPRanges(normalizedIPv4, normalizedIPv6)
 	}
 	if err = b.updateControlLocked(); err != nil {
 		b.control = previous
+		return false, err
+	}
+	// The fakeip_icmp object has its own control map, so a range change has to
+	// reach it too or it would answer for the prefix the fake pool just left.
+	if _, err = b.fakeIPICMP.SetFakeIPRanges(normalizedIPv4, normalizedIPv6); err != nil {
+		b.control = previous
+		_ = b.updateControlLocked()
 		return false, err
 	}
 	return true, nil
@@ -155,10 +164,16 @@ func (b *SharedNetworkBackend) SetFakeIPRanges(ipv4 netip.Prefix, ipv6 netip.Pre
 		b.control.FakeIPIPv6Mask = prefixMask16(normalizedIPv6.Bits())
 	}
 	if b.control == previous {
-		return false, nil
+		// See the TCBackend comment: push the ranges down regardless.
+		return b.fakeIPICMP.SetFakeIPRanges(normalizedIPv4, normalizedIPv6)
 	}
 	if err = b.updateControl(); err != nil {
 		b.control = previous
+		return false, err
+	}
+	if _, err = b.fakeIPICMP.SetFakeIPRanges(normalizedIPv4, normalizedIPv6); err != nil {
+		b.control = previous
+		_ = b.updateControl()
 		return false, err
 	}
 	return true, nil

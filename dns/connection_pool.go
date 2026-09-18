@@ -12,14 +12,22 @@ import (
 )
 
 const (
+	// Streams are worth capping: every one of them is a real connection the
+	// server has to hold open, and before pooling existed a burst of N queries
+	// opened N TLS connections. Datagram sockets get no cap (see newDNSUDPPool).
 	dnsMaxOpenConnections = 32
 
 	dnsStreamIdleTimeout = 90 * time.Second
 	dnsStreamMaxLifetime = 10 * time.Minute
 
-	dnsUDPIdleTimeout = 10 * time.Second
-	dnsUDPMaxLifetime = 30 * time.Second
-	dnsUDPMaxUses     = 32
+	// A datagram socket keeps its source port for as long as it is pooled, and
+	// a pinned port is what ephemeral-port inference attacks (SAD DNS and
+	// friends) need in order to get down to guessing the 16-bit transaction ID.
+	// Reuse is therefore scoped to a burst - the A/AAAA pair of one lookup and
+	// its immediate follow-ups - which is where the dial cost actually repeats.
+	dnsUDPIdleTimeout = 3 * time.Second
+	dnsUDPMaxLifetime = 10 * time.Second
+	dnsUDPMaxUses     = 8
 )
 
 var errInvalidDNSResponse = errors.New("invalid DNS response")
@@ -75,6 +83,43 @@ func newDNSConnectionPool(options dnsConnectionPoolOptions) *dnsConnectionPool {
 	}
 }
 
+// dnsPoolMaxIdle maps the per-nameserver disable-reuse parameter onto the pool:
+// keeping nothing idle makes every acquire dial a fresh connection.
+func dnsPoolMaxIdle(disableReuse bool) int {
+	if disableReuse {
+		return 0
+	}
+	return 8
+}
+
+// newDNSStreamPool builds the pool used for TCP and DoT, where reuse saves a
+// TCP (and for DoT a TLS) handshake and a cap on concurrent connections is
+// worth having.
+func newDNSStreamPool(maxIdle int) *dnsConnectionPool {
+	return newDNSConnectionPool(dnsConnectionPoolOptions{
+		maxOpen:     dnsMaxOpenConnections,
+		maxIdle:     maxIdle,
+		idleTimeout: dnsStreamIdleTimeout,
+		maxLifetime: dnsStreamMaxLifetime,
+	})
+}
+
+// newDNSUDPPool builds the pool used for plain udp:// nameservers. It is
+// deliberately uncapped: a datagram socket costs a dial and nothing else, there
+// is no handshake or server-side state to protect, and capping it would add
+// head-of-line blocking to the one transport that never had any - a burst of
+// lookups past the cap would queue behind in-flight queries instead of going
+// out on the wire.
+func newDNSUDPPool(maxIdle int) *dnsConnectionPool {
+	return newDNSConnectionPool(dnsConnectionPoolOptions{
+		maxOpen:     0,
+		maxIdle:     maxIdle,
+		idleTimeout: dnsUDPIdleTimeout,
+		maxLifetime: dnsUDPMaxLifetime,
+		maxUses:     dnsUDPMaxUses,
+	})
+}
+
 func newDNSConnectionPoolState() *dnsConnectionPoolState {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	return &dnsConnectionPoolState{
@@ -109,7 +154,7 @@ func (p *dnsConnectionPool) acquireInternal(ctx context.Context, dial func(conte
 			connection := state.idle[idleLen-1]
 			state.idle[idleLen-1] = nil
 			state.idle = state.idle[:idleLen-1]
-			if p.canReuseLocked(connection, time.Now()) {
+			if p.canReuseLocked(connection, time.Now(), true) {
 				p.mu.Unlock()
 				return &dnsConnectionLease{state: state, connection: connection, reused: true}, nil
 			}
@@ -219,7 +264,10 @@ func (p *dnsConnectionPool) release(lease *dnsConnectionLease, reuse bool) {
 		return
 	}
 	connection.uses++
-	if p.closed || p.state != state || !reuse || p.options.maxIdle <= 0 || !p.canReuseLocked(connection, now) {
+	// checkIdle is false here: idleSince still records when this connection last
+	// went into the pool, so testing it now would charge the connection for the
+	// query it just finished and close one that has proven itself alive.
+	if p.closed || p.state != state || !reuse || p.options.maxIdle <= 0 || !p.canReuseLocked(connection, now, false) {
 		delete(state.all, connection)
 		p.signalLocked(state)
 		closeConnections = append(closeConnections, connection)
@@ -248,14 +296,18 @@ func (p *dnsConnectionPool) discard(lease *dnsConnectionLease) {
 	p.release(lease, false)
 }
 
-func (p *dnsConnectionPool) canReuseLocked(connection *dnsPooledConnection, now time.Time) bool {
+// canReuseLocked reports whether a pooled connection may serve another query.
+// checkIdle only makes sense for a connection that is currently sitting in the
+// pool; callers handing one back pass false, because at that moment it has not
+// been idle at all.
+func (p *dnsConnectionPool) canReuseLocked(connection *dnsPooledConnection, now time.Time, checkIdle bool) bool {
 	if p.options.maxUses > 0 && connection.uses >= p.options.maxUses {
 		return false
 	}
 	if p.options.maxLifetime > 0 && now.Sub(connection.createdAt) >= p.options.maxLifetime {
 		return false
 	}
-	if !connection.idleSince.IsZero() && p.options.idleTimeout > 0 && now.Sub(connection.idleSince) >= p.options.idleTimeout {
+	if checkIdle && !connection.idleSince.IsZero() && p.options.idleTimeout > 0 && now.Sub(connection.idleSince) >= p.options.idleTimeout {
 		return false
 	}
 	return true
@@ -359,7 +411,7 @@ func (p *dnsConnectionPool) expireIdle(epoch uint64) {
 	state := p.state
 	kept := state.idle[:0]
 	for _, connection := range state.idle {
-		if p.canReuseLocked(connection, now) {
+		if p.canReuseLocked(connection, now, true) {
 			kept = append(kept, connection)
 			continue
 		}

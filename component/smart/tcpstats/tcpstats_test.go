@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+// Half the segments retransmitted over loopback is not a slow runner, it is a
+// counter being read out of the wrong place. Real scheduling noise on this path
+// costs single-digit retransmits against tens of segments.
+const loopbackMaxLossRate = 0.5
+
 func TestGetTCPStats_Loopback(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -75,15 +80,34 @@ func TestGetTCPStats_Loopback(t *testing.T) {
 	t.Logf("Platform: %s, SegsOut: %d, RetransSegs: %d, BytesSent: %d, BytesRetrans: %d, LossRate: %.4f",
 		runtime.GOOS, stats.SegsOut, stats.RetransSegs, stats.BytesSent, stats.BytesRetrans, lossRate)
 
-	// On loopback, loss rate should be 0
-	if lossRate != 0 {
-		t.Errorf("expected 0 loss rate on loopback, got %.4f", lossRate)
+	// Deliberately a ceiling, not an equality. The counter reports
+	// retransmissions, and a retransmission does not require loss: a tail loss
+	// probe fires when the peer's ACK is late, which on a loaded runner means
+	// the echo goroutine was descheduled, and loopback delivery itself can drop
+	// when the receiver's backlog fills. One retransmit out of 43 segments is
+	// what took this red on CI. What the arithmetic of LossRate does with a
+	// given pair of counters is pinned by the synthetic table tests below; what
+	// a live connection adds is that the counters read out of the kernel are
+	// sane at all, and a ceiling this loose still fails a nonsense read while
+	// leaving the scheduler out of the verdict.
+	if lossRate > loopbackMaxLossRate {
+		t.Errorf("loss rate %.4f over loopback exceeds %.4f (SegsOut=%d RetransSegs=%d BytesSent=%d BytesRetrans=%d)",
+			lossRate, loopbackMaxLossRate, stats.SegsOut, stats.RetransSegs, stats.BytesSent, stats.BytesRetrans)
 	}
 
 	// At least one of SegsOut or BytesSent should be populated
 	// (FreeBSD uses TCP_PERF_INFO which fills BytesSent; Linux uses TCP_INFO which fills SegsOut)
 	if stats.SegsOut == 0 && stats.BytesSent == 0 {
 		t.Error("expected non-zero sent statistics (SegsOut or BytesSent)")
+	}
+
+	// Redundant for detection: a ratio above one clamps to one, so the ceiling
+	// above already fails on this. It earns its place by naming the invariant
+	// and printing the offending pair on its own line, and by surviving anyone
+	// who later decides the ceiling should be looser. The byte counters below
+	// have had the same check all along; the segment counters did not.
+	if stats.SegsOut > 0 && stats.RetransSegs > stats.SegsOut {
+		t.Errorf("RetransSegs (%d) exceeds SegsOut (%d)", stats.RetransSegs, stats.SegsOut)
 	}
 
 	// If BytesSent is populated, ensure BytesRetrans is also meaningful

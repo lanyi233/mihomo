@@ -1,7 +1,6 @@
 package smart
 
 import (
-	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -11,43 +10,27 @@ import (
 )
 
 func TestCheckHostStatusConcurrentUpdate(t *testing.T) {
-	InitCache()
-	InitQueue()
-	db = nil
-	hostStatusCache.Clear()
-	dbResultCache.Clear()
-
 	const (
 		group          = "group"
 		config         = "config"
 		wildcardTarget = "example.com"
 	)
 	now := time.Now().Unix()
-	initial := HostStatus{Codes: map[int]*CodeNodeSet{
-		2: {
+	initial := HostStatus{Codes: map[BlockCode]*CodeNodeSet{
+		BlockAbnormalStatus: {
 			Nodes:     map[string]int64{"node-0": now + int64(time.Hour.Seconds())},
 			NodeHosts: map[string]string{"node-0": "example.com"},
 		},
 	}}
-	data, err := json.Marshal(&initial)
-	require.NoError(t, err)
-
-	// Seed the caches directly: AdjustCacheParameters can leave asynchronous
-	// flushes running, so the global write queue is not a stable test fixture.
-	cachePath := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
-	initial.initOnce.Do(func() {})
-	hostStatusCache.Set(cachePath, &initial)
-	dbResultCache.Set(FormatDBKey(KeyTypeHostFailures, config, group), map[string][]byte{
-		cachePath: data,
-	})
+	cachePath := seedHostStatus(t, group, config, wildcardTarget, &initial)
 
 	store := &Store{}
-	_, err = store.CheckHostStatus(group, config, 1_000)
+	_, err := store.CheckHostStatus(group, config, 1_000)
 	require.NoError(t, err)
 
 	cached, ok := hostStatusCache.Get(cachePath)
 	require.True(t, ok)
-	require.NotNil(t, cached.Codes[2])
+	require.NotNil(t, cached.Codes[BlockAbnormalStatus])
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
@@ -57,7 +40,7 @@ func TestCheckHostStatusConcurrentUpdate(t *testing.T) {
 		for i := 0; i < 2_000; i++ {
 			name := fmt.Sprintf("node-%d", i%64)
 			cached.mu.Lock()
-			codeSet := cached.Codes[2]
+			codeSet := cached.Codes[BlockAbnormalStatus]
 			codeSet.Nodes[name] = now + int64(time.Hour.Seconds())
 			codeSet.NodeHosts[name] = fmt.Sprintf("host-%d.example", i)
 			if i >= 64 {

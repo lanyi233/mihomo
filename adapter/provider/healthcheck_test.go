@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"strings"
 	"sync"
 	stdatomic "sync/atomic"
 	"testing"
@@ -14,7 +13,6 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/power"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/log"
 )
 
 type healthCheckProbe struct {
@@ -125,28 +123,16 @@ func waitHealthCheckCall(t *testing.T, calls <-chan string, timeout time.Duratio
 func TestLazyHealthCheckStopsPeriodicWakeupsAndTouchRestarts(t *testing.T) {
 	const interval = 20 * time.Millisecond
 	proxy := newHealthCheckProbe("lazy")
-	sub := log.Subscribe()
-	t.Cleanup(func() { log.UnSubscribe(sub) })
 
 	hc := testHealthCheck(t, proxy, interval, true)
 	waitHealthCheckCall(t, proxy.calls, time.Second) // startup check
 
-	deadline := time.NewTimer(6 * interval)
-	defer deadline.Stop()
-	skips := 0
-collect:
-	for {
-		select {
-		case event := <-sub:
-			if strings.Contains(event.Payload, "health check because we are lazy") {
-				skips++
-			}
-		case <-deadline.C:
-			break collect
-		}
-	}
-	if skips > 1 {
-		t.Fatalf("idle lazy health check woke %d times, want at most one transition to idle", skips)
+	// An untouched lazy provider has to go idle rather than keep waking every
+	// interval, so no further check may run until something touches it.
+	select {
+	case url := <-proxy.calls:
+		t.Fatalf("idle lazy health check ran a periodic check for %q", url)
+	case <-time.After(6 * interval):
 	}
 
 	hc.touch()

@@ -8,13 +8,14 @@ import (
 	"io"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/metacubex/mihomo/adapter/inbound"
+	"github.com/metacubex/mihomo/common/atomic"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -32,7 +33,8 @@ import (
 type Listener interface {
 	Close() error
 	Address() string
-	InterfaceUpdated()
+	// Update applies a config difference in place; see config_update.go.
+	Update(options LC.EBPF) error
 }
 
 type Inbound struct {
@@ -54,6 +56,11 @@ type Inbound struct {
 	enableTCP        bool
 	enableUDP        bool
 
+	// The datapath degradation report's own cadence; see datapath_report.go for
+	// why it does not ride on the UDP janitor or the interface-update loop.
+	datapathReportCancel context.CancelFunc
+	datapathReportDone   chan struct{}
+
 	localDNSMode        string
 	sharedDNSMode       string
 	localIPv6           bool
@@ -69,13 +76,23 @@ type Inbound struct {
 	sharedBypassPort    []ECommon.PortRange
 	fakeIPIPv4Prefix    netip.Prefix
 	fakeIPIPv6Prefix    netip.Prefix
+	fakeIPICMPReply     bool
 	redirectIPv4Prefix  netip.Prefix
 	redirectIPv6Prefix  netip.Prefix
 	androidUIDOptions   *androidUIDOptions
-	udpTimeout          time.Duration
-	bypassTUNDirect     bool
 	localStateCapacity  uint32
 	sharedStateCapacity uint32
+
+	// udpTimeout is nanoseconds. The janitor loop, the reply-socket pool and a
+	// shared backend built for an interface that appeared late all read it
+	// while a config reload can be writing it, so it does not stay a plain
+	// Duration field.
+	udpTimeout atomic.Int64
+
+	// fakeIPRangeNeedsRetry records that a backend refused the current fake-ip
+	// ranges. Only a DNS config change would otherwise ask again, so the
+	// interface-update scheduler picks it up; see fakeip.go.
+	fakeIPRangeNeedsRetry bool
 
 	// policyAccess guards compiledPolicy and the fake-ip prefixes once the
 	// inbound is running: the fake-ip observer rewrites them while a shared
@@ -102,13 +119,30 @@ type Inbound struct {
 
 	sharedRewrite *sharedRewrite
 
-	bypassRuleSetAccess   sync.Mutex
-	bypassRuleSet         []P.RuleProvider
+	// providerTunnel is the tunnel's rule-provider registry. Bypass rule sets
+	// are resolved through it by name on every refresh instead of being
+	// captured once at startup, because a config reload builds an entirely new
+	// set of provider objects and swaps the registry out: a captured pointer
+	// would go on compiling the kernel policy from an orphan nothing updates
+	// any more, so the eBPF bypass would silently stop tracking the rule set
+	// after the first reload. tunnel itself cannot serve this -- it is only a
+	// C.Tunnel, and the rule-provider half is an optional interface on top.
+	providerTunnel P.Tunnel
+
+	bypassRuleSetAccess sync.Mutex
+	bypassRuleSetTags   []string
+	// Read on the publish path and rewritten by an in-place config update.
+	bypassTUNDirect       bool
+	bypassRuleSetMissing  warningLimiter
 	bypassRuleSetCallback io.Closer
 	bypassRuleSetStarted  bool
 	bypassCIDR            []netip.Prefix
 	bypassRuleSetPolicy   ECommon.BypassCIDRPolicy
-	bypassRuleSetDirty    bool
+	// bypassRuleSetNeedsRetry records that a refresh failed and the previous
+	// policy is still live. Nothing else will ask for that refresh again --
+	// rule-provider callbacks are the only other driver -- so the
+	// interface-update scheduler picks it back up on its next round.
+	bypassRuleSetNeedsRetry bool
 
 	// TUN coexistence and fake-ip tracking, see tun_coexist.go and fakeip.go.
 	fakeIPRangeRemove  func()
@@ -128,6 +162,11 @@ type interfaceWarningLimiters struct {
 	infrastructure   warningLimiter
 	hostPolicy       warningLimiter
 	reconcile        warningLimiter
+	// bypassRuleSet covers the scheduler's retries of a failed bypass_rule_set
+	// refresh. The rule-provider callback's own failure is reported once, at
+	// the point it happens; a retry that keeps failing repeats every two
+	// seconds at first, so it needs the limiter.
+	bypassRuleSet warningLimiter
 }
 
 func (i *Inbound) logWarn(format string, args ...any) {
@@ -217,6 +256,10 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	if err != nil {
 		return nil, err
 	}
+	fakeIPICMPReply, err := normalizeFakeIPICMP(options.FakeIPICMP)
+	if err != nil {
+		return nil, E.Cause(err, "parse fakeip_icmp")
+	}
 	sharedIncludeMAC, err := parseSharedMACAddresses(
 		"include_mac_address",
 		sharedOptions.IncludeMACAddress,
@@ -262,6 +305,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		sharedBypassPrivate: options.Shared.BypassPrivateAddress == nil || *options.Shared.BypassPrivateAddress,
 		localBypassPort:     localBypassPort,
 		sharedBypassPort:    sharedBypassPort,
+		fakeIPICMPReply:     fakeIPICMPReply,
 		tcPriority:          options.TCPriority,
 		sharedOptions:       sharedOptions,
 		sharedIncludeMAC:    sharedIncludeMAC,
@@ -280,10 +324,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	if inbound.tcPriority == 0 {
 		inbound.tcPriority = defaultTCPriority
 	}
-	// On by default: a destination this inbound bypasses is one the user asked
-	// to keep off the proxy, and letting TUN hand it to the rules instead is
-	// what makes a bypassed address unreachable.
-	inbound.bypassTUNDirect = options.BypassTUNDirect == nil || *options.BypassTUNDirect
+	inbound.bypassTUNDirect = resolveBypassTUNDirect(options.BypassTUNDirect)
 	inbound.localStateCapacity = options.Local.StateCapacity
 	inbound.sharedStateCapacity = options.Shared.StateCapacity
 	inbound.tunOverlapWarnings.interval = tunOverlapWarningInterval
@@ -293,6 +334,14 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	inbound.bypassPublisher = resolver.NewEBPFBypassPublisher()
 	inbound.fakeIPIPv4Prefix, inbound.fakeIPIPv6Prefix = resolver.FakeIPRanges()
 	if err = inbound.normalizeFakeIPPrefixes(); err != nil {
+		return nil, err
+	}
+	if err = validateFakeIPICMP(
+		inbound.fakeIPICMPReply,
+		inbound.fakeIPIPv4Prefix, inbound.fakeIPIPv6Prefix,
+		inbound.localEnabled, inbound.localDataPlane,
+		inbound.sharedEnabled, inbound.sharedDataPlane,
+	); err != nil {
 		return nil, err
 	}
 	if inbound.localCgroupEnabled() || inbound.sharedRewriteEnabled() {
@@ -307,14 +356,17 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	if !ok {
 		return nil, E.New("tunnel does not expose rule providers")
 	}
+	inbound.providerTunnel = rp
+	// Only the tags are kept; see providerTunnel. Resolving them here is purely
+	// a check that each one exists, so a typo fails the listener outright
+	// instead of quietly bypassing nothing at all.
 	for _, ruleSetTag := range options.BypassRuleSet {
-		ruleSet, loaded := rp.RuleProviders()[ruleSetTag]
-		if !loaded {
+		if _, loaded := rp.RuleProviders()[ruleSetTag]; !loaded {
 			return nil, E.New("parse bypass_rule_set: rule-set not found: ", ruleSetTag)
 		}
-		inbound.bypassRuleSet = append(inbound.bypassRuleSet, ruleSet)
 	}
-	inbound.udpTimeout = resolveUDPTimeout(options.UDPTimeout)
+	inbound.bypassRuleSetTags = slices.Clone(options.BypassRuleSet)
+	inbound.udpTimeout.Store(int64(resolveUDPTimeout(options.UDPTimeout)))
 	if err := inbound.compilePolicy(); err != nil {
 		return nil, err
 	}
@@ -393,6 +445,10 @@ func joinStringList(values []string) string {
 }
 
 func (i *Inbound) start() error {
+	// Before anything attaches: a previous run that died without detaching left
+	// its classic filters behind, and an orphan on an interface this run does
+	// not attach to is never revisited. Once per process, not per inbound.
+	tcPurgeOnce.Do(purgeStaleTCFilters)
 	if i.localEnabled && i.androidUIDOptions != nil {
 		if err := i.resolveAndroidUIDPolicy(); err != nil {
 			return E.Cause(err, "resolve Android UID policy")
@@ -465,6 +521,7 @@ func (i *Inbound) start() error {
 			EnableUDP:        i.enableUDP,
 			Policy:           i.policySnapshot(),
 			TrackProcess:     i.processTracker != nil,
+			FakeIPICMPReply:  i.fakeIPICMPReply,
 		}
 		if i.selfBypass != nil {
 			backendConfig.SelfBypassMap = i.selfBypass.Map()
@@ -527,6 +584,10 @@ func (i *Inbound) start() error {
 			return err
 		}
 	}
+	// After the data planes exist and are enabled: the reporter reads their stat
+	// maps, and its first tick must not land on a backend that is still being
+	// built.
+	i.startDatapathReporter()
 	// Publish the bypass policy even when no bypass_rule_set refresh will ever
 	// run (no rule sets configured), so a TUN listener can still report an
 	// overlap with the private ranges and keep them off its routes.
@@ -704,7 +765,7 @@ func (i *Inbound) prepareCgroupBackend() error {
 		RedirectIPv4:  i.redirectIPv4Prefix,
 		RedirectIPv6:  i.redirectIPv6Prefix,
 		MapCapacity:   i.cgroupMapCapacity(),
-		UDPTimeout:    i.udpTimeout,
+		UDPTimeout:    i.udpTimeoutValue(),
 		Policy:        i.policySnapshot(),
 		SelfBypassMap: i.selfBypass.Map(),
 	}
@@ -755,6 +816,9 @@ func (i *Inbound) Close() error {
 	var closeErr error
 	i.closeOnce.Do(func() {
 		i.stopUDPJanitor()
+		// Stopped and joined here, before anything below drops a backend or
+		// clears sharedRewrite: the reporter reads both without a lock.
+		i.stopDatapathReporter()
 		i.stopDNSRelays()
 		if i.protectRegistered {
 			dialer.UnregisterSocketProtectFunc()

@@ -646,11 +646,13 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
 
 	for name, newListener := range newListenerMap {
 		if oldListener, ok := inboundListeners[name]; ok {
-			if !oldListener.Config().Equal(newListener.Config()) {
-				_ = oldListener.Close()
-			} else {
+			if oldListener.Config().Equal(newListener.Config()) {
 				continue
 			}
+			if updateInboundListenerInPlace(name, oldListener, newListener.Config()) {
+				continue
+			}
+			_ = oldListener.Close()
 		}
 		if err := newListener.Listen(tunnel); err != nil {
 			log.Errorln("Listener %s listen err: %s", name, err.Error())
@@ -669,6 +671,40 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
 	}
 
 	rebuildStaleListeners(tunnel)
+}
+
+// updatableListener is a listener that can absorb some config differences
+// without being rebuilt. Rebuilding is not equally cheap for all of them: the
+// eBPF inbound's kernel state goes with it -- the cgroup redirect table, the
+// shared flow table, the TC assignment map, the UDP recovery table -- so every
+// established redirect breaks, and the rebuild can itself fail and leave the
+// inbound gone until someone reloads again.
+//
+// Update reports handled=false for any difference it will not take, which is
+// the default for everything it has not been taught, and must leave the
+// listener exactly as it was when it returns an error. Both cases fall back to
+// the close-and-rebuild that would have happened anyway, so a listener can
+// implement this for one field and still be correct.
+//
+// A listener that reports handled=true keeps running, and therefore has to
+// start answering for the new config: the next reload compares against
+// Config(), and a stale answer would ask it to apply the same difference again
+// forever.
+type updatableListener interface {
+	Update(newConfig C.InboundConfig) (handled bool, err error)
+}
+
+func updateInboundListenerInPlace(name string, oldListener C.InboundListener, newConfig C.InboundConfig) bool {
+	updatable, ok := oldListener.(updatableListener)
+	if !ok {
+		return false
+	}
+	handled, err := updatable.Update(newConfig)
+	if err != nil {
+		log.Errorln("Listener %s in-place update failed, rebuilding: %s", name, err.Error())
+		return false
+	}
+	return handled
 }
 
 // staleListener is a listener built from state that lives outside its own

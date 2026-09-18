@@ -134,3 +134,61 @@ func BenchmarkReplySocketCachedLease(b *testing.B) {
 		lease.release()
 	}
 }
+
+// A port-only shard key collapses whenever many distinct addresses share one
+// port, which is the normal case rather than the exotic one: reply sockets are
+// keyed by destination and those cluster on well-known ports, and client keys
+// collapse for any downstream application dialling from a fixed source port.
+func TestShardIndexSpreadsAddressesSharingOnePort(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		port uint16
+	}{
+		{name: "https", port: 443},
+		{name: "dns", port: 53},
+		{name: "wireguard", port: 51820},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			occupied := make(map[int]int, udpClientShardCount)
+			for host := 0; host < 256; host++ {
+				address := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, byte(host >> 8), byte(host)}), test.port)
+				occupied[shardIndexForAddrPort(address, udpClientShardCount)]++
+			}
+			if len(occupied) != udpClientShardCount {
+				t.Fatalf("256 hosts on port %d reached %d of %d shards", test.port, len(occupied), udpClientShardCount)
+			}
+			// Perfectly even would be 16 per shard; allow a wide band so this
+			// asserts "no collapse" rather than a specific hash.
+			for shard, count := range occupied {
+				if count < 4 || count > 64 {
+					t.Fatalf("shard %d holds %d of 256 hosts", shard, count)
+				}
+			}
+		})
+	}
+}
+
+// Placement only has to be self-consistent: every lookup and insert goes
+// through clientShard, so the table must find back what it stored.
+func TestClientTablesFindBackEveryStoredClient(t *testing.T) {
+	var local udpClientTable
+	var shared sharedUDPClientTable
+	clients := make([]netip.AddrPort, 0, 512)
+	for host := 0; host < 256; host++ {
+		for _, port := range []uint16{53, 51820} {
+			clients = append(clients, netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, byte(host >> 8), byte(host)}), port))
+		}
+	}
+	for _, client := range clients {
+		local.loadOrCreate(client)
+		shared.loadOrCreate(client)
+	}
+	for _, client := range clients {
+		if _, loaded := local.load(client); !loaded {
+			t.Fatalf("local table lost %s", client)
+		}
+		if _, loaded := shared.load(client); !loaded {
+			t.Fatalf("shared table lost %s", client)
+		}
+	}
+}

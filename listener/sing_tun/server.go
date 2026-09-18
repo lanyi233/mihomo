@@ -15,7 +15,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/dialer"
-	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/component/netchange"
 	"github.com/metacubex/mihomo/component/power"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -373,8 +373,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			} else {
 				log.Errorln("[TUN] default interface lost by monitor")
 			}
-			iface.FlushCache()
-			resolver.ResetConnection() // reset resolver's connection after default interface changed
+			netchange.Notify() // flush caches, reset resolver connections and re-probe providers
 		})
 		err = defaultInterfaceMonitor.Start()
 		if err != nil {

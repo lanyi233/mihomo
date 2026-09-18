@@ -1,0 +1,152 @@
+name: eBPF
+
+# The kernel programs are compiled ahead of time and their objects are committed
+# to the tree, so every other workflow consumes them without ever checking them:
+# test.yml runs `go test -tags with_ebpf` and build.yml runs a plain `go build`,
+# both of which embed whatever is in internal/bpfgen. A .bpf.c edited without a
+# regenerate therefore ships a binary running the previous kernel program while
+# the source says otherwise, with CI entirely green. This workflow is what
+# closes that, and it also runs the only tests that load a program into a real
+# kernel.
+#
+# It replaces build-ebpf.yml, which triggered on a branch this repository does
+# not have and so had never run once. Its build and cross-compile jobs duplicated
+# build.yml, which already builds linux and android with with_ebpf.
+
+on:
+  push:
+    branches:
+      - Alpha
+    paths:
+      - "common/ebpf/**"
+      - "listener/sing_ebpf/**"
+      - ".github/workflows/ebpf.yml"
+  pull_request:
+    branches:
+      - Alpha
+    paths:
+      - "common/ebpf/**"
+      - "listener/sing_ebpf/**"
+      - ".github/workflows/ebpf.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ebpf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  # Proves the committed objects still reproduce from their sources. The
+  # toolchain is pinned to the exact Clang build recorded in
+  # internal/bpfgen/manifest.txt, because the check compares generated output
+  # byte for byte -- a different NDK is a real failure worth seeing, not noise.
+  generate-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install Android NDK r29
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          # Verified against manifest.txt: r29 ships the exact Clang build the
+          # committed objects came from. r29-beta1, which the other workflows
+          # use for cross-compiling, does not -- it is a different Clang and
+          # the check refused it, which is the check working.
+          ndk-version: r29
+          # Deliberately no local-cache. The first run with it downloaded the
+          # NDK and passed; the next run restored the 708 MB entry, logged
+          # "Cache restored successfully" and "Found in local cache", and left
+          # no compiler under the path it then handed to ANDROID_NDK_HOME. A
+          # poisoned entry stays poisoned for the life of the key, so that is
+          # every subsequent run failing, not one. Downloading each time costs
+          # about a minute, and the path filter means this only runs when the
+          # eBPF sources actually change.
+
+      # The guard inside the Makefile only says the version is wrong, not what
+      # it found. This class of failure recurs whenever the NDK moves, so the
+      # run should say what it is holding rather than leave the next person
+      # guessing. It asserts rather than merely printing, because a missing
+      # compiler makes the substitution empty while `echo` still succeeds: the
+      # report passes, and the failure lands two steps later on a message that
+      # blames the version for what is actually an absent install.
+      - name: Report the toolchain
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          clang="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          if [ ! -x "${clang}" ]; then
+            echo "::error::the NDK install left no usable clang at ${clang}"
+            exit 1
+          fi
+          echo "runner:   $("${clang}" --version | head -n 1)"
+          echo "expected: $(sed -n 's/^clang: //p' common/ebpf/internal/bpfgen/manifest.txt)"
+
+      - name: Check the generated eBPF objects are current
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CGO_ENABLED: "0"
+        run: make ebpf_check
+
+  # The only tests in the tree that attach a program to a kernel. Salvaged from
+  # build-ebpf.yml, which never ran them. The probe decides whether this runner
+  # can prove the capabilities they need and skips rather than failing when it
+  # cannot, so a hosted runner without them does not block a merge.
+  privileged-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libc6-dev linux-libc-dev
+
+      - name: Probe eBPF capabilities
+        id: probe
+        shell: bash
+        run: |
+          set +e
+          sudo apt-get install -y bpftool >/dev/null 2>&1 || true
+          bash common/ebpf/check-kernel.sh --mode local > /tmp/ebpf-probe.log 2>&1
+          probe_status=$?
+          set -e
+          cat /tmp/ebpf-probe.log
+          if [ "${probe_status}" -ne 0 ] || grep -Eq '^(FAIL|UNKNOWN) .*\[required' /tmp/ebpf-probe.log; then
+            echo "SKIP: runner cannot prove the required eBPF capabilities"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run privileged eBPF integration tests
+        if: steps.probe.outputs.skipped == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download
+          sudo -E env SING_BOX_EBPF_INTEGRATION=1 CGO_ENABLED=0 GOCACHE=/tmp/gocache go test -count=1 -tags "with_gvisor with_ebpf ebpf_integration" ./common/ebpf/... -run 'Integration'
+
+      - name: Copy probe log
+        run: cp /tmp/ebpf-probe.log ebpf-probe.log
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ebpf-privileged-probe
+          path: ebpf-probe.log

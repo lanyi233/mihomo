@@ -19,8 +19,8 @@ func TestLocalAddrIsBuiltOncePerClient(t *testing.T) {
 	client := netip.MustParseAddrPort("192.0.2.10:40000")
 	state := table.loadOrCreate(client)
 
-	first := state.localAddr(client)
-	second := state.localAddr(client)
+	first := state.localAddr()
+	second := state.localAddr()
 	if first != second {
 		t.Fatalf("expected the cached address to be reused, got %p and %p", first, second)
 	}
@@ -30,16 +30,16 @@ func TestLocalAddrIsBuiltOncePerClient(t *testing.T) {
 	if first.Network() != C.EBPF.String() {
 		t.Fatalf("unexpected network %q", first.Network())
 	}
-	if allocs := testing.AllocsPerRun(100, func() { state.localAddr(client) }); allocs != 0 {
+	if allocs := testing.AllocsPerRun(100, func() { state.localAddr() }); allocs != 0 {
 		t.Fatalf("cached localAddr allocates %v per call", allocs)
 	}
 
 	var shared sharedUDPClientTable
 	sharedState := shared.loadOrCreate(client)
-	if sharedState.localAddr(client) != sharedState.localAddr(client) {
+	if sharedState.localAddr() != sharedState.localAddr() {
 		t.Fatal("expected the shared client address to be reused")
 	}
-	if sharedState.localAddr(client).String() != client.String() {
+	if sharedState.localAddr().String() != client.String() {
 		t.Fatal("shared NAT key changed")
 	}
 }
@@ -54,14 +54,14 @@ func TestHasDirectBindingTracksValidatedFlowsOnly(t *testing.T) {
 	destination := netip.MustParseAddrPort("198.51.100.10:443")
 	alias := netip.MustParseAddrPort("198.51.100.11:443")
 
-	if table.hasDirectBinding(client, destination) {
+	if bound, _ := table.hasDirectBinding(client, destination); bound {
 		t.Fatal("unknown client must not have a binding")
 	}
-	table.setDirectBinding(client, destination, nil, 42)
-	if !table.hasDirectBinding(client, destination) {
+	table.setDirectBinding(client, destination, nil, 42, false)
+	if bound, _ := table.hasDirectBinding(client, destination); !bound {
 		t.Fatal("expected the validated flow to be cached")
 	}
-	if table.hasDirectBinding(client, alias) {
+	if bound, _ := table.hasDirectBinding(client, alias); bound {
 		t.Fatal("a destination that was never validated must not be cached")
 	}
 
@@ -69,7 +69,7 @@ func TestHasDirectBindingTracksValidatedFlowsOnly(t *testing.T) {
 	if !table.setDirectReplyBinding(client, state, alias) {
 		t.Fatal("reply alias was rejected")
 	}
-	if table.hasDirectBinding(client, alias) {
+	if bound, _ := table.hasDirectBinding(client, alias); bound {
 		t.Fatal("a reply alias must not count as a validated flow")
 	}
 
@@ -79,7 +79,7 @@ func TestHasDirectBindingTracksValidatedFlowsOnly(t *testing.T) {
 	}
 
 	table.delete(client, state)
-	if table.hasDirectBinding(client, destination) {
+	if bound, _ := table.hasDirectBinding(client, destination); bound {
 		t.Fatal("a deleted client must not keep its bindings")
 	}
 }
@@ -129,7 +129,61 @@ func TestReplyBindingReportsCgroupDataPlane(t *testing.T) {
 	if !loaded || !cgroup || binding.redirectAddress != redirect || len(binding.packetInfo) == 0 {
 		t.Fatalf("unexpected cgroup reply binding: loaded=%v cgroup=%v binding=%+v", loaded, cgroup, binding)
 	}
-	if table.hasDirectBinding(client, destination) {
+	if bound, _ := table.hasDirectBinding(client, destination); bound {
 		t.Fatal("a cgroup client must not take the TC fast path")
+	}
+}
+
+// The kernel honours local.dns-mode and shared.dns-mode separately, and the TC
+// data plane carries both roles on one listener, so the Go side has to judge a
+// port-53 flow by the role that actually selected it. Reading local.dns-mode
+// for a shared flow makes shared.dns-mode silently inoperative whenever the two
+// differ: the flow is forwarded to the client's own DNS server instead of being
+// relayed, or relayed when it should have been left alone.
+func TestDNSHijackFollowsTheRoleThatSelectedTheFlow(t *testing.T) {
+	dns := netip.MustParseAddrPort("10.0.0.1:53")
+	other := netip.MustParseAddrPort("10.0.0.1:443")
+
+	for _, test := range []struct {
+		name                  string
+		localMode, sharedMode string
+		wantLocal, wantShared bool
+	}{
+		{name: "local off, shared hijack", localMode: dnsModeOff, sharedMode: dnsModeHijack, wantLocal: false, wantShared: true},
+		{name: "local hijack, shared off", localMode: dnsModeHijack, sharedMode: dnsModeOff, wantLocal: true, wantShared: false},
+		{name: "both hijack", localMode: dnsModeHijack, sharedMode: dnsModeHijack, wantLocal: true, wantShared: true},
+		{name: "both off", localMode: dnsModeOff, sharedMode: dnsModeOff, wantLocal: false, wantShared: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			i := &Inbound{localDNSMode: test.localMode, sharedDNSMode: test.sharedMode}
+			if got := i.hijackTCDNS(dns, false); got != test.wantLocal {
+				t.Fatalf("local-selected flow hijacked=%v, want %v", got, test.wantLocal)
+			}
+			if got := i.hijackTCDNS(dns, true); got != test.wantShared {
+				t.Fatalf("shared-selected flow hijacked=%v, want %v", got, test.wantShared)
+			}
+			if i.hijackTCDNS(other, false) || i.hijackTCDNS(other, true) {
+				t.Fatal("a non-DNS port was hijacked")
+			}
+		})
+	}
+}
+
+// The role has to survive past the first packet: the assignment that carries it
+// is only read while the flow has no binding yet.
+func TestDirectBindingRemembersTheSelectingRole(t *testing.T) {
+	var table udpClientTable
+	client := netip.MustParseAddrPort("192.0.2.10:40000")
+	shared := netip.MustParseAddrPort("10.0.0.1:53")
+	local := netip.MustParseAddrPort("10.0.0.2:53")
+
+	table.setDirectBinding(client, shared, nil, 1, true)
+	table.setDirectBinding(client, local, nil, 2, false)
+
+	if bound, sharedPath := table.hasDirectBinding(client, shared); !bound || !sharedPath {
+		t.Fatalf("shared flow: bound=%v sharedPath=%v", bound, sharedPath)
+	}
+	if bound, sharedPath := table.hasDirectBinding(client, local); !bound || sharedPath {
+		t.Fatalf("local flow: bound=%v sharedPath=%v", bound, sharedPath)
 	}
 }

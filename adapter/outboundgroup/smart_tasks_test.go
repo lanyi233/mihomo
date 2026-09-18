@@ -273,3 +273,70 @@ func TestSmartCloseIsConcurrentAndIdempotent(t *testing.T) {
 		t.Fatal("close retained global task ownership")
 	}
 }
+
+func TestResumeDelayNeverExceedsTheSettleDelay(t *testing.T) {
+	defer func(previous time.Duration) { smartResumeSettleDelay = previous }(smartResumeSettleDelay)
+	smartResumeSettleDelay = 30 * time.Second
+
+	for _, testCase := range []struct {
+		name   string
+		period time.Duration
+		want   time.Duration
+	}{
+		{name: "the host status sweep", period: 30 * time.Minute, want: 30 * time.Second},
+		{name: "a period shorter than the settle delay", period: 5 * time.Second, want: 5 * time.Second},
+		{name: "a degenerate period", period: 0, want: time.Millisecond},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := resumeDelayFor(testCase.period); got != testCase.want {
+				t.Fatalf("resumeDelayFor(%v) = %v, want %v", testCase.period, got, testCase.want)
+			}
+		})
+	}
+}
+
+// A task that came due while the device was paused used to be pushed a whole
+// period into the future on resume, so a device that pauses more often than the
+// task's interval postponed it forever. The interval here is an hour: under the
+// old behaviour this test would time out rather than fail.
+func TestSmartTaskScheduleRunsWhatCameDueWhilePaused(t *testing.T) {
+	defer func(previous time.Duration) { smartResumeSettleDelay = previous }(smartResumeSettleDelay)
+	smartResumeSettleDelay = time.Millisecond
+
+	power.SetDevicePaused(true)
+	defer power.SetDevicePaused(false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runs := make(chan struct{}, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runSmartTaskSchedule(ctx, []smartScheduledTask{{
+			initialDelay: time.Millisecond, interval: time.Hour,
+			run: func() { runs <- struct{}{} },
+		}}, func() bool { return true }, time.Millisecond, func() time.Duration { return 0 })
+	}()
+
+	// Let the task fall due while the scheduler is parked on the pause.
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-runs:
+		t.Fatal("maintenance ran while the device was paused")
+	default:
+	}
+
+	power.SetDevicePaused(false)
+	select {
+	case <-runs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a task that came due while paused was deferred a whole period, so a device that pauses often never runs it")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop")
+	}
+}

@@ -99,12 +99,7 @@ func newDoTClient(addr string, resolver resolver.Resolver, params map[string]str
 	if c.disableReuse {
 		maxIdle = 0
 	}
-	c.pool = newDNSConnectionPool(dnsConnectionPoolOptions{
-		maxOpen:     dnsMaxOpenConnections,
-		maxIdle:     maxIdle,
-		idleTimeout: dnsStreamIdleTimeout,
-		maxLifetime: dnsStreamMaxLifetime,
-	})
+	c.pool = newDNSStreamPool(maxIdle)
 	runtime.SetFinalizer(c, (*dnsOverTLS).Close)
 	return c
 }

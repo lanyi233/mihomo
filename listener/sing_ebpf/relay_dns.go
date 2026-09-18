@@ -9,6 +9,8 @@ import (
 
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/resolver"
+
+	D "github.com/miekg/dns"
 )
 
 // relayTCPDNS relays a hijacked TCP DNS connection into mihomo's own resolver
@@ -48,13 +50,19 @@ func (s *sharedRewrite) relaySharedUDPDNS(ctx context.Context, data []byte, clie
 		s.udpWarnings.originalDestination.warn(s.inbound.logWarn, "relay hijacked shared UDP DNS: ", err)
 		return
 	}
+	s.writeHijackedUDPReply(reply, client, clientState, destination)
+}
+
+// writeHijackedUDPReply sends an answer back to the client that asked, through
+// whichever reply path its binding says to use.
+func (s *sharedRewrite) writeHijackedUDPReply(reply []byte, client netip.AddrPort, clientState *sharedUDPClientState, destination netip.AddrPort) {
 	s.lifecycleAccess.RLock()
 	clientState.activity.touch()
 	binding, loaded := clientState.redirectBinding(destination)
 	if !loaded {
 		s.lifecycleAccess.RUnlock()
 		writer := &sharedRewritePacket{shared: s, client: client, clientState: clientState}
-		if _, err = writer.WriteBack(reply, net.UDPAddrFromAddrPort(destination)); err != nil {
+		if _, err := writer.WriteBack(reply, net.UDPAddrFromAddrPort(destination)); err != nil {
 			s.udpWarnings.cleanup.warn(s.inbound.logWarn, "write hijacked shared UDP DNS reply: ", err)
 		}
 		return
@@ -65,13 +73,31 @@ func (s *sharedRewrite) relaySharedUDPDNS(ctx context.Context, data []byte, clie
 	}
 }
 
-// relayHijackedDNS resolves one hijacked query. The query buffer is returned to
-// the pool as soon as the resolver has unpacked it; the reply is built into a
-// pooled buffer the caller returns after writing it.
-func relayHijackedDNS(query []byte) ([]byte, []byte, error) {
-	return relayHijackedDNSContext(context.Background(), query)
+// refusedDNSReply turns a hijacked query into a REFUSED answer.
+//
+// Dropping the datagram instead is indistinguishable from a dead server: a stub
+// resolver waits out its whole per-nameserver timeout, retransmitting into the
+// very burst that exhausted the budget, and only then tries the next server.
+// REFUSED makes it fail over immediately and stops the amplification. A query
+// that will not unpack gets nothing, because there is no header to answer with.
+func refusedDNSReply(query []byte) ([]byte, bool) {
+	var message D.Msg
+	if err := message.Unpack(query); err != nil || message.Response {
+		return nil, false
+	}
+	reply := new(D.Msg)
+	reply.SetRcode(&message, D.RcodeRefused)
+	reply.RecursionAvailable = true
+	packed, err := reply.Pack()
+	if err != nil {
+		return nil, false
+	}
+	return packed, true
 }
 
+// relayHijackedDNSContext resolves one hijacked query. The query buffer is
+// returned to the pool as soon as the resolver has unpacked it; the reply is
+// built into a pooled buffer the caller returns after writing it.
 func relayHijackedDNSContext(parent context.Context, query []byte) ([]byte, []byte, error) {
 	ctx, cancel := context.WithTimeout(parent, resolver.DefaultDnsRelayTimeout)
 	defer cancel()

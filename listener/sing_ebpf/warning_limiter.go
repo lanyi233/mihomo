@@ -60,4 +60,5 @@ type udpWarningLimiters struct {
 	packetInfo          warningLimiter
 	originalDestination warningLimiter
 	cleanup             warningLimiter
+	dnsRelay            warningLimiter
 }

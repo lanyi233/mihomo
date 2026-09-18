@@ -92,6 +92,7 @@ listeners:
     tc-priority: 1            # TC filter priority; 1 also enables TCX
     bypass-rule-set: []       # rule providers (behavior: ipcidr) bypassed in kernel
     bypass-tun-direct: true   # see "Coexisting with TUN"
+    fakeip-icmp: off          # off (default) | reply, see "FakeIP"
     local:
       data-plane: cgroup      # cgroup (default) | tc
       cgroup-path: ""         # cgroup v2 directory, empty = auto-detect (cgroup only)
@@ -137,6 +138,9 @@ Field behavior:
   maps. Only `behavior: ipcidr` providers contribute; others are skipped.
 - `bypass-tun-direct`: whether a destination this inbound bypasses is
   connected directly when a TUN listener claims it anyway. Defaults to true.
+- `fakeip-icmp`: `off` (default) leaves ICMP alone, `reply` answers ICMP Echo
+  Requests addressed to a fake-ip address in the kernel. See "FakeIP" for what
+  it costs and which data planes can carry it.
 - `local.data-plane`: `cgroup` attaches connect/sendmsg/recvmsg programs to the
   cgroup and rewrites destinations to an internal redirect address on
   loopback. `tc` attaches an egress program to the default interface and
@@ -180,6 +184,33 @@ size the kernel state maps; `shared.advanced.tc-priority` becomes
 `shared.data-plane`. `tcp-splice` and `shared.advanced.routing-mark` /
 `routing-table` no longer do anything and are reported once at startup.
 
+### What a config reload can change in place
+
+Rebuilding this inbound destroys every kernel map it owns -- the cgroup
+redirect table, the shared flow table, the TC assignment map, the UDP recovery
+table -- so every established redirect on the host and every tethered client
+breaks at once. Three options avoid that and are applied to the running
+inbound:
+
+- `udp-timeout`. The kernel compares it against each session's last-seen
+  stamp rather than storing a deadline, so a change reaches the sessions that
+  already exist, and the userspace sweep re-paces itself on the next round.
+- `bypass-rule-set`, as long as the list does not become empty or stop being
+  empty. The shared packet-rewrite backend sizes its bypass flow cache to a
+  single entry when nothing is bypassed, and that is fixed when the map is
+  created, so crossing that line still needs a rebuild.
+- `bypass-tun-direct`, which only republishes what a TUN listener reads.
+
+Changing anything else in the section -- or changing one of the three
+alongside something else -- rebuilds the inbound exactly as before. The split
+fails closed: an option added later forces a rebuild until it is explicitly
+classified.
+
+Rule-set *contents* never needed a reload at all. The listener resolves its
+`bypass-rule-set` tags by name each time it recompiles, so a provider that
+refreshes on its own interval reaches the kernel policy without anything else
+happening.
+
 ## Resource limits
 
 The recent performance changes add no required configuration keys. They reuse
@@ -190,8 +221,12 @@ rounds once per second, then returns to the normal idle-sweep interval. Active
 destination bindings are not hard-capped. Outstanding packets, DNS work and
 replies retain activity.
 
-TCP and UDP DNS relays share a fixed 256-task limit per inbound. Excess UDP
-queries are dropped; excess TCP connections are closed. Transparent UDP reply
+DNS relays have separate per-inbound budgets, because a TCP relay holds its slot
+for the whole connection while a UDP relay holds one for a single datagram: 256
+concurrent UDP queries and 128 hijacked TCP connections, of which no single
+source may hold more than 8 once the TCP budget is more than half spent. Excess
+UDP queries are dropped; excess TCP connections are closed. Both are logged at a
+limited rate. Transparent UDP reply
 sockets have 16 shards with a limit of 64 live sockets each, including retired
 sockets still leased by writers. A full shard with every socket leased rejects
 the reply. These limits are internal constants, not YAML options.
@@ -272,7 +307,7 @@ does not depend on stale pinned objects.
 
 ## Privileged integration tests
 
-The `privileged-integration` job in `.github/workflows/build-ebpf.yml` probes
+The `privileged-integration` job in `.github/workflows/ebpf.yml` probes
 the runner with `common/ebpf/check-kernel.sh` and marks the job SKIP when
 required BPF/cgroup features cannot be proven. GitHub-hosted runners are
 expected to SKIP because the probe cannot distinguish cgroup sockaddr attach
@@ -290,6 +325,26 @@ The suite creates temporary cgroups, loads programs, attaches traffic
 helpers, and cleans up all state on completion. After stopping mihomo on the
 same host, verify `bpftool prog show`, `bpftool map show`, and
 `bpftool link show` report no leftover objects.
+
+## Keeping the generated objects honest
+
+The kernel programs are compiled ahead of time and their objects are committed
+under `common/ebpf/internal/bpfgen`. Nothing that consumes them recompiles
+them: `go test -tags with_ebpf` and the release `go build` both embed whatever
+is in the tree. A `.bpf.c` edited without a regenerate therefore produces a
+binary running the previous kernel program while the source says otherwise.
+
+`make ebpf_check` is what catches that. It regenerates into a scratch
+directory and diffs, including `manifest.txt`, which records the exact Clang
+build the committed objects came from -- so a toolchain that drifts fails
+loudly rather than silently producing different programs. The `generate-check`
+job in `.github/workflows/ebpf.yml` runs it whenever `common/ebpf/**` changes.
+
+Regenerating locally needs that same toolchain:
+
+```bash
+ANDROID_NDK_HOME=/path/to/android-ndk-r29 make ebpf_generate
+```
 
 ## Repository automation prerequisites
 
@@ -387,3 +442,17 @@ meaning once the tunnel maps it back to its domain. This matters when the
 configured range sits inside a bypassed range, as `fake-ip-range: 100.64.0.0/10`
 does. The ranges follow `dns.fake-ip-range`/`fake-ip-range6` at runtime, so a
 config reload that changes them reaches a running inbound.
+
+A fake-ip address answers nothing on its own, so `ping` against a fake-ip
+destination times out even while the same domain is proxied fine. With
+`fakeip-icmp: reply` a separate eBPF object is attached beside the interception
+programs and turns an ICMP Echo Request addressed to a fake-ip address into an
+Echo Reply in the kernel, without the packet ever reaching the core. Nothing
+about reachability is being measured: the reply says only that the address is a
+fake-ip one, not that the domain behind it resolves or that its proxy is up.
+
+The reply programs run on a TC hook, so `reply` is rejected unless a fake-ip
+range is configured and at least one attachment can carry them --
+`local.data-plane: tc`, or shared interception under either `shared.data-plane`.
+In particular `local.data-plane: cgroup` with no shared interception cannot:
+its `connect()`/`sendmsg()` hooks never see ICMP.

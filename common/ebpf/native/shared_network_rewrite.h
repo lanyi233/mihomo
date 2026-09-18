@@ -40,10 +40,12 @@ INLINE int rewrite_ipv4(
             old_address,
             new_address,
 			4U) != 0) {
+		record_rewrite_failure();
 		return TC_ACT_SHOT;
 	}
 	if (l4_csum_replace(skb, checksum_offset, old_address, new_address, pseudo_header_checksum_flags(protocol, 4U, false)) != 0 ||
 		l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U, false)) != 0) {
+        record_rewrite_failure();
         return TC_ACT_SHOT;
     }
     /* Checksum helpers invalidate all prior packet bounds. */
@@ -81,13 +83,14 @@ INLINE int rewrite_ipv6(
         (const __be32 *)new_address,
         16U,
         0U);
-    if (address_diff < 0) return TC_ACT_SHOT;
+    if (address_diff < 0) { record_rewrite_failure(); return TC_ACT_SHOT; }
     __u32 address_offset = l3_offset + (source
         ? __builtin_offsetof(struct ipv6_header, source)
         : __builtin_offsetof(struct ipv6_header, destination));
     __u32 port_offset = l4_offset + (source ? 0U : 2U);
 	if (l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U, true)) != 0 ||
         l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U, true)) != 0) {
+        record_rewrite_failure();
         return TC_ACT_SHOT;
     }
     /* Checksum helpers invalidate all prior packet bounds. */

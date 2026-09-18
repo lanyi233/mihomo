@@ -25,7 +25,6 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 		data []byte
 	}
 
-
 	var deleteKeys []string
 	deleteKeyIdx := make(map[string]int)
 
@@ -118,7 +117,7 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 
 // 刷新队列中的操作到数据库
 func (s *Store) FlushQueue(force bool) {
-	ops := drainGlobalQueue(force)
+	ops := globalOperationQueue.drain(force)
 	if len(ops) == 0 {
 		return
 	}
@@ -194,7 +193,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	}
 
 	// 从队列获取结果
-	ops := getGlobalQueueSnapshot()
+	ops := globalOperationQueue.snapshot()
 	for _, op := range ops {
 		if op.Config != config {
 			continue

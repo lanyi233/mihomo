@@ -3,6 +3,7 @@
 package sing_ebpf
 
 import (
+	"net/netip"
 	"testing"
 
 	LC "github.com/metacubex/mihomo/listener/config"
@@ -34,6 +35,14 @@ func TestReadmeDocumentedValues(t *testing.T) {
 			t.Errorf("shared.data-plane %q 被拒绝: %v", plane, err)
 		}
 	}
+	for _, mode := range []string{"", "off", "reply"} {
+		if _, err := normalizeFakeIPICMP(mode); err != nil {
+			t.Errorf("fakeip-icmp %q 被拒绝: %v", mode, err)
+		}
+	}
+	if _, err := normalizeFakeIPICMP("on"); err == nil {
+		t.Error("fakeip-icmp 只有 off / reply 两个值，on 本应被拒绝")
+	}
 	if _, err := parseUIDRanges([]uint32{0, 1000}, []string{"10000:19999", "20000:20100"}); err != nil {
 		t.Errorf("README 写的 UID 范围被拒绝: %v", err)
 	}
@@ -56,6 +65,36 @@ func TestReadmeDocumentedValues(t *testing.T) {
 	}
 	if got := resolveUDPTimeout(300); got.Seconds() != 300 {
 		t.Errorf("udp-timeout 300 解析成了 %v", got)
+	}
+}
+
+// TestFakeIPICMPDocumentedRequirements pins the README's rule for when
+// fakeip-icmp: reply is accepted -- a configured fake-ip range plus an
+// attachment that can carry the reply program. The reply programs run on a TC
+// hook, which is what rules cgroup-only out.
+func TestFakeIPICMPDocumentedRequirements(t *testing.T) {
+	fakeIPv4 := netip.MustParsePrefix("198.18.0.0/16")
+	none := netip.Prefix{}
+	if err := validateFakeIPICMP(false, none, none, true, localDataPlaneCgroup, false, ""); err != nil {
+		t.Errorf("fakeip-icmp 关着时不该有任何限制: %v", err)
+	}
+	if err := validateFakeIPICMP(true, none, none, true, localDataPlaneTC, false, ""); err == nil {
+		t.Error("没配 fake-ip 段时 reply 本应被拒绝")
+	}
+	if err := validateFakeIPICMP(true, fakeIPv4, none, true, localDataPlaneTC, false, ""); err != nil {
+		t.Errorf("local.data-plane=tc 本应被接受: %v", err)
+	}
+	for _, plane := range []string{sharedDataPlanePacketRewrite, sharedDataPlaneSocketAssign} {
+		if err := validateFakeIPICMP(true, fakeIPv4, none, false, "", true, plane); err != nil {
+			t.Errorf("shared.data-plane=%s 本应被接受: %v", plane, err)
+		}
+	}
+	// cgroup 的 connect()/sendmsg() hook 看不到 ICMP，没有 shared 兜底就没人能回包。
+	if err := validateFakeIPICMP(true, fakeIPv4, none, true, localDataPlaneCgroup, false, ""); err == nil {
+		t.Error("local.data-plane=cgroup 且没开 shared 本应被拒绝")
+	}
+	if err := validateFakeIPICMP(true, fakeIPv4, none, true, localDataPlaneCgroup, true, sharedDataPlanePacketRewrite); err != nil {
+		t.Errorf("cgroup + shared 本应被接受: %v", err)
 	}
 }
 

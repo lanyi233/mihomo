@@ -15,6 +15,32 @@ import (
 
 const smartTaskReadyPollInterval = time.Second
 
+// smartResumeSettleDelay bounds how long a task that came due while the device
+// was paused waits once it resumes. A var so tests can shorten it.
+//
+// It is not zero. The pause is armed by the eBPF and TUN listeners reporting
+// that the default interface is gone, so a resume is the instant the network
+// came back -- rarely the instant it works. Probing then is worse than not
+// probing: a failed host-recovery probe re-blocks the node and extends its
+// backoff, spending budget to learn nothing. The scheduler's jitter adds up to
+// another 30s on top, which also keeps several groups from resuming in lockstep.
+var smartResumeSettleDelay = 30 * time.Second
+
+// resumeDelayFor is how long an overdue task waits after a resume.
+//
+// It used to wait a whole period. A phone that loses its default interface more
+// often than a task's own interval -- 30 minutes, for the host-status recovery
+// sweep -- therefore postponed that task on every resume and could go
+// indefinitely without ever probing a blocked node, which is the one thing that
+// returns a blocked node to service before its 24-hour TTL.
+func resumeDelayFor(period time.Duration) time.Duration {
+	delay := min(smartResumeSettleDelay, period)
+	if delay < time.Millisecond {
+		return time.Millisecond
+	}
+	return delay
+}
+
 type smartScheduledTask struct {
 	initialDelay time.Duration
 	interval     time.Duration
@@ -119,11 +145,7 @@ func runSmartTaskSchedule(
 			for idx := range states {
 				state := &states[idx]
 				if !state.finished && !state.next.After(now) {
-					delay := state.period
-					if state.runOnce {
-						delay = max(state.initialDelay, time.Millisecond)
-					}
-					state.next = now.Add(delay + spread)
+					state.next = now.Add(resumeDelayFor(state.period) + spread)
 				}
 			}
 			wasPaused = false

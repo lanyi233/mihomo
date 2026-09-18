@@ -148,3 +148,11 @@ func legacyIPv6Mode(section string, mode string, allowAuto bool) (bool, string, 
 	}
 	return false, "", E.New("unknown ", section, ".ipv6-mode: ", mode)
 }
+
+// resolveBypassTUNDirect reads bypass-tun-direct with its default applied. On
+// by default: a destination this inbound bypasses is one the user asked to keep
+// off the proxy, and letting TUN hand it to the rules instead is what makes a
+// bypassed address unreachable.
+func resolveBypassTUNDirect(configured *bool) bool {
+	return configured == nil || *configured
+}

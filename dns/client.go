@@ -70,32 +70,13 @@ func (c *client) dial(ctx context.Context, network, addr string) (net.Conn, erro
 
 func (c *client) initPools() {
 	c.poolOnce.Do(func() {
-		maxIdle := 8
-		if c.disableReuse {
-			maxIdle = 0
-		}
+		maxIdle := dnsPoolMaxIdle(c.disableReuse)
 		if c.schema == "udp" {
-			c.pool = newDNSConnectionPool(dnsConnectionPoolOptions{
-				maxOpen:     dnsMaxOpenConnections,
-				maxIdle:     maxIdle,
-				idleTimeout: dnsUDPIdleTimeout,
-				maxLifetime: dnsUDPMaxLifetime,
-				maxUses:     dnsUDPMaxUses,
-			})
-			c.tcpFallbackPool = newDNSConnectionPool(dnsConnectionPoolOptions{
-				maxOpen:     dnsMaxOpenConnections,
-				maxIdle:     maxIdle,
-				idleTimeout: dnsStreamIdleTimeout,
-				maxLifetime: dnsStreamMaxLifetime,
-			})
+			c.pool = newDNSUDPPool(maxIdle)
+			c.tcpFallbackPool = newDNSStreamPool(maxIdle)
 			return
 		}
-		c.pool = newDNSConnectionPool(dnsConnectionPoolOptions{
-			maxOpen:     dnsMaxOpenConnections,
-			maxIdle:     maxIdle,
-			idleTimeout: dnsStreamIdleTimeout,
-			maxLifetime: dnsStreamMaxLifetime,
-		})
+		c.pool = newDNSStreamPool(maxIdle)
 	})
 }
 

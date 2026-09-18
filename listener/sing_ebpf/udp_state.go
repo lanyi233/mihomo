@@ -22,19 +22,21 @@ const (
 	udpClientShardCount         = 16
 	udpReplyAliasLimit          = 64
 	udpReplySocketShardCapacity = 64
-	udpReplySocketTotalCapacity = udpClientShardCount * udpReplySocketShardCapacity
 )
 
 var errUDPReplySocketPoolBusy = errors.New("eBPF UDP reply socket pool has no idle slot")
 
 type udpClientTable struct {
-	clientShards [udpClientShardCount]udpClientShard
+	clientShards [udpClientShardCount]udpClientShard[udpClientState]
 }
 
-type udpClientShard struct {
+// udpClientShard is shared by the local and the shared-rewrite client tables:
+// they differ only in the state they hang off each client, and keeping one
+// shard type is what lets the sweep and expiry bookkeeping be written once.
+type udpClientShard[S any] struct {
 	sweep   udpSweepQueue
 	access  sync.RWMutex
-	clients map[netip.AddrPort]*udpClientState
+	clients map[netip.AddrPort]*S
 }
 
 type udpClientState struct {
@@ -58,6 +60,13 @@ type udpRedirectBinding struct {
 	redirectAddress netip.Addr
 	packetInfo      []byte
 	connected       bool
+	// sharedPath records which role's kernel rule selected this flow. The TC
+	// data plane carries local egress and shared socket-assignment flows on one
+	// listener, and the assignment that says which is only read for the first
+	// packet, so the answer has to live with the binding for every packet after
+	// it. dns-mode is configured per role, so a flow handled as the wrong one is
+	// relayed when it should have been forwarded, or the reverse.
+	sharedPath bool
 }
 
 func (t *udpClientTable) load(client netip.AddrPort) (*udpClientState, bool) {
@@ -84,6 +93,7 @@ func (t *udpClientTable) loadOrCreate(client netip.AddrPort) *udpClientState {
 	state := &udpClientState{
 		bindings:        make(map[netip.AddrPort]udpRedirectBinding),
 		cgroupOriginals: make(map[netip.Addr]commonEBPF.OriginalDestination),
+		lAddr:           newUDPClientAddr(client),
 	}
 	state.activity.touch()
 	shard.clients[client] = state
@@ -139,9 +149,8 @@ func (t *udpClientTable) setCgroupReplyBinding(client netip.AddrPort, expected *
 	return true
 }
 
-func (t *udpClientTable) clientShard(client netip.AddrPort) *udpClientShard {
-	port := client.Port()
-	return &t.clientShards[(port^port>>8)&(udpClientShardCount-1)]
+func (t *udpClientTable) clientShard(client netip.AddrPort) *udpClientShard[udpClientState] {
+	return &t.clientShards[shardIndexForAddrPort(client, udpClientShardCount)]
 }
 
 func (t *udpClientTable) setDirectBinding(
@@ -149,6 +158,7 @@ func (t *udpClientTable) setDirectBinding(
 	destination netip.AddrPort,
 	sourceMAC net.HardwareAddr,
 	socketCookie uint64,
+	sharedPath bool,
 ) {
 	state := t.loadOrCreate(client)
 	state.access.Lock()
@@ -157,7 +167,7 @@ func (t *udpClientTable) setDirectBinding(
 		state.sourceMAC = append(state.sourceMAC[:0], sourceMAC...)
 	}
 	state.socketCookie = socketCookie
-	state.bindings[destination] = udpRedirectBinding{}
+	state.bindings[destination] = udpRedirectBinding{sharedPath: sharedPath}
 }
 
 func (t *udpClientTable) setDirectReplyBinding(
@@ -208,12 +218,6 @@ func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState)
 	expected.replyAliasCount = 0
 	expected.access.Unlock()
 	return redirects
-}
-
-func (s *udpClientState) isCgroupDataPlane() bool {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return s.cgroupDataPlane
 }
 
 func sourcePacketInfo(address netip.Addr) []byte {
@@ -309,9 +313,20 @@ func (p *udpReplySocketPool) lease(
 	return udpReplySocketLease{shard: shard, entry: entry}, nil
 }
 
-func (p *udpReplySocketPool) shardIndex(source netip.AddrPort) int {
-	address := source.Addr().As16()
-	hash := uint32(source.Port()) * 0x9e3779b1
+// shardIndexForAddrPort mixes every address byte with the port, and is the one
+// placement function for all the sharded UDP tables. A port-only key collapses
+// onto a single shard whenever many distinct addresses share one port, which is
+// the normal case rather than the exotic one: reply sockets are keyed by
+// destination and those cluster on a handful of well-known ports, while client
+// keys collapse for any downstream application that dials from a fixed source
+// port (WireGuard, games) across many hosts.
+//
+// shardCount must be a power of two. This only changes how entries are spread;
+// nothing depends on which shard a key lands in, as long as every lookup and
+// insert goes through here.
+func shardIndexForAddrPort(addrPort netip.AddrPort, shardCount int) int {
+	address := addrPort.Addr().As16()
+	hash := uint32(addrPort.Port()) * 0x9e3779b1
 	for offset := 0; offset < len(address); offset += 4 {
 		hash ^= uint32(address[offset])<<24 |
 			uint32(address[offset+1])<<16 |
@@ -320,7 +335,11 @@ func (p *udpReplySocketPool) shardIndex(source netip.AddrPort) int {
 		hash *= 0x85ebca6b
 	}
 	hash ^= hash >> 16
-	return int(hash & (udpClientShardCount - 1))
+	return int(hash & uint32(shardCount-1))
+}
+
+func (p *udpReplySocketPool) shardIndex(source netip.AddrPort) int {
+	return shardIndexForAddrPort(source, udpClientShardCount)
 }
 
 func (l udpReplySocketLease) release() {
@@ -489,41 +508,36 @@ func (s *udpClientState) processSocketCookie() uint64 {
 	return s.socketCookie
 }
 
-// localAddr returns the address the tunnel keys its NAT table on. It is the
-// same for every packet of a client, so it is built once: formatting the
-// client address and allocating a net.UDPAddr per packet was pure overhead on
-// the read loop.
-func (s *udpClientState) localAddr(client netip.AddrPort) net.Addr {
-	s.access.RLock()
-	lAddr := s.lAddr
-	s.access.RUnlock()
-	if lAddr != nil {
-		return lAddr
-	}
-	s.access.Lock()
-	if s.lAddr == nil {
-		s.lAddr = N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client))
-	}
-	lAddr = s.lAddr
-	s.access.Unlock()
-	return lAddr
+// newUDPClientAddr builds the address the tunnel keys its NAT table on. Both
+// client tables go through it, so the local and shared data planes can never
+// end up keying NAT differently for the same client.
+func newUDPClientAddr(client netip.AddrPort) net.Addr {
+	return N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client))
 }
+
+// localAddr is fixed at construction from the client key, so reading it on the
+// packet path needs no lock: formatting the address and allocating a
+// net.UDPAddr per packet was pure overhead on the read loop.
+func (s *udpClientState) localAddr() net.Addr { return s.lAddr }
 
 // hasDirectBinding reports whether a TC client already has a validated
 // binding for destination, so the per-flow assignment lookup can be skipped
 // for the packets that follow the first one. Reply aliases do not count: they
 // were installed for a remote that answered, not for a flow the kernel
 // assigned.
-func (t *udpClientTable) hasDirectBinding(client netip.AddrPort, destination netip.AddrPort) bool {
+// hasDirectBinding also reports which role selected the flow, so the caller can
+// apply that role's dns-mode without re-reading the assignment per packet.
+func (t *udpClientTable) hasDirectBinding(client netip.AddrPort, destination netip.AddrPort) (bool, bool) {
 	state, loaded := t.load(client)
 	if !loaded {
-		return false
+		return false, false
 	}
 	state.access.RLock()
 	binding, loaded := state.bindings[destination]
 	ready := loaded && !binding.replyAlias && !state.closed && !state.cgroupDataPlane
+	sharedPath := ready && binding.sharedPath
 	state.access.RUnlock()
-	return ready
+	return ready, sharedPath
 }
 
 // replyBinding reads the reply binding and the data plane of the client in one

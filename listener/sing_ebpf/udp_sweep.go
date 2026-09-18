@@ -58,8 +58,12 @@ const udpIdleSweepBatch = 32
 // Snapshot the count, not the clients. Each shard's cursor survives between
 // passes; one pass examines each snapshotted slot at most once. New clients
 // need not be examined until the next pass.
+// remaining is sized from the shards it was snapshotted from rather than from a
+// shard-count constant: the two client tables carry separate constants, and an
+// array sized by one of them would silently mis-index the other if they ever
+// diverged.
 type udpSweepProgress struct {
-	remaining                    [udpClientShardCount]int
+	remaining                    []int
 	total, scanned, limit, shard int
 }
 
@@ -81,10 +85,10 @@ func (p *udpSweepProgress) nextBatch() (int, int) {
 	return idx, count
 }
 
-func (t *udpClientTable) sweepProgress(all bool) udpSweepProgress {
-	p := udpSweepProgress{limit: udpIdleSweepBudget}
-	for idx := range t.clientShards {
-		shard := &t.clientShards[idx]
+func sweepProgressOf[S any](shards []udpClientShard[S], all bool) udpSweepProgress {
+	p := udpSweepProgress{remaining: make([]int, len(shards)), limit: udpIdleSweepBudget}
+	for idx := range shards {
+		shard := &shards[idx]
 		shard.access.RLock()
 		p.remaining[idx] = shard.sweep.length
 		shard.access.RUnlock()
@@ -96,17 +100,10 @@ func (t *udpClientTable) sweepProgress(all bool) udpSweepProgress {
 	return p
 }
 
+func (t *udpClientTable) sweepProgress(all bool) udpSweepProgress {
+	return sweepProgressOf(t.clientShards[:], all)
+}
+
 func (t *sharedUDPClientTable) sweepProgress(all bool) udpSweepProgress {
-	p := udpSweepProgress{limit: udpIdleSweepBudget}
-	for idx := range t.clientShards {
-		shard := &t.clientShards[idx]
-		shard.access.RLock()
-		p.remaining[idx] = shard.sweep.length
-		shard.access.RUnlock()
-		p.total += p.remaining[idx]
-	}
-	if all {
-		p.limit = p.total
-	}
-	return p
+	return sweepProgressOf(t.clientShards[:], all)
 }

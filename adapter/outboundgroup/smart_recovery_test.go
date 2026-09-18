@@ -23,7 +23,7 @@ func TestHostRecoverySelectionIsBoundedAndFair(t *testing.T) {
 	s := &Smart{recoveryBackoff: make(map[string]hostRecoveryState)}
 	s.lastTrafficActivity.Store(now.UnixNano())
 
-	candidates := recoveryCandidates(20)
+	candidates := recoveryCandidates(2 * hostRecoveryProbeBudget)
 	first := s.selectHostRecoveryItems(candidates, nil, now)
 	second := s.selectHostRecoveryItems(candidates, nil, now)
 	if len(first) != hostRecoveryProbeBudget || len(second) != hostRecoveryProbeBudget {
@@ -37,6 +37,26 @@ func TestHostRecoverySelectionIsBoundedAndFair(t *testing.T) {
 		if _, duplicate := seen[item.key]; duplicate {
 			t.Fatalf("round-robin budget immediately repeated %q", item.key)
 		}
+	}
+}
+
+// The maintenance scheduler picks its jitter once and then keeps a fixed phase,
+// so an activity window shorter than the tick period lets a group that is used
+// in short regular bursts miss every single cycle.
+func TestHostRecoveryActiveWindowCoversAFullCycle(t *testing.T) {
+	if hostRecoveryActiveWindow < hostStatusCheckInterval {
+		t.Fatalf("activity window %v is shorter than the %v check interval", hostRecoveryActiveWindow, hostStatusCheckInterval)
+	}
+}
+
+// A blocked pair is excluded at dial time until the store drops it after
+// HostFailureNodeTTL (24h), so a full sweep of the blocked set has to fit
+// comfortably inside that window.
+func TestHostRecoverySweepsBlockedSetWellInsideTTL(t *testing.T) {
+	const blockedPairs = 400
+	ticks := (blockedPairs + hostRecoveryProbeBudget - 1) / hostRecoveryProbeBudget
+	if sweep := time.Duration(ticks) * hostStatusCheckInterval; sweep > 6*time.Hour {
+		t.Fatalf("sweeping %d blocked pairs takes %v", blockedPairs, sweep)
 	}
 }
 

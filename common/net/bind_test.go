@@ -61,6 +61,56 @@ func TestDNSBindPacketConnWaitReadReturnsRejectedBuffer(t *testing.T) {
 	}
 }
 
+// A proxy that declines to report the real source must not cost us the reply:
+// SOCKS5 servers are allowed to answer with 0.0.0.0:0, TUIC omits the address
+// on non-first fragments, and some protocols hand back a domain-form address.
+func TestDNSBindPacketConnAcceptsUnreportedSource(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		addr net.Addr
+	}{
+		{name: "socks5 unspecified", addr: &net.UDPAddr{IP: net.IPv4zero, Port: 0}},
+		{name: "unspecified v6", addr: &net.UDPAddr{IP: net.IPv6zero, Port: 0}},
+		{name: "tuic atyp none", addr: &net.UDPAddr{IP: nil, Port: 0}},
+		{name: "domain form", addr: M.ParseSocksaddrHostPort("dns.example", 53)},
+		{name: "missing", addr: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			packetConn := &scriptedPacketConn{packets: []scriptedPacket{
+				{data: []byte("reply"), addr: test.addr},
+			}}
+			conn := NewDNSBindPacketConn(packetConn, &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 53})
+
+			buffer := make([]byte, 16)
+			n, err := conn.Read(buffer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(buffer[:n]); got != "reply" {
+				t.Fatalf("reply was dropped: %q", got)
+			}
+		})
+	}
+}
+
+// An unresolvable target would make the filter reject every source, so it has
+// to stay off instead of blocking until the query deadline.
+func TestDNSBindPacketConnWithoutUsableTargetStaysPermissive(t *testing.T) {
+	packetConn := &scriptedPacketConn{packets: []scriptedPacket{
+		{data: []byte("reply"), addr: &net.UDPAddr{IP: net.ParseIP("192.0.2.2"), Port: 53}},
+	}}
+	conn := NewDNSBindPacketConn(packetConn, (*net.UDPAddr)(nil))
+
+	buffer := make([]byte, 16)
+	n, err := conn.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buffer[:n]); got != "reply" {
+		t.Fatalf("reply was dropped: %q", got)
+	}
+}
+
 func TestLegacyBindPacketConnKeepsPermissiveSourceBehavior(t *testing.T) {
 	packetConn := &scriptedPacketConn{packets: []scriptedPacket{
 		{data: []byte("legacy"), addr: &net.UDPAddr{IP: net.ParseIP("192.0.2.2"), Port: 53}},

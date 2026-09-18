@@ -233,6 +233,11 @@ MAP(tc_host_ipv4, struct sb_tc_ipv4_key, __u8, BPF_MAP_TYPE_HASH, 4096U);
 MAP(tc_host_ipv6, struct sb_tc_ipv6_key, __u8, BPF_MAP_TYPE_HASH, 4096U);
 MAP(tc_local_bypass_port, struct sb_tc_port_key, __u8, BPF_MAP_TYPE_HASH, 4096U);
 MAP(tc_shared_bypass_port, struct sb_tc_port_key, __u8, BPF_MAP_TYPE_HASH, 4096U);
+// Degradation counters for the paths below that give up on a packet without
+// saying so. Indexed by SB_TC_STAT_* (native/abi.h, where each key's
+// operational meaning is written down); same shape as shared_network.bpf.c's
+// shared_stats, and read the same way from Go -- summed across CPUs.
+MAP(tc_stats, __u32, __u64, BPF_MAP_TYPE_PERCPU_ARRAY, SB_TC_STAT_COUNT);
 
 static void *(*map_lookup)(void *map, const void *key) = (void *)BPF_FUNC_map_lookup_elem;
 static long (*map_update)(void *map, const void *key, const void *value, __u64 flags) =
@@ -252,6 +257,17 @@ static struct bpf_sock *(*sk_lookup_udp)(void *ctx, struct bpf_sock_tuple *tuple
 static long (*sk_assign)(void *ctx, struct bpf_sock *socket, __u64 flags) =
     (void *)BPF_FUNC_sk_assign;
 static void (*sk_release)(struct bpf_sock *socket) = (void *)BPF_FUNC_sk_release;
+
+// record_tc_stat advances one SB_TC_STAT_* counter, mirroring
+// shared_network.bpf.c's record_shared_stat exactly: a plain lookup and a
+// non-atomic increment, which is safe only because tc_stats is a PERCPU_ARRAY
+// and each CPU owns its own slot. Every caller is a path that has already
+// decided to stop handling the packet, so the extra lookup is never on a
+// forwarding hot path.
+INLINE void record_tc_stat(__u32 key) {
+    __u64 *counter = map_lookup(&tc_stats, &key);
+    if (counter != 0) *counter += 1U;
+}
 
 INLINE __u16 network_order16(__u16 value) {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -635,7 +651,10 @@ NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *co
     struct bpf_sock *socket = key->protocol == IPPROTO_TCP_VALUE
         ? lookup_tcp_socket(skb, key)
         : lookup_udp_socket(skb, control, key);
-    if (socket == 0) return TC_ACT_SHOT;
+    if (socket == 0) {
+        record_tc_stat(SB_TC_STAT_LISTENER_SOCKET_MISSING);
+        return TC_ACT_SHOT;
+    }
     struct sb_tc_assign_key assignment_key = *key;
     if (key->protocol == IPPROTO_UDP_VALUE && path == SB_TC_PATH_SHARED)
         assignment_key.interface_index = skb->ifindex;
@@ -652,12 +671,14 @@ NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *co
         existing->path != value.path || existing->source_mac_valid != value.source_mac_valid;
     if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
     if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
         sk_release(socket);
         return TC_ACT_SHOT;
     }
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
+        record_tc_stat(SB_TC_STAT_SK_ASSIGN_FAILED);
         map_delete(&tc_assignment, &assignment_key);
         return TC_ACT_SHOT;
     }
@@ -671,7 +692,10 @@ NOINLINE int assign_socket_legacy(struct __sk_buff *skb, const struct sb_tc_cont
     struct bpf_sock *socket = key->protocol == IPPROTO_TCP_VALUE
         ? lookup_tcp_socket_legacy(skb, control, key)
         : lookup_udp_socket(skb, control, key);
-    if (socket == 0) return TC_ACT_SHOT;
+    if (socket == 0) {
+        record_tc_stat(SB_TC_STAT_LISTENER_SOCKET_MISSING);
+        return TC_ACT_SHOT;
+    }
     struct sb_tc_assign_key assignment_key = *key;
     if (key->protocol == IPPROTO_UDP_VALUE && path == SB_TC_PATH_SHARED)
         assignment_key.interface_index = skb->ifindex;
@@ -688,12 +712,14 @@ NOINLINE int assign_socket_legacy(struct __sk_buff *skb, const struct sb_tc_cont
         existing->path != value.path || existing->source_mac_valid != value.source_mac_valid;
     if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
     if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
         sk_release(socket);
         return TC_ACT_SHOT;
     }
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
+        record_tc_stat(SB_TC_STAT_SK_ASSIGN_FAILED);
         map_delete(&tc_assignment, &assignment_key);
         return TC_ACT_SHOT;
     }
@@ -705,7 +731,10 @@ NOINLINE int assign_udp_socket(struct __sk_buff *skb, const struct sb_tc_control
     bool source_mac_valid = (path & SB_TC_PATH_SOURCE_MAC_VALID) != 0U;
     path &= ~SB_TC_PATH_SOURCE_MAC_VALID;
     struct bpf_sock *socket = lookup_udp_socket(skb, control, key);
-    if (socket == 0) return TC_ACT_SHOT;
+    if (socket == 0) {
+        record_tc_stat(SB_TC_STAT_LISTENER_SOCKET_MISSING);
+        return TC_ACT_SHOT;
+    }
     struct sb_tc_assign_key assignment_key = *key;
     assignment_key.interface_index = path == SB_TC_PATH_SHARED ? skb->ifindex : 0U;
     struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, &assignment_key);
@@ -721,12 +750,14 @@ NOINLINE int assign_udp_socket(struct __sk_buff *skb, const struct sb_tc_control
         existing->source_mac_valid != value.source_mac_valid;
     if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
     if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
         sk_release(socket);
         return TC_ACT_SHOT;
     }
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
+        record_tc_stat(SB_TC_STAT_SK_ASSIGN_FAILED);
         map_delete(&tc_assignment, &assignment_key);
         return TC_ACT_SHOT;
     }
@@ -743,13 +774,22 @@ INLINE void record_local_socket_cookie(const struct sb_tc_assign_key *key, __u64
 
 INLINE int redirect_local(struct __sk_buff *skb, const struct sb_tc_control *control, bool ethernet) {
     if (ethernet) {
-        if (skb_store_bytes(skb, 0U, control->delivery_mac, 6U, 0U) != 0) return TC_ACT_UNSPEC;
+        if (skb_store_bytes(skb, 0U, control->delivery_mac, 6U, 0U) != 0) {
+            record_tc_stat(SB_TC_STAT_DELIVERY_REWRITE_FAILED);
+            return TC_ACT_UNSPEC;
+        }
     } else {
         __be16 protocol = skb->protocol;
-        if (skb_change_head(skb, sizeof(struct ethernet_header), 0U) != 0) return TC_ACT_UNSPEC;
+        if (skb_change_head(skb, sizeof(struct ethernet_header), 0U) != 0) {
+            record_tc_stat(SB_TC_STAT_DELIVERY_REWRITE_FAILED);
+            return TC_ACT_UNSPEC;
+        }
         struct ethernet_header header = {.protocol = protocol};
         __builtin_memcpy(header.destination, control->delivery_mac, 6U);
-        if (skb_store_bytes(skb, 0U, &header, sizeof(header), 0U) != 0) return TC_ACT_SHOT;
+        if (skb_store_bytes(skb, 0U, &header, sizeof(header), 0U) != 0) {
+            record_tc_stat(SB_TC_STAT_DELIVERY_REWRITE_FAILED);
+            return TC_ACT_SHOT;
+        }
     }
     return redirect((int)control->delivery_ifindex, 0U);
 }
