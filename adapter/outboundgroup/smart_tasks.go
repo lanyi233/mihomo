@@ -9,8 +9,10 @@ import (
 	"github.com/metacubex/mihomo/component/power"
 	"github.com/metacubex/mihomo/component/smart"
 	"github.com/metacubex/mihomo/component/smart/lightgbm"
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
+	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
 const smartTaskReadyPollInterval = time.Second
@@ -285,8 +287,80 @@ func (r *smartGlobalTaskRun) cleanupOrphanedGroups() {
 	}
 }
 
+// closeStalledConnections closes the connections left stuck on members that
+// new dials already avoid.
+//
+// The degrade path sweeps once, when the degrade lands, and from then on the
+// member is excluded: nothing dials it, so nothing degrades it again. A
+// connection that was idle at that moment and sends into the dead relay later
+// was never looked at, and hung until the client or a keep-alive gave up --
+// over ten minutes behind a 600s keep-alive idle. This catches those, and only
+// those: a connection is closed when it has been waiting on a reply for
+// stalledReplyAfter and the group carrying it currently avoids the member it is
+// on. Idle connections and ones still getting answers are left alone, as is
+// everything on a member the group still dials.
+func (r *smartGlobalTaskRun) closeStalledConnections() {
+	now := time.Now()
+	type groupView struct {
+		proxyByName  map[string]C.Proxy
+		blockedNodes map[string]bool
+	}
+	var byName map[string][]*Smart
+	views := make(map[*Smart]*groupView)
+	defer func() {
+		for _, groups := range byName {
+			for _, s := range groups {
+				s.finishBackgroundWork()
+			}
+		}
+	}()
+
+	statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+		// Two atomic loads, and they reject nearly every connection, so they go
+		// before anything that walks the chain or reads the store.
+		info := tracker.Info()
+		if !info.AwaitingReply(now, stalledReplyAfter) {
+			return true
+		}
+		if byName == nil {
+			byName = r.admitGroupsByName()
+		}
+		chains := tracker.Chains()
+		for hop := 1; hop < len(chains); hop++ {
+			for _, s := range byName[chains[hop]] {
+				view := views[s]
+				if view == nil {
+					_, proxyByName := s.GetProxiesByName(false)
+					view = &groupView{proxyByName, s.store.GetBlockedNodes(s.Name(), s.configName)}
+					views[s] = view
+				}
+				if s.avoidsMember(chains[hop-1], info.Metadata, view.proxyByName, view.blockedNodes) {
+					closeStalled(tracker)
+					return true
+				}
+			}
+		}
+		return true
+	})
+}
+
+// admitGroupsByName indexes the registered groups that are not closing by
+// name, each admitted as background work; the caller finishes every one.
+func (r *smartGlobalTaskRun) admitGroupsByName() map[string][]*Smart {
+	r.groupsMu.Lock()
+	defer r.groupsMu.Unlock()
+	byName := make(map[string][]*Smart, len(r.groups))
+	for group := range r.groups {
+		if group.beginBackgroundWork() {
+			byName[group.Name()] = append(byName[group.Name()], group)
+		}
+	}
+	return byName
+}
+
 func (r *smartGlobalTaskRun) start() {
 	tasks := []smartScheduledTask{
+		{stalledSweepInterval, stalledSweepInterval, "Global stalled connections sweep", r.closeStalledConnections, false},
 		{5 * time.Minute, cleanupInterval, "Global orphaned groups clean up", r.cleanupOrphanedGroups, false},
 		{5 * time.Second, cacheParamAdjustInterval, "Global cache parameters adjustment", r.store.AdjustCacheParameters, false},
 		{5 * time.Minute, flushQueueInterval, "Global queues flush", func() { r.store.FlushQueue(true) }, false},

@@ -3,6 +3,7 @@ package outboundgroup
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/component/smart"
@@ -11,7 +12,7 @@ import (
 )
 
 // sweepTracker is the smallest thing statistic.Manager will index and
-// closeSameConnection will act on.
+// closeStalledConnections will act on.
 type sweepTracker struct {
 	id     string
 	info   *statistic.TrackerInfo
@@ -38,92 +39,210 @@ func (t *sweepTracker) AppendToChains(C.ProxyAdapter) {}
 func (t *sweepTracker) RemoteDestination() string     { return "" }
 func (t *sweepTracker) block() string                 { return t.info.Metadata.SmartBlock }
 
+// traffic stamps when the tracker last sent and last received, relative to now;
+// a zero duration leaves that direction never having carried anything.
+func (t *sweepTracker) traffic(now time.Time, sentAgo, receivedAgo time.Duration) *sweepTracker {
+	if sentAgo > 0 {
+		t.info.LastUpload.Store(now.Add(-sentAgo).UnixNano())
+	}
+	if receivedAgo > 0 {
+		t.info.LastDownload.Store(now.Add(-receivedAgo).UnixNano())
+	}
+	return t
+}
+
+// stuck stamps the tracker as having sent something long enough ago, with
+// nothing back since, to count as stalled.
+func (t *sweepTracker) stuck(now time.Time) *sweepTracker {
+	return t.traffic(now, 2*stalledReplyAfter, 3*stalledReplyAfter)
+}
+
 var _ statistic.Tracker = (*sweepTracker)(nil)
 
 func sweepGroup(name string) *Smart {
 	return &Smart{GroupBase: &GroupBase{Base: outbound.NewBase(outbound.BaseOption{Name: name})}}
 }
 
-// The non-force sweep closes every connection in the bucket that is not on the
-// winning node. Those victims used to be closed without the marker the force
-// sweep sets, so unlike force-closed connections they ran the full quality
-// check on the way out -- and a connection killed moments after it was
-// established has moved no bytes, which the zero-traffic rule reads as a broken
-// node and answers with a 24-hour block. Closing a connection is this group's
-// own decision; it is not evidence about the node that carried it.
-func TestSweepMarksEveryConnectionItCloses(t *testing.T) {
-	const target = "RuleSet [Proxy]"
-	const group = "smart-group"
-	s := sweepGroup(group)
-
-	winner := newSweepTracker("winner", target, "node-a", group)
-	loser := newSweepTracker("loser", target, "node-b", group)
-	for _, tracker := range []*sweepTracker{winner, loser} {
+func joinSweepTrackers(t *testing.T, trackers ...*sweepTracker) {
+	t.Helper()
+	for _, tracker := range trackers {
 		statistic.DefaultManager.Join(tracker)
-		defer statistic.DefaultManager.Leave(tracker)
-	}
-
-	dialer := &C.Metadata{UUID: "dialer", SmartTarget: target}
-	s.closeSameConnection(dialer, "node-a", target, "", false)
-
-	if !loser.closed {
-		t.Fatal("the sweep left a connection on a losing node open")
-	}
-	if loser.block() != "degraded" {
-		t.Fatalf("a connection the group closed itself is marked %q, so its close is read as the node's fault", loser.block())
-	}
-	if winner.closed {
-		t.Fatal("the sweep closed a connection already on the winning node")
-	}
-	if winner.block() != "normal" {
-		t.Fatalf("an untouched connection was marked %q", winner.block())
+		t.Cleanup(func() { statistic.DefaultManager.Leave(tracker) })
 	}
 }
 
-// The force sweep is the one that answers a degrade, and it takes the whole
-// bucket -- winning node included.
-func TestForceSweepTakesTheWholeTargetAndMarksIt(t *testing.T) {
+// A degrade closes what its node left stuck, and nothing that is still working:
+// not a connection on another node, not one that is idle, not one whose last
+// send was answered, and not one whose send is still within the wait. It used to
+// close the whole bucket on every node, so one degraded connection killed all
+// the rule's working traffic and the reconnect storm fed the next degrade.
+func TestDegradeClosesOnlyTheStuckConnectionsOnTheDegradedNode(t *testing.T) {
 	const target = "RuleSet [Proxy]"
 	const group = "smart-group"
 	s := sweepGroup(group)
+	now := time.Now()
 
-	onWinner := newSweepTracker("on-winner", target, "node-a", group)
-	elsewhere := newSweepTracker("elsewhere", target, "node-b", group)
-	for _, tracker := range []*sweepTracker{onWinner, elsewhere} {
-		statistic.DefaultManager.Join(tracker)
-		defer statistic.DefaultManager.Leave(tracker)
-	}
+	stuck := newSweepTracker("stuck", target, "node-a", group).stuck(now)
+	answered := newSweepTracker("answered", target, "node-a", group).traffic(now, 2*stalledReplyAfter, stalledReplyAfter)
+	waiting := newSweepTracker("still-waiting", target, "node-a", group).traffic(now, stalledReplyAfter/2, 3*stalledReplyAfter)
+	idle := newSweepTracker("idle", target, "node-a", group)
+	otherNode := newSweepTracker("other-node", target, "node-b", group).stuck(now)
+	joinSweepTrackers(t, stuck, answered, waiting, idle, otherNode)
 
 	dialer := &C.Metadata{UUID: "dialer", SmartTarget: target}
-	s.closeSameConnection(dialer, "node-a", target, "", true)
+	s.closeStalledConnections(dialer, "node-a", target, "")
 
-	for _, tracker := range []*sweepTracker{onWinner, elsewhere} {
+	if !stuck.closed {
+		t.Fatal("a connection stuck on the degraded node was left open")
+	}
+	if stuck.block() != "degraded" {
+		t.Fatalf("a connection the group closed itself is marked %q, so its close is read as the node's fault", stuck.block())
+	}
+	for _, tracker := range []*sweepTracker{answered, waiting, idle, otherNode} {
+		if tracker.closed {
+			t.Errorf("the degrade closed %q, which was not stuck on the degraded node", tracker.id)
+		}
+		if tracker.block() != "normal" {
+			t.Errorf("an untouched connection %q was marked %q", tracker.id, tracker.block())
+		}
+	}
+}
+
+// stallSweepGroup is a group with a member in each state the periodic sweep
+// distinguishes: healthy, failing its health check, blocked outright, and
+// blocked for one destination only.
+func stallSweepGroup(t *testing.T, group, blockedHost string) *Smart {
+	t.Helper()
+	const config = "config"
+	smart.InitCache()
+	smart.InitQueue()
+
+	s := sweepGroup(group)
+	s.configName = config
+	s.store = &smart.Store{}
+	s.maxFailedTimes = 1
+	s.hostFailLimit.Store(1_000)
+	s.providerProxies = []C.Proxy{
+		strategyTestProxy{name: "healthy", alive: true},
+		strategyTestProxy{name: "dead", alive: false},
+		strategyTestProxy{name: "blocked", alive: true},
+		strategyTestProxy{name: "host-blocked", alive: true},
+	}
+	s.providerVersions = []uint32{}
+	s.store.UpdateBlockedNodesCache(group, config, map[string]*smart.NodeState{
+		"blocked": {Name: "blocked", BlockedUntil: time.Now().Add(time.Hour).Unix()},
+	})
+	s.store.UpdateHostStatus(group, config, blockedHost, &C.Metadata{WildcardTarget: blockedHost},
+		"host-blocked", 1, 1_000, true, true, smart.BlockNoResponse)
+	return s
+}
+
+func (t *sweepTracker) to(wildcardTarget string) *sweepTracker {
+	t.info.Metadata.WildcardTarget = wildcardTarget
+	return t
+}
+
+// A degrade sweeps once, and from then on nothing dials the member it degraded,
+// so nothing degrades it again. A connection idle at that moment that sends
+// into the dead relay later was never looked at and hung until a keep-alive
+// gave up. The periodic sweep closes exactly those: stuck, on a member the
+// group now avoids -- and nothing that is idle, still answered, on a member
+// still in use, or somebody else's.
+func TestStalledSweepClosesOnlyWhatIsStuckOnAnAvoidedMember(t *testing.T) {
+	const (
+		target      = "RuleSet [TelegramIP]"
+		group       = "stall-sweep-group"
+		blockedHost = "149.154.167.41"
+		otherHost   = "91.108.56.194"
+	)
+	s := stallSweepGroup(t, group, blockedHost)
+	now := time.Now()
+
+	nested := newSweepTracker("stuck-nested", target, "dead", group).stuck(now).to(otherHost)
+	nested.chain = C.Chain{"dead", group, "outer-select"}
+	closes := []*sweepTracker{
+		newSweepTracker("stuck-on-dead", target, "dead", group).stuck(now).to(otherHost),
+		newSweepTracker("stuck-on-blocked", target, "blocked", group).stuck(now).to(otherHost),
+		newSweepTracker("stuck-on-host-block", target, "host-blocked", group).stuck(now).to(blockedHost),
+		nested,
+	}
+	keeps := []*sweepTracker{
+		newSweepTracker("stuck-on-healthy", target, "healthy", group).stuck(now).to(otherHost),
+		newSweepTracker("stuck-host-block-elsewhere", target, "host-blocked", group).stuck(now).to(otherHost),
+		newSweepTracker("answered-on-dead", target, "dead", group).traffic(now, 2*stalledReplyAfter, stalledReplyAfter).to(otherHost),
+		newSweepTracker("idle-on-dead", target, "dead", group).to(otherHost),
+		newSweepTracker("stuck-on-non-member", target, "gone", group).stuck(now).to(otherHost),
+		newSweepTracker("stuck-in-other-group", target, "dead", "another-group").stuck(now).to(otherHost),
+	}
+	joinSweepTrackers(t, append(append([]*sweepTracker{}, closes...), keeps...)...)
+
+	run := newSmartGlobalTaskRun(s.store)
+	run.add(s)
+	run.closeStalledConnections()
+
+	for _, tracker := range closes {
 		if !tracker.closed {
-			t.Fatalf("force sweep spared %q", tracker.id)
+			t.Errorf("%q was stuck on a member the group avoids and was left open", tracker.id)
+		} else if tracker.block() != "degraded" {
+			t.Errorf("%q was closed unmarked, so its close is read as the node's fault", tracker.id)
 		}
-		if tracker.block() != "degraded" {
-			t.Fatalf("force sweep left %q marked %q", tracker.id, tracker.block())
+	}
+	for _, tracker := range keeps {
+		if tracker.closed {
+			t.Errorf("the sweep closed %q", tracker.id)
 		}
+	}
+
+	// Every group the sweep admitted as background work was released again;
+	// otherwise closing the group would wait on the sweep forever.
+	s.disableBackgroundWork()
+	released := make(chan struct{})
+	go func() { s.waitBackgroundWork(); close(released) }()
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("the sweep left the group's background work admitted")
+	}
+}
+
+// A group that is closing has stopped admitting background work, and the sweep
+// must not act for it.
+func TestStalledSweepSkipsAClosingGroup(t *testing.T) {
+	const (
+		target = "RuleSet [TelegramIP]"
+		group  = "stall-sweep-closing-group"
+	)
+	s := stallSweepGroup(t, group, "149.154.167.41")
+	s.disableBackgroundWork()
+	stuck := newSweepTracker("stuck-on-dead", target, "dead", group).stuck(time.Now()).to("91.108.56.194")
+	joinSweepTrackers(t, stuck)
+
+	run := newSmartGlobalTaskRun(s.store)
+	run.add(s)
+	run.closeStalledConnections()
+
+	if stuck.closed {
+		t.Fatal("the sweep acted for a group that is closing")
 	}
 }
 
 // A connection belonging to another group shares the bucket but not the blame.
-func TestSweepIgnoresConnectionsOutsideTheGroup(t *testing.T) {
+func TestDegradeIgnoresConnectionsOutsideTheGroup(t *testing.T) {
 	const target = "RuleSet [Proxy]"
 	s := sweepGroup("smart-group")
+	now := time.Now()
 
-	foreign := newSweepTracker("foreign", target, "node-b", "another-group")
-	statistic.DefaultManager.Join(foreign)
-	defer statistic.DefaultManager.Leave(foreign)
+	foreign := newSweepTracker("foreign", target, "node-a", "another-group").stuck(now)
+	joinSweepTrackers(t, foreign)
 
 	dialer := &C.Metadata{UUID: "dialer", SmartTarget: target}
-	s.closeSameConnection(dialer, "node-a", target, "", true)
+	s.closeStalledConnections(dialer, "node-a", target, "")
 
 	if foreign.closed {
-		t.Fatal("the sweep closed a connection that is not in this group's chain")
+		t.Fatal("the degrade closed a connection that is not in this group's chain")
 	}
 	if foreign.block() != "normal" {
-		t.Fatalf("the sweep marked a connection outside the group as %q", foreign.block())
+		t.Fatalf("the degrade marked a connection outside the group as %q", foreign.block())
 	}
 }
 
@@ -333,15 +452,16 @@ func TestTheSafetyValveOnlyReportsClosesOnBlockedNodes(t *testing.T) {
 	}
 }
 
-// The sweep exists to move traffic onto a new winner. When the winner has not
-// moved there is nothing to move, and scanning anyway costs dial-rate x
-// bucket-size per dial -- and the bucket, keyed by the matched rule, grows with
-// the dial rate too. A connection a parallel dial placed elsewhere after the
-// winner settled now survives; that is working traffic, and killing it was the
-// churn this whole area is trying to stop.
-func TestAdoptingAnUnchangedWinnerDoesNotSweep(t *testing.T) {
+// liuran001/mihomo#2. Every Telegram DC matches one rule, so they share one
+// bucket, while the node a dial lands on depends on per-destination blocks. With
+// node-b excluded for one DC and node-a for another, their dials alternate the
+// bucket's winner between the two, and adopting a winner used to close every
+// connection in the bucket not on it: each DC's dial killed the other DC's
+// working connections, the client redialled, and the pair looped every few
+// seconds. A new winner steers later dials and must leave live traffic alone.
+func TestAdoptingAWinnerLeavesExistingConnectionsAlone(t *testing.T) {
 	const (
-		target = "RuleSet [Proxy]"
+		target = "RuleSet [TelegramIP]"
 		group  = "adopt-group"
 		config = "config"
 	)
@@ -351,28 +471,30 @@ func TestAdoptingAnUnchangedWinnerDoesNotSweep(t *testing.T) {
 	s := sweepGroup(group)
 	s.configName = config
 	s.store = &smart.Store{}
+	now := time.Now()
 
-	winner := &proxyNamed{name: "node-a"}
-	dialer := &C.Metadata{UUID: "dialer", SmartTarget: target, WildcardTarget: "example.com"}
+	nodeA, nodeB := &proxyNamed{name: "node-a"}, &proxyNamed{name: "node-b"}
+	toDCOne := &C.Metadata{UUID: "dial-dc-1", SmartTarget: target, WildcardTarget: "149.154.167.41"}
+	toDCTwo := &C.Metadata{UUID: "dial-dc-2", SmartTarget: target, WildcardTarget: "91.108.56.194"}
 
-	// First adopt: records the winner.
-	s.adoptUnwrapWinner(dialer, "", winner)
+	// Live traffic on both nodes, including a connection that looks stuck:
+	// winning a dial is no verdict on the node it is on either way.
+	onA := newSweepTracker("dc-1-on-a", target, "node-a", group).traffic(now, time.Second, time.Second/2)
+	onB := newSweepTracker("dc-2-on-b", target, "node-b", group).stuck(now)
+	joinSweepTrackers(t, onA, onB)
 
-	// A connection lands on another node afterwards.
-	straggler := newSweepTracker("straggler", target, "node-b", group)
-	statistic.DefaultManager.Join(straggler)
-	defer statistic.DefaultManager.Leave(straggler)
-
-	// Second adopt, same winner: nothing to consolidate.
-	s.adoptUnwrapWinner(dialer, "", winner)
-	if straggler.closed {
-		t.Fatal("a dial that changed nothing still swept the bucket")
+	for round := range 4 {
+		s.adoptUnwrapWinner(toDCOne, "", nodeA)
+		s.adoptUnwrapWinner(toDCTwo, "", nodeB)
+		if onA.closed || onB.closed {
+			t.Fatalf("round %d: adopting a winner closed a live connection (dc-1 closed=%v, dc-2 closed=%v)",
+				round, onA.closed, onB.closed)
+		}
 	}
 
-	// A winner that actually moves still sweeps.
-	s.adoptUnwrapWinner(dialer, "", &proxyNamed{name: "node-c"})
-	if !straggler.closed {
-		t.Fatal("a changed winner did not consolidate traffic onto it")
+	// The winner still moves: the next dial for the rule is steered to it.
+	if names, _ := s.store.GetUnwrapResult(group, config, target, "", toDCOne.WildcardTarget); len(names) == 0 || names[0] != "node-b" {
+		t.Fatalf("the bucket's winner is %v, want the most recent winner node-b", names)
 	}
 }
 

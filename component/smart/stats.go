@@ -116,6 +116,46 @@ type HostStatus struct {
 	LastCheck   int64                      `json:"last_check,omitempty"`
 	Blocked     bool                       `json:"blocked,omitempty"`
 	Codes       map[BlockCode]*CodeNodeSet `json:"codes,omitempty"`
+
+	// rev is bumped by every writer of Codes, under mu. view caches what
+	// GetHostStatus derived from the rev it saw; its nodes map is shared by
+	// every caller that hits it, so callers must treat it as read-only.
+	rev  atomic.Int64                      `json:"-"`
+	view atomic.TypedValue[hostStatusView] `json:"-"`
+}
+
+type hostStatusView struct {
+	rev     int64
+	limit   int
+	expire  int64
+	nodes   map[string]BlockCode
+	blocked bool
+}
+
+func buildHostStatusView(codes map[BlockCode]*CodeNodeSet, now int64, hostFailLimit int) (map[string]BlockCode, bool) {
+	var nodes map[string]BlockCode
+	blockingCount := 0
+
+	for code, codeSet := range codes {
+		if codeSet == nil {
+			continue
+		}
+		for nodeName, nodeEntry := range codeSet.Nodes {
+			if nodeEntry == 0 || nodeEntry > now {
+				if nodes == nil {
+					nodes = make(map[string]BlockCode)
+				}
+				if oldCode, exists := nodes[nodeName]; !exists || code < oldCode {
+					nodes[nodeName] = code
+				}
+			}
+			if code.Recoverable() && nodeEntry > now {
+				blockingCount++
+			}
+		}
+	}
+
+	return nodes, blockingCount > hostFailLimit
 }
 
 type ActiveTarget struct {
@@ -591,16 +631,20 @@ func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, i
 		return nil, nil, errors.New("empty target")
 	}
 
+	allStatsMap, err := s.GetAllStats(group, config)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return s.bestProxyForTargetFrom(allStatsMap, group, config, target, asnNumber, isUDP)
+}
+
+func (s *Store) bestProxyForTargetFrom(allStatsMap map[string]map[string][]byte, group, config, target, asnNumber string, isUDP bool) ([]string, []float64, error) {
 	now := time.Now().Unix()
 	minDecay := 0.4
 
 	getTimeDecay := func(lastUsedTime int64) float64 {
 		return GetTimeDecayWithCache(lastUsedTime, now, minDecay)
-	}
-
-	allStatsMap, err := s.GetAllStats(group, config)
-	if err != nil {
-		return nil, nil, err
 	}
 
 	weightType := WeightTypeTCP
@@ -863,6 +907,15 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 
 	items := make([]prefetchItem, 0, len(activeTargets))
 
+	hoistedStats, hoistedErr := s.GetAllStats(group, config)
+
+	bestFor := func(active ActiveTarget) ([]string, []float64, error) {
+		if hoistedErr == nil {
+			return s.bestProxyForTargetFrom(hoistedStats, group, config, active.Target, active.ASN, active.IsUDP)
+		}
+		return s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+	}
+
 	for _, active := range activeTargets {
 		var bestNodes []string
 		var bestWeights []float64
@@ -874,14 +927,14 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 				bestNodes = v.nodes
 				bestWeights = v.weights
 			} else {
-				bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+				bestNodes, bestWeights, err = bestFor(active)
 				asnCache[key] = asnCacheValue{
 					nodes:   bestNodes,
 					weights: bestWeights,
 				}
 			}
 		} else {
-			bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+			bestNodes, bestWeights, err = bestFor(active)
 		}
 
 		if err != nil || len(bestNodes) == 0 {
@@ -1265,30 +1318,29 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimi
 					}
 				}
 			}
+			hs.rev.Add(1)
 		})
+
 		hs.mu.RLock()
-		defer hs.mu.RUnlock()
-		blockingCount := 0
-		for code, codeSet := range hs.Codes {
-			if codeSet == nil {
-				continue
-			}
-			for nodeName, nodeEntry := range codeSet.Nodes {
-				if nodeEntry == 0 || nodeEntry > now {
-					if nodes == nil {
-						nodes = make(map[string]BlockCode)
-					}
-					if oldCode, exists := nodes[nodeName]; !exists || code < oldCode {
-						nodes[nodeName] = code
-					}
-				}
-				if code.Recoverable() && nodeEntry > now {
-					blockingCount++
-				}
-			}
+		lastCheck, lastFailure = hs.LastCheck, hs.LastFailure
+		rev := hs.rev.Load()
+		if cached := hs.view.Load(); cached.rev == rev && cached.limit == hostFailLimit && now < cached.expire {
+			nodes, blocked = cached.nodes, cached.blocked
+			hs.mu.RUnlock()
+			return nodes, lastCheck, lastFailure, blocked
 		}
-		blocked = blockingCount > hostFailLimit
-		return nodes, hs.LastCheck, hs.LastFailure, blocked
+		nodes, blocked = buildHostStatusView(hs.Codes, now, hostFailLimit)
+		hs.mu.RUnlock()
+
+		hs.view.Store(hostStatusView{
+			rev:     rev,
+			limit:   hostFailLimit,
+			expire:  now + hostStatusViewTTLSeconds,
+			nodes:   nodes,
+			blocked: blocked,
+		})
+
+		return nodes, lastCheck, lastFailure, blocked
 	}
 
 	failNodes, lastCheck, lastFailure, blocked = lookup(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
@@ -1298,15 +1350,16 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimi
 			continue
 		}
 		if extraNodes, _, _, _ := lookup(FormatDBKey(KeyTypeHostFailures, config, group, extraTarget)); len(extraNodes) > 0 {
-			if failNodes == nil {
-				failNodes = extraNodes
-			} else {
-				for k, v := range extraNodes {
-					if oldCode, exists := failNodes[k]; !exists || v < oldCode {
-						failNodes[k] = v
-					}
+			merged := make(map[string]BlockCode, len(failNodes)+len(extraNodes))
+			for k, v := range failNodes {
+				merged[k] = v
+			}
+			for k, v := range extraNodes {
+				if oldCode, exists := merged[k]; !exists || v < oldCode {
+					merged[k] = v
 				}
 			}
+			failNodes = merged
 		}
 	}
 
@@ -1381,6 +1434,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 	})
 
 	hs.mu.Lock()
+	hs.rev.Add(1)
 
 	if hs.Codes == nil {
 		hs.Codes = make(map[BlockCode]*CodeNodeSet)
@@ -1660,6 +1714,7 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 		}
 		if newBlocked := hostBlockingCount > hostFailLimit; newBlocked != cacheHS.Blocked {
 			cacheHS.Blocked = newBlocked
+			cacheHS.rev.Add(1)
 			if newData, merr := json.Marshal(cacheHS); merr == nil {
 				s.AppendToGlobalQueue(StoreOperation{
 					Type:   OpSaveHostFailures,

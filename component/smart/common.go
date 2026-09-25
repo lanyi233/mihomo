@@ -44,11 +44,13 @@ const (
 	MinTargetsLimit     = 500
 	MaxBatchThreshLimit = 300
 	MinBatchThreshLimit = 50
+	maxScanPrealloc     = 4096
 
 	RecordExpiredTime = 7 * 24 * time.Hour
 
-	HostFailureNodeTTL   = 24 * time.Hour
-	hostStatusRetryAfter = 4 * time.Hour
+	HostFailureNodeTTL       = 24 * time.Hour
+	hostStatusRetryAfter     = 4 * time.Hour
+	hostStatusViewTTLSeconds = 30
 
 	AllowedWeight = 0.4
 
