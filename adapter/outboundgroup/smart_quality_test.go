@@ -47,7 +47,7 @@ func TestNoResponseVerdictNeedsTheClientToHaveSentSomething(t *testing.T) {
 			}
 			_, isDegraded, _, blockCode := s.checkNodeQuality(
 				nil, metadata, nil, wildcardTarget, "example.com:443", node,
-				0.9, 0.9, 1_000, testCase.uploadTotal, 0, "tcp", "", false, 0, 0)
+				0.9, 0.9, 1_000, testCase.uploadTotal, 0, "tcp", false, 0, 0)
 
 			if isDegraded != testCase.wantDegraded || blockCode != testCase.wantCode {
 				t.Fatalf("degraded=%v code=%d, want %v and %d",

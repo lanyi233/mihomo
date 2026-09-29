@@ -98,6 +98,7 @@ type tunSchema struct {
 	EndpointIndependentNat                *bool           `yaml:"endpoint-independent-nat" json:"endpoint-independent-nat,omitempty"`
 	UDPTimeout                            *int64          `yaml:"udp-timeout" json:"udp-timeout,omitempty"`
 	ICMPTimeout                           *int64          `yaml:"icmp-timeout" json:"icmp-timeout,omitempty"`
+	CongestionController                  *string         `yaml:"congestion-controller" json:"congestion-controller,omitempty"`
 	FileDescriptor                        *int            `yaml:"file-descriptor" json:"file-descriptor"`
 
 	Inet4RouteAddress        *[]netip.Prefix `yaml:"inet4-route-address" json:"inet4-route-address,omitempty"`
@@ -264,6 +265,9 @@ func pointerOrDefaultTun(p *tunSchema, def LC.Tun) LC.Tun {
 		if p.ICMPTimeout != nil {
 			def.ICMPTimeout = *p.ICMPTimeout
 		}
+		if p.CongestionController != nil {
+			def.CongestionController = *p.CongestionController
+		}
 		if p.FileDescriptor != nil {
 			def.FileDescriptor = *p.FileDescriptor
 		}
@@ -370,10 +374,14 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 	listener.ReCreateRedir(pointerOrDefault(general.RedirPort, ports.RedirPort), tunnel.Tunnel)
 	listener.ReCreateTProxy(pointerOrDefault(general.TProxyPort, ports.TProxyPort), tunnel.Tunnel)
 	listener.ReCreateMixed(pointerOrDefault(general.MixedPort, ports.MixedPort), tunnel.Tunnel)
-	listener.ReCreateTun(pointerOrDefaultTun(general.Tun, listener.LastTunConf), tunnel.Tunnel)
+	listener.PatchTun(func(last LC.Tun) LC.Tun {
+		return pointerOrDefaultTun(general.Tun, last)
+	}, tunnel.Tunnel)
 	listener.ReCreateShadowSocks(pointerOrDefault(general.ShadowSocksConfig, ports.ShadowSocksConfig), tunnel.Tunnel)
 	listener.ReCreateVmess(pointerOrDefault(general.VmessConfig, ports.VmessConfig), tunnel.Tunnel)
-	listener.ReCreateTuic(pointerOrDefaultTuicServer(general.TuicServer, listener.LastTuicConf), tunnel.Tunnel)
+	listener.PatchTuic(func(last LC.TuicServer) LC.TuicServer {
+		return pointerOrDefaultTuicServer(general.TuicServer, last)
+	}, tunnel.Tunnel)
 
 	if general.Mode != nil {
 		tunnel.SetMode(*general.Mode)

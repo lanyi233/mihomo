@@ -90,7 +90,7 @@ func TestDegradeClosesOnlyTheStuckConnectionsOnTheDegradedNode(t *testing.T) {
 	joinSweepTrackers(t, stuck, answered, waiting, idle, otherNode)
 
 	dialer := &C.Metadata{UUID: "dialer", SmartTarget: target}
-	s.closeStalledConnections(dialer, "node-a", target, "")
+	s.closeStalledConnections(dialer, "node-a", target)
 
 	if !stuck.closed {
 		t.Fatal("a connection stuck on the degraded node was left open")
@@ -133,7 +133,7 @@ func stallSweepGroup(t *testing.T, group, blockedHost string) *Smart {
 		"blocked": {Name: "blocked", BlockedUntil: time.Now().Add(time.Hour).Unix()},
 	})
 	s.store.UpdateHostStatus(group, config, blockedHost, &C.Metadata{WildcardTarget: blockedHost},
-		"host-blocked", 1, 1_000, true, true, smart.BlockNoResponse)
+		"host-blocked", 1, 1_000, true, true, smart.BlockNoResponse, 0)
 	return s
 }
 
@@ -236,7 +236,7 @@ func TestDegradeIgnoresConnectionsOutsideTheGroup(t *testing.T) {
 	joinSweepTrackers(t, foreign)
 
 	dialer := &C.Metadata{UUID: "dialer", SmartTarget: target}
-	s.closeStalledConnections(dialer, "node-a", target, "")
+	s.closeStalledConnections(dialer, "node-a", target)
 
 	if foreign.closed {
 		t.Fatal("the degrade closed a connection that is not in this group's chain")
@@ -355,7 +355,7 @@ func TestACleanCloseOnABlockedNodeIsReportedAsChecked(t *testing.T) {
 			s.hostFailLimit.Store(testCase.hostFailLimit)
 
 			blocking := &C.Metadata{Host: "probe.example.com", WildcardTarget: wildcardTarget}
-			s.store.UpdateHostStatus(group, config, wildcardTarget, blocking, node, 1, 1_000, true, true, smart.BlockNoResponse)
+			s.store.UpdateHostStatus(group, config, wildcardTarget, blocking, node, 1, 1_000, true, true, smart.BlockNoResponse, 0)
 			if failNodes, _, _, _ := s.store.GetHostStatus(group, config, wildcardTarget, 1_000); failNodes[node] == 0 {
 				t.Fatal("fixture did not block the node")
 			}
@@ -366,7 +366,7 @@ func TestACleanCloseOnABlockedNodeIsReportedAsChecked(t *testing.T) {
 			}
 			_, isDegraded, checked, blockCode := s.checkNodeQuality(
 				nil, metadata, nil, wildcardTarget, "probe.example.com:443", node,
-				0.9, 0.9, 1_000, 1.0, 1.0, "tcp", "", false, 0, 0)
+				0.9, 0.9, 1_000, 1.0, 1.0, "tcp", false, 0, 0)
 
 			if isDegraded || blockCode != smart.BlockNone {
 				t.Fatalf("a clean close was judged degraded=%v code=%d", isDegraded, blockCode)
@@ -398,7 +398,7 @@ func TestTheSafetyValveStillRefusesToRecordAFailure(t *testing.T) {
 	s.hostFailLimit.Store(0)
 
 	blocking := &C.Metadata{Host: "probe.example.com", WildcardTarget: wildcardTarget}
-	s.store.UpdateHostStatus(group, config, wildcardTarget, blocking, node, 1, 1_000, true, true, smart.BlockNoResponse)
+	s.store.UpdateHostStatus(group, config, wildcardTarget, blocking, node, 1, 1_000, true, true, smart.BlockNoResponse, 0)
 
 	metadata := &C.Metadata{
 		Host: "probe.example.com", WildcardTarget: wildcardTarget,
@@ -406,7 +406,7 @@ func TestTheSafetyValveStillRefusesToRecordAFailure(t *testing.T) {
 	}
 	_, isDegraded, checked, blockCode := s.checkNodeQuality(
 		errors.New("connection reset"), metadata, nil, wildcardTarget, "probe.example.com:443", node,
-		0.9, 0.9, 1_000, 1.0, 1.0, "tcp", "", false, 0, 0)
+		0.9, 0.9, 1_000, 1.0, 1.0, "tcp", false, 0, 0)
 
 	if isDegraded || blockCode != smart.BlockNone {
 		t.Fatalf("the valve recorded a blocking verdict: degraded=%v code=%d", isDegraded, blockCode)
@@ -438,7 +438,7 @@ func TestTheSafetyValveOnlyReportsClosesOnBlockedNodes(t *testing.T) {
 	s.hostFailLimit.Store(0)
 
 	blocking := &C.Metadata{Host: "probe.example.com", WildcardTarget: wildcardTarget}
-	s.store.UpdateHostStatus(group, config, wildcardTarget, blocking, blocked, 1, 1_000, true, true, smart.BlockNoResponse)
+	s.store.UpdateHostStatus(group, config, wildcardTarget, blocking, blocked, 1, 1_000, true, true, smart.BlockNoResponse, 0)
 
 	metadata := &C.Metadata{
 		Host: "probe.example.com", WildcardTarget: wildcardTarget,
@@ -446,7 +446,7 @@ func TestTheSafetyValveOnlyReportsClosesOnBlockedNodes(t *testing.T) {
 	}
 	_, _, checked, _ := s.checkNodeQuality(
 		nil, metadata, nil, wildcardTarget, "probe.example.com:443", healthy,
-		0.9, 0.9, 1_000, 1.0, 1.0, "tcp", "", false, 0, 0)
+		0.9, 0.9, 1_000, 1.0, 1.0, "tcp", false, 0, 0)
 	if checked {
 		t.Fatal("a clean close on an unblocked node was reported as checked, which writes a host-status update with nothing to clear")
 	}
@@ -484,8 +484,8 @@ func TestAdoptingAWinnerLeavesExistingConnectionsAlone(t *testing.T) {
 	joinSweepTrackers(t, onA, onB)
 
 	for round := range 4 {
-		s.adoptUnwrapWinner(toDCOne, "", nodeA)
-		s.adoptUnwrapWinner(toDCTwo, "", nodeB)
+		s.adoptUnwrapWinner(toDCOne, nodeA)
+		s.adoptUnwrapWinner(toDCTwo, nodeB)
 		if onA.closed || onB.closed {
 			t.Fatalf("round %d: adopting a winner closed a live connection (dc-1 closed=%v, dc-2 closed=%v)",
 				round, onA.closed, onB.closed)
@@ -493,7 +493,7 @@ func TestAdoptingAWinnerLeavesExistingConnectionsAlone(t *testing.T) {
 	}
 
 	// The winner still moves: the next dial for the rule is steered to it.
-	if names, _ := s.store.GetUnwrapResult(group, config, target, "", toDCOne.WildcardTarget); len(names) == 0 || names[0] != "node-b" {
+	if names, _ := s.store.GetUnwrapResult(group, config, target); len(names) == 0 || names[0] != "node-b" {
 		t.Fatalf("the bucket's winner is %v, want the most recent winner node-b", names)
 	}
 }

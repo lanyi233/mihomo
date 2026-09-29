@@ -109,6 +109,12 @@ func testHealthCheck(t *testing.T, proxy C.Proxy, interval time.Duration, lazy b
 	return hc
 }
 
+// eventually bounds waits for a check that has to happen. It is far longer than
+// any interval here on purpose: what these tests catch is a timer that was
+// lost, which never fires, while a few intervals of headroom were not enough
+// on a loaded Windows runner, whose timers tick every ~15.6ms.
+const eventually = time.Second
+
 func waitHealthCheckCall(t *testing.T, calls <-chan string, timeout time.Duration) string {
 	t.Helper()
 	select {
@@ -136,7 +142,7 @@ func TestLazyHealthCheckStopsPeriodicWakeupsAndTouchRestarts(t *testing.T) {
 	}
 
 	hc.touch()
-	waitHealthCheckCall(t, proxy.calls, 4*interval)
+	waitHealthCheckCall(t, proxy.calls, eventually)
 }
 
 func TestLazyHealthCheckTouchDoesNotAllocate(t *testing.T) {
@@ -152,8 +158,8 @@ func TestNonLazyHealthCheckRemainsPeriodic(t *testing.T) {
 	testHealthCheck(t, proxy, interval, false)
 
 	waitHealthCheckCall(t, proxy.calls, time.Second)
-	waitHealthCheckCall(t, proxy.calls, 4*interval)
-	waitHealthCheckCall(t, proxy.calls, 4*interval)
+	waitHealthCheckCall(t, proxy.calls, eventually)
+	waitHealthCheckCall(t, proxy.calls, eventually)
 }
 
 func TestAutomaticHealthCheckPausesWhileManualCheckStillWorks(t *testing.T) {
@@ -171,7 +177,7 @@ func TestAutomaticHealthCheckPausesWhileManualCheckStillWorks(t *testing.T) {
 	}
 
 	hc.check()
-	waitHealthCheckCall(t, proxy.calls, interval)
+	waitHealthCheckCall(t, proxy.calls, eventually)
 	select {
 	case <-proxy.calls:
 		t.Fatal("automatic health check resumed while still paused")
@@ -179,7 +185,7 @@ func TestAutomaticHealthCheckPausesWhileManualCheckStillWorks(t *testing.T) {
 	}
 
 	power.SetDevicePaused(false)
-	waitHealthCheckCall(t, proxy.calls, 5*interval)
+	waitHealthCheckCall(t, proxy.calls, eventually)
 }
 
 func TestAutomaticHealthCheckUpdateIsCoalescedWhilePaused(t *testing.T) {
@@ -201,7 +207,7 @@ func TestAutomaticHealthCheckUpdateIsCoalescedWhilePaused(t *testing.T) {
 	}
 
 	power.SetDevicePaused(false)
-	waitHealthCheckCall(t, proxy.calls, 5*interval)
+	waitHealthCheckCall(t, proxy.calls, eventually)
 	select {
 	case <-proxy.calls:
 		t.Fatal("coalesced provider updates scheduled more than one lazy check")
@@ -224,8 +230,8 @@ func TestResumeAndProviderUpdateCannotLosePeriodicTimer(t *testing.T) {
 		// ready in either select order inside the scheduler.
 		hc.scheduleCheck()
 		power.SetDevicePaused(false)
-		waitHealthCheckCall(t, proxy.calls, 6*interval)
-		waitHealthCheckCall(t, proxy.calls, 6*interval)
+		waitHealthCheckCall(t, proxy.calls, eventually)
+		waitHealthCheckCall(t, proxy.calls, eventually)
 	}
 }
 
@@ -263,7 +269,7 @@ func TestCompletedSlowCheckRestoresPeriodicTimerAfterDuplicateTrigger(t *testing
 	hc.scheduleCheck()
 	time.Sleep(3 * interval)
 	close(proxy.release)
-	deadline := time.Now().Add(8 * interval)
+	deadline := time.Now().Add(eventually)
 	for proxy.calls.Load() < 2 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}

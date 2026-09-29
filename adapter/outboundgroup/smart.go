@@ -48,6 +48,7 @@ const (
 	hostStatusCheckInterval  = 30 * time.Minute
 	checkInterval            = 10 * time.Minute
 	prefetchInterval         = 15 * time.Minute
+	claimInterval            = 2 * time.Minute
 	flushQueueInterval       = 5 * time.Minute
 	rankingInterval          = 5 * time.Minute
 
@@ -89,6 +90,8 @@ const (
 	// past a few hours only delays recovery, and this map is lost on restart --
 	// after which the 64-per-tick budget is what bounds the catch-up.
 	hostRecoveryBackoffMax = 4 * time.Hour
+
+	siteKeyCacheLimit = 4096 // sites remembered as site keys, relearned after eviction
 )
 
 // A failed attempt downloads ASN.mmdb with a 90s timeout, and InitSmart runs
@@ -163,6 +166,11 @@ type Smart struct {
 
 	freshNodesGroup singleflight.Group[nodeResult]
 
+	ruleCountCache xsync.Map[string, int]
+	asnDiversity   xsync.Map[string, *xsync.Map[string, bool]]
+	asnRule        xsync.Map[string, string]
+	siteKeyCache   xsync.Map[string, bool]
+
 	suppressStats atomic.Bool
 	suppressCount atomic.Int64
 	suppressLast  atomic.Int64
@@ -175,6 +183,8 @@ type Smart struct {
 	recoveryCursor      atomic.Uint64
 	recoveryMu          sync.Mutex
 	recoveryBackoff     map[string]hostRecoveryState
+
+	probeThrottle smart.ProbeThrottle
 }
 
 type dialResult struct {
@@ -366,9 +376,17 @@ func (s *Smart) groupDialFailed(proxies []C.Proxy, err error) {
 	}
 }
 
-func smartDialBatchBounds(total, iteration int) (begin, end int) {
+// smartDialBatchBounds returns the dial batch of one iteration, a pinned target is
+// dialed one node at a time so it cannot end up on a second exit.
+func smartDialBatchBounds(total, iteration int, pinned bool) (begin, end int) {
 	if total <= 0 {
 		return 0, 0
+	}
+	if pinned {
+		if iteration >= total {
+			return 0, 0
+		}
+		return iteration, iteration + 1
 	}
 	if total == 1 {
 		return 0, 1
@@ -390,10 +408,9 @@ func smartDialBatchBounds(total, iteration int) (begin, end int) {
 	return begin, end
 }
 
-func (s *Smart) adoptUnwrapWinner(metadata *C.Metadata, asnNumber string, p C.Proxy) {
+func (s *Smart) adoptUnwrapWinner(metadata *C.Metadata, p C.Proxy) {
 	target := metadata.SmartTarget
-	wildcard := metadata.WildcardTarget
-	existing, _ := s.store.GetUnwrapResult(s.Name(), s.configName, target, asnNumber, wildcard)
+	existing, _ := s.store.GetUnwrapResult(s.Name(), s.configName, target)
 
 	// A new winner steers the dials that come after it, and nothing else. This
 	// used to also close every connection in the bucket that was not on the
@@ -407,20 +424,20 @@ func (s *Smart) adoptUnwrapWinner(metadata *C.Metadata, asnNumber string, p C.Pr
 	// that has actually stopped carrying traffic.
 	switch {
 	case len(existing) == 0:
-		s.store.StoreUnwrapResult(s.Name(), s.configName, target, asnNumber, wildcard, []C.Proxy{p})
+		s.store.StoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p})
 	case existing[0] == p.Name():
 		// Unchanged: nothing to record.
 	default:
-		s.store.DeleteUnwrapResult(s.Name(), s.configName, target, asnNumber, wildcard)
-		s.store.StoreUnwrapResult(s.Name(), s.configName, target, asnNumber, wildcard, []C.Proxy{p})
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
+		s.store.StoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p})
 	}
 }
 
 func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	s.markTrafficActivity()
 
-	getBatch := func(proxies []C.Proxy, i int) ([]C.Proxy, time.Duration) {
-		begin, end := smartDialBatchBounds(len(proxies), i)
+	getBatch := func(proxies []C.Proxy, i int, pinned bool) ([]C.Proxy, time.Duration) {
+		begin, end := smartDialBatchBounds(len(proxies), i, pinned)
 		if begin == end {
 			return nil, 0
 		}
@@ -447,10 +464,10 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		return batch, timeout
 	}
 
-	tryDial := func(proxies []C.Proxy, asnNumber string) (C.Conn, error) {
+	tryDial := func(proxies []C.Proxy, pinned bool) (C.Conn, error) {
 		var finalErr error
 		for i := 0; i < maxRetries; i++ {
-			batch, timeout := getBatch(proxies, i)
+			batch, timeout := getBatch(proxies, i, pinned)
 			if len(batch) == 0 {
 				break
 			}
@@ -466,22 +483,22 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 				}
 				finalErr = err
 			} else {
-				s.adoptUnwrapWinner(metadata, asnNumber, p)
+				s.adoptUnwrapWinner(metadata, p)
 				s.onDialSuccess()
 				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
 			}
 		}
 
-		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 
 		s.groupDialFailed(proxies, finalErr)
 
 		return nil, finalErr
 	}
 
-	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
+	proxies, pinned := s.selectProxies(metadata, s.GetProxies(true))
 
-	return tryDial(proxies, asnNumber)
+	return tryDial(proxies, pinned)
 }
 
 func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
@@ -489,7 +506,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 
 	var finalErr error
 
-	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
+	proxies, _ := s.selectProxies(metadata, s.GetProxies(true))
 
 	limit := len(proxies)
 	if limit > maxSelected {
@@ -529,7 +546,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 				continue
 			}
 
-			s.adoptUnwrapWinner(metadata, asnNumber, proxy)
+			s.adoptUnwrapWinner(metadata, proxy)
 			s.onDialSuccess()
 			return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
 		}
@@ -539,7 +556,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		}
 	}
 
-	s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+	s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 
 	s.groupDialFailed(proxies, finalErr)
 
@@ -907,37 +924,58 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	return selected
 }
 
-// node selection
-func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Proxy, string) {
+// selectProxies returns the nodes to dial and whether the target is already pinned to
+// one node: a pinned target is dialed node by node, an unpinned one may race on its
+// first dial, which is the only moment a key can show more than one exit.
+func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Proxy, bool) {
 	// attach ASN info
 	asnNumber := s.getASNCode(metadata)
-	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+	dstIP := ""
+	if metadata.Host == "" {
+		dstIP = metadata.DstIP.String()
+	}
+	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, dstIP)
 	metadata.WildcardTarget = wildcardTarget
 	if metadata.SmartTarget == "" {
 		metadata.SmartTarget = wildcardTarget
+	}
+	needsASNKey := s.preferASN && s.needsASNKey(metadata.SmartTarget, asnNumber)
+	if claimedRule, ok := s.claimedRule(asnNumber, needsASNKey); ok {
+		metadata.SmartTarget = claimedRule
+	} else {
+		// a shared or unknown network cannot identify the site, so the site is kept as its key
+		site := ""
+		if needsASNKey && metadata.Host != "" {
+			if asnNumber == "" || smart.SharedASNs[asnNumber] {
+				s.recordSiteKey(metadata, wildcardTarget)
+			} else if _, recorded := s.siteKeyCache.Load(wildcardTarget); recorded {
+				site = wildcardTarget
+			}
+		}
+		metadata.SmartTarget = smart.SmartTargetKey(s.preferASN, asnNumber, metadata.SmartTarget, wildcardTarget, site, needsASNKey)
 	}
 
 	if s.selected != "" {
 		for _, p := range proxies {
 			if p.Name() == s.selected {
-				return []C.Proxy{p}, asnNumber
+				return []C.Proxy{p}, true
 			}
 		}
 	}
 
 	// use prefetch cache or compute in real time
 	computeFreshNodes := func(isUDP bool) ([]string, []float64) {
-		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
+		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, isUDP); len(proxiesName) > 0 {
 			return proxiesName, weights
 		}
-		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
+		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, isUDP); err == nil && len(proxiesName) > 0 {
 			return proxiesName, weights
 		}
 		return nil, nil
 	}
 
 	computeFreshSingleFlight := func(isUDP bool) ([]string, []float64) {
-		sfKey := fmt.Sprintf("%s|%s|%v", metadata.SmartTarget, asnNumber, isUDP)
+		sfKey := fmt.Sprintf("%s|%v", metadata.SmartTarget, isUDP)
 		res, _, _ := s.freshNodesGroup.Do(sfKey, func() (nodeResult, error) {
 			names, weights := computeFreshNodes(isUDP)
 			return nodeResult{names: names, weights: weights}, nil
@@ -959,29 +997,38 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 			}
 		}
 		if len(resultProxies) > 0 {
-			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, resultProxies)
+			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, resultProxies)
 		}
 	}
 
-	trySelector := func(isUDP bool) ([]string, []float64) {
+	trySelector := func(isUDP bool) ([]string, []float64, bool) {
 		// check the unwrap cache
-		if proxiesName, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(proxiesName) > 0 {
+		if proxiesName, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget); len(proxiesName) > 0 {
 			if expired && s.beginBackgroundWork() {
 				go func() {
 					defer s.finishBackgroundWork()
 					refreshUnwrapCache(isUDP)
 				}()
 			}
-			return proxiesName, nil
+			return proxiesName, nil, true
 		}
-		return computeFreshSingleFlight(isUDP)
+		names, weights := computeFreshSingleFlight(isUDP)
+		return names, weights, false
 	}
 
 	isUDP := metadata.NetWork == C.UDP
-	resultNames, resultWeights := trySelector(isUDP)
-	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP)
+	resultNames, resultWeights, pinned := trySelector(isUDP)
 
-	return result, asnNumber
+	// a pin that cannot serve this network leaves it to the other one, so the candidates are
+	// taken per network instead; the winner of this dial still replaces the pin
+	if pinned && isUDP && len(resultNames) > 0 && lo.ContainsBy(proxies, func(p C.Proxy) bool {
+		return p.Name() == resultNames[0] && !p.SupportUDP()
+	}) {
+		resultNames, resultWeights = computeFreshSingleFlight(isUDP)
+		pinned = false
+	}
+
+	return s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP), pinned
 }
 
 func (s *Smart) InitSmart() {
@@ -1458,22 +1505,7 @@ func formatTimeUnit(val float64) string {
 // log record
 func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadata *C.Metadata, baseWeight, priorityFactor float64,
 	addressDisplay, proxyName string, connectTime int64, latency int64, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate float64,
-	connectionDuration int64, asnNumber string, ModelPredicted bool, lossRate, cumulLossRate float64) {
-
-	var tcpAsnWeight, udpAsnWeight float64
-
-	if asnNumber != "" {
-		tcpAsnWeightKey := smart.WeightTypeTCPASN + ":" + asnNumber
-		udpAsnWeightKey := smart.WeightTypeUDPASN + ":" + asnNumber
-		if record.Weights != nil {
-			if w, ok := record.Weights[tcpAsnWeightKey]; ok {
-				tcpAsnWeight = w
-			}
-			if w, ok := record.Weights[udpAsnWeightKey]; ok {
-				udpAsnWeight = w
-			}
-		}
-	}
+	connectionDuration int64, ModelPredicted bool, lossRate, cumulLossRate float64) {
 
 	weightSource := "Traditional"
 	if ModelPredicted {
@@ -1485,11 +1517,11 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 		statusStr = "failed"
 	}
 
-	log.Debugln("[Smart] Connection status: [%s], Updated weights: (Model: [%s], TCP: [%.4f], UDP: [%.4f], TCP ASN: [%.4f], UDP ASN: [%.4f], Base: [%.4f], Priority: [%.2f]) "+
+	log.Debugln("[Smart] Connection status: [%s], Updated weights: (Model: [%s], TCP: [%.4f], UDP: [%.4f], Base: [%.4f], Priority: [%.2f]) "+
 		"For (Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s]) "+
 		"- Current: (Connect: [%s], Latency: [%s], LossRate: [%.2f%%], Up: [%s], Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Duration: [%s]) "+
 		"- History: (Success: [%d], Failure: [%d], EMA Connect: [%s], EMA Latency: [%s], Cumul LossRate: [%.2f%%], Total Up: [%s], Total Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Avg Duration: [%s])",
-		statusStr, weightSource, record.Weights[smart.WeightTypeTCP], record.Weights[smart.WeightTypeUDP], tcpAsnWeight, udpAsnWeight, baseWeight, priorityFactor,
+		statusStr, weightSource, record.Weights[smart.WeightTypeTCP], record.Weights[smart.WeightTypeUDP], baseWeight, priorityFactor,
 		s.Name(), proxyName, metadata.NetWork.String(), addressDisplay,
 		formatTimeUnit(float64(connectTime)),
 		formatTimeUnit(float64(latency)),
@@ -1630,13 +1662,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	weightType := smart.WeightTypeTCP
-	if asnNumber != "" {
-		if isUDP {
-			weightType = smart.WeightTypeUDPASN + ":" + asnNumber
-		} else {
-			weightType = smart.WeightTypeTCPASN + ":" + asnNumber
-		}
-	} else if isUDP {
+	if isUDP {
 		weightType = smart.WeightTypeUDP
 	}
 
@@ -1656,6 +1682,12 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		atomicRecord.Add("failure", int64(1))
 	default:
 		atomicRecord.Add("success", int64(1))
+		if asnNumber != "" && !smart.SharedASNs[asnNumber] {
+			if kind := smart.ClassifyTargetName(target); kind == smart.TargetKindRuleName || kind == smart.TargetKindService {
+				atomicRecord.AddASNEvidence(asnNumber)
+				s.store.RecordASNEvidence(s.Name(), s.configName, target, asnNumber)
+			}
+		}
 	}
 
 	if connectTime > 0 {
@@ -1729,15 +1761,14 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		err, metadata, proxy, wildcardTarget,
 		addressDisplay, proxyName, calculatedWeight, oldWeight,
 		connectionDuration, uploadTotalMB, downloadTotalMB,
-		networkStr, asnNumber, isUDP, lossRate, emaLossRate)
+		networkStr, isUDP, lossRate, emaLossRate)
 
 	// block node for the specific domain/IP (wildcardTarget + SmartTarget two-level records)
-	failedBlock := s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode)
+	failedBlock := s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode, 0)
 
-	// average weight (adapted for target adjusting to rule-based and ASN-based cases)
 	newWeight := updateEMAFloat(oldWeight, adjWeight)
 	atomicRecord.Set("lastUsed", time.Now().Unix())
-	atomicRecord.SetWeight(weightType, newWeight, isUDP)
+	atomicRecord.SetWeight(weightType, newWeight)
 	statsSnapshot := atomicRecord.CreateStatsSnapshot(cacheKey)
 	// Queued under the lock: the queue keeps the last write per key, so two
 	// closes on this node racing to append would otherwise let the older
@@ -1750,8 +1781,8 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	locked = false
 
 	if isDegraded || failedBlock {
-		s.closeStalledConnections(metadata, proxyName, target, asnNumber)
-		s.store.DeleteUnwrapResult(s.Name(), s.configName, target, asnNumber, metadata.WildcardTarget)
+		s.closeStalledConnections(metadata, proxyName, target)
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
 	}
 
 	if s.collectData {
@@ -1771,7 +1802,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	if debugEnabled {
 		s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight/priorityFactor, priorityFactor, addressDisplay, proxyName,
-			connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnNumber, ModelPredicted, lossRate, cumulLossRate)
+			connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, ModelPredicted, lossRate, cumulLossRate)
 	}
 }
 
@@ -1790,7 +1821,7 @@ func (s *Smart) submitConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		// it; this path did not, and a connection whose first read had already
 		// failed before the sweep reached it was blamed with code 3 anyway.
 		if markCloseFailure && err != nil && metadata.SmartBlock != "degraded" {
-			s.markNodeFailure(metadata, proxy.Name(), true, true, smart.BlockDialFailure)
+			s.markNodeFailure(metadata, proxy.Name(), true, true, smart.BlockDialFailure, 0)
 		}
 		s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, err)
 	}()
@@ -1881,13 +1912,11 @@ func (s *Smart) checkNodeQuality(
 	addressDisplay, proxyName string,
 	newWeight, oldWeight float64,
 	connectionDuration int64, uploadTotal, downloadTotal float64,
-	networkType string, asnNumber string, isUDP bool, lossRate, emaLossRate float64) (float64, bool, bool, smart.BlockCode) {
+	networkType string, isUDP bool, lossRate, emaLossRate float64) (float64, bool, bool, smart.BlockCode) {
 
 	if s.selected != "" {
 		return newWeight, false, false, smart.BlockNone
 	}
-
-	now := time.Now().Unix()
 
 	// user manual block
 	if metadata.SmartBlock == "blocked" {
@@ -1901,7 +1930,7 @@ func (s *Smart) checkNodeQuality(
 		return oldWeight, false, false, smart.BlockNone
 	}
 
-	wtFailNodes, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, int(s.hostFailLimit.Load()), metadata.SmartTarget)
+	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, int(s.hostFailLimit.Load()), metadata.SmartTarget)
 
 	// The safety valve: so many nodes are blocked for this target that
 	// filterProxies has started letting blocked ones back into the pool, and no
@@ -1953,40 +1982,14 @@ func (s *Smart) checkNodeQuality(
 		return newWeight, true, true, smart.BlockNoResponse
 	}
 
-	// abnormal status code detection
-	if downloadTotal < 0.03 && metadata.Host != "" && metadata.DstPort == 443 && !isUDP && metadata.Type != C.INNER {
-		var failure bool
-		var checked bool
-		// A probe is a live HTTPS request through the proxy -- a fresh
-		// transport, a TLS handshake, up to three redirects, a 10s client
-		// timeout -- and it runs with this connection's shard lock held. The
-		// rate limit is what keeps that bounded.
-		//
-		// The second clause used to remove the limit outright for 300s after
-		// any failure on this target, so during exactly the churn that produces
-		// failures, every qualifying close launched its own probe: unbounded,
-		// while the scheduled path doing the same work budgets itself to 64
-		// probes per half hour. Recent trouble now shortens the interval rather
-		// than removing it, so the eagerness survives and the storm does not.
-		probeInterval := int64(300)
-		if now-wtLastFailure < 300 {
-			probeInterval = 30
-		}
-		if now-wtLastCheck > probeInterval {
-			checked = true
-			status, ok, err := s.StatusTest(proxy, metadata.Host)
-			if err == nil {
-				failure = !ok
-				if failure {
-					log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected abnormal response [%d]...",
-						s.Name(), proxyName, networkType, addressDisplay, status)
-				}
-			}
-		}
-		if failure {
-			return newWeight, true, checked, smart.BlockAbnormalStatus
-		}
-		return newWeight, false, checked, smart.BlockNone
+	// Whether a near-empty HTTPS close was answered with an error or limit page
+	// is probed after the close, off this goroutine and outside the (target,
+	// node) stats lock, and rate limited per node, per target and globally;
+	// probeAfterClose records whatever it finds. It used to be a synchronous
+	// probe here, under that lock.
+	if smart.ResponseProbeEligible(metadata, downloadTotal, isUDP) {
+		s.probeAfterClose(metadata, proxy)
+		return newWeight, false, false, smart.BlockNone
 	}
 
 	// high packet loss detection
@@ -1999,15 +2002,18 @@ func (s *Smart) checkNodeQuality(
 	return newWeight, false, false, smart.BlockNone
 }
 
-func (s *Smart) markNodeFailure(metadata *C.Metadata, proxyName string, isDegraded bool, checked bool, blockCode smart.BlockCode) bool {
+// markNodeFailure records a node failure for the host and for the target, otherwise every
+// host of a rule set picks its own fallback node. ttl, when set, bounds how long the
+// block lasts; see UpdateHostStatus.
+func (s *Smart) markNodeFailure(metadata *C.Metadata, proxyName string, isDegraded bool, checked bool, blockCode smart.BlockCode, ttl time.Duration) bool {
 	wildcardTarget := metadata.WildcardTarget
 	target := metadata.SmartTarget
 
-	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, int(s.hostFailLimit.Load()), isDegraded, checked, blockCode)
+	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, int(s.hostFailLimit.Load()), isDegraded, checked, blockCode, ttl)
 
 	if hostStatusAppliesToEveryScope(isDegraded, failedBlock, checked, blockCode) {
 		if target != "" && target != wildcardTarget {
-			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, int(s.hostFailLimit.Load()), isDegraded, checked, blockCode)
+			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, int(s.hostFailLimit.Load()), isDegraded, checked, blockCode, ttl)
 		}
 	}
 
@@ -2040,13 +2046,11 @@ func hostStatusAppliesToEveryScope(isDegraded, failedBlock, checked bool, blockC
 // all the rule's working traffic and the reconnect storm fed the next degrade.
 // A connection that is on another node, idle, or still getting answers is not
 // stuck, whatever happened to its neighbour.
-func (s *Smart) closeStalledConnections(metadata *C.Metadata, proxyName, target, asnNumber string) {
+func (s *Smart) closeStalledConnections(metadata *C.Metadata, proxyName, target string) {
 	if proxyName == "" {
 		return
 	}
 	now := time.Now()
-	// Loop-invariant: depends only on asnNumber.
-	cdnASN := asnNumber != "" && smart.CdnASNs[asnNumber]
 	statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
 		if id == metadata.UUID {
 			return true
@@ -2063,13 +2067,6 @@ func (s *Smart) closeStalledConnections(metadata *C.Metadata, proxyName, target,
 			return true
 		}
 		if !tracker.Info().AwaitingReply(now, stalledReplyAfter) {
-			return true
-		}
-		if asnNumber != "" {
-			if !cdnASN && s.getASNCode(tracker.Info().Metadata) != asnNumber {
-				return true
-			}
-		} else if s.getASNCode(tracker.Info().Metadata) != "" {
 			return true
 		}
 		closeStalled(tracker)
@@ -2264,15 +2261,19 @@ func (s *Smart) checkHostStatus() {
 				if !ok {
 					continue
 				}
-				status, okRes, err := s.StatusTest(p, it.host)
-				s.recordHostRecoveryResult(it.key, err == nil && okRes, time.Now())
 				metadata := &C.Metadata{Host: it.host}
-				if err == nil && okRes {
-					s.store.UpdateHostStatus(s.Name(), s.configName, it.wildcardTarget, metadata, it.nodeName, s.maxFailedTimes, int(s.hostFailLimit.Load()), false, true, 0)
-					log.Debugln("[Smart] Recover Group: [%s] - Node: [%s] for Host: [%s] with HTTP Status: [%d]", s.Name(), it.nodeName, it.host, status)
-				} else if err == nil {
-					s.store.UpdateHostStatus(s.Name(), s.configName, it.wildcardTarget, metadata, it.nodeName, s.maxFailedTimes, int(s.hostFailLimit.Load()), true, true, 2)
-					log.Debugln("[Smart] Recover Group: [%s] - Node: [%s] for Host: [%s] still abnormal with HTTP Status: [%d]", s.Name(), it.nodeName, it.host, status)
+				verdict := s.probeVerdict(p, it.host)
+				s.recordHostRecoveryResult(it.key, verdict.Action == smart.VerdictReachable, time.Now())
+				limit := int(s.hostFailLimit.Load())
+				switch verdict.Action {
+				case smart.VerdictReachable:
+					s.store.UpdateHostStatus(s.Name(), s.configName, it.wildcardTarget, metadata, it.nodeName, s.maxFailedTimes, limit, false, true, smart.BlockNone, 0)
+					log.Debugln("[Smart] Recheck Group: [%s] - Node: [%s] - Host: [%s] recovered [%s]", s.Name(), it.nodeName, it.host, verdict.Reason)
+				case smart.VerdictRecord:
+					s.store.UpdateHostStatus(s.Name(), s.configName, it.wildcardTarget, metadata, it.nodeName, s.maxFailedTimes, limit, true, true, smart.BlockAbnormalStatus, verdict.TTL)
+					log.Debugln("[Smart] Recheck Group: [%s] - Node: [%s] - Host: [%s] avoided for [%s]: [%s]", s.Name(), it.nodeName, it.host, verdict.TTL, verdict.Reason)
+				default:
+					log.Debugln("[Smart] Recheck Group: [%s] - Node: [%s] - Host: [%s] left unchanged [%s]", s.Name(), it.nodeName, it.host, verdict.Reason)
 				}
 			}
 		}()
@@ -2290,15 +2291,81 @@ sendLoop:
 	wg.Wait()
 }
 
-func (s *Smart) StatusTest(proxy C.Proxy, host string) (uint16, bool, error) {
+// The verdict lands after its connection is gone, outside the (target, node) stats lock, so the pin,
+// the membership and the stop-loss have to be re-checked before anything is written.
+func (s *Smart) probeAfterClose(metadata *C.Metadata, proxy C.Proxy) {
+	now := time.Now()
+	if !s.probeThrottle.AllowNode(metadata.WildcardTarget, proxy.Name(), now) {
+		return
+	}
+	if !smart.AllowGlobalProbe(now) {
+		return
+	}
+	done, ok := smart.TryStartProbe()
+	if !ok {
+		return
+	}
+
+	if !s.beginBackgroundWork() {
+		done()
+		return
+	}
+
+	clone := metadata.Clone()
+	nodeName := proxy.Name()
+	go func() {
+		defer s.finishBackgroundWork()
+		defer done()
+
+		verdict := s.probeVerdict(proxy, clone.Host)
+		if verdict.Action == smart.VerdictIgnore {
+			log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] ignored answer [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
+			return
+		}
+		if !s.probeThrottle.AllowHostRecord(clone.Host, verdict, time.Now()) {
+			log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] kept, no node reaches the host [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
+			return
+		}
+		if s.selected != "" || !lo.ContainsBy(s.GetProxies(false), func(p C.Proxy) bool { return p.Name() == nodeName }) {
+			return
+		}
+		if _, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, clone.WildcardTarget, int(s.hostFailLimit.Load()), clone.SmartTarget); wtBlocked {
+			return
+		}
+
+		if verdict.Action == smart.VerdictReachable {
+			s.markNodeFailure(clone, nodeName, false, true, smart.BlockNone, 0)
+			log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] recovered [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
+			return
+		}
+
+		s.probeThrottle.NoteFailure(clone.WildcardTarget, nodeName, time.Now())
+		s.markNodeFailure(clone, nodeName, true, true, smart.BlockAbnormalStatus, verdict.TTL)
+		// Only what is stuck on the node: see closeStalledConnections.
+		s.closeStalledConnections(clone, nodeName, clone.SmartTarget)
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, clone.SmartTarget)
+		log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] avoided for [%s]: [%s]", s.Name(), nodeName, clone.Host, verdict.TTL, verdict.Reason)
+	}()
+}
+
+func (s *Smart) probeVerdict(proxy C.Proxy, host string) smart.Verdict {
+	prober, ok := proxy.(smart.StatusProber)
+	if !ok {
+		return smart.Verdict{Action: smart.VerdictIgnore, Reason: "no probe support"}
+	}
+
 	parent := s.ctx
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(parent, C.DefaultTCPTimeout)
+	ctx, cancel := context.WithTimeout(parent, smart.ProbeTimeout)
 	defer cancel()
-	url := "https://" + host + "/?z=" + strconv.FormatInt(rand.Int63(), 10)
-	return proxy.StatusTest(ctx, url)
+
+	result, err := prober.StatusProbe(ctx, smart.ProbeURL(host))
+	if err != nil {
+		return smart.ClassifyProbeError(err)
+	}
+	return smart.ClassifyResponse(result.StatusCode, result.Header, time.Now())
 }
 
 func (s *Smart) getPriorityFactor(proxyName string) float64 {
@@ -2448,6 +2515,106 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 		return metadata.DstIPASN[:idx]
 	}
 	return metadata.DstIPASN
+}
+
+// recordSiteKey marks a site as keyed by itself, so its later dials key by the
+// site rather than by the network they happened to resolve to.
+//
+// Upstream also closed the site's open connections that still keyed by a
+// network, to converge the service on one exit at once. That is the sweep this
+// fork removed from adoptUnwrapWinner (liuran001/mihomo#2): a key change steers
+// the dials after it and says nothing against the node a working connection is
+// on, so the existing connections are left to finish on their own.
+func (s *Smart) recordSiteKey(metadata *C.Metadata, site string) {
+	if site == "" {
+		return
+	}
+	if _, recorded := s.siteKeyCache.Load(site); recorded {
+		return
+	}
+	if s.siteKeyCache.Size() >= siteKeyCacheLimit {
+		return
+	}
+	s.siteKeyCache.LoadOrStore(site, true)
+}
+
+func (s *Smart) needsASNKey(target, asn string) bool {
+	ruleCount := 0
+	if payload, ok := smart.RuleSetPayload(target); ok {
+		if cached, loaded := s.ruleCountCache.Load(payload); loaded {
+			ruleCount = cached
+		} else if rp, ok := tunnel.RuleProviders()[payload]; ok && rp != nil {
+			if ruleCount = rp.Count(); ruleCount > 0 {
+				s.ruleCountCache.Store(payload, ruleCount)
+			}
+		}
+	}
+	// Only a provider-defined rule name is judged by its diversity; every other
+	// kind is decided by its name alone. Counting for all of them kept a set per
+	// domain in asnDiversity for the life of the group, which nothing reads.
+	diversity := 0
+	if smart.ClassifyTargetName(target) == smart.TargetKindRuleName {
+		diversity = s.asnDiversityOf(target, asn)
+	}
+	return smart.NeedsASNKey(target, ruleCount, diversity)
+}
+
+// asnDiversityOf counts the unrelated networks a target was seen on, which is how a
+// rule set with a provider defined name is told apart from a collection.
+func (s *Smart) asnDiversityOf(target, asn string) int {
+	if asn == "" || smart.SharedASNs[asn] {
+		return 0
+	}
+	set, _ := s.asnDiversity.LoadOrStoreFn(target, func() *xsync.Map[string, bool] {
+		return xsync.NewMap[string, bool]()
+	})
+	if _, loaded := set.Load(asn); !loaded && set.Size() < smart.BroadASNDiversity {
+		set.Store(asn, true)
+	}
+	return set.Size()
+}
+
+// claimedRule returns the service rule that owns this network, so that a host of the
+// same service which matched a broad rule keeps the exit of the service.
+func (s *Smart) claimedRule(asn string, needsASNKey bool) (string, bool) {
+	if !s.preferASN || !needsASNKey || asn == "" {
+		return "", false
+	}
+	rule, ok := s.asnRule.Load(asn)
+	if !ok || rule == "" || rule == smart.ASNClaimAmbiguous {
+		return "", false
+	}
+	return rule, true
+}
+
+// claimASNEvidence rebuilds the network to service rule claims from the evidence
+// collected per target (see TargetASNEvidence), it runs on its own timer.
+func (s *Smart) claimASNEvidence() {
+	// claimedRule consults the claims only under prefer-asn, and building them
+	// decodes every stats record of the group.
+	if !s.preferASN {
+		return
+	}
+	// An empty result still has to go through: it is what clears the claims
+	// whose evidence has aged out.
+	claims := smart.ClaimedASNRules(s.store.TargetASNEvidence(s.Name(), s.configName))
+
+	s.asnRule.Range(func(asn, _ string) bool {
+		if _, ok := claims[asn]; !ok {
+			s.asnRule.Delete(asn)
+		}
+		return true
+	})
+
+	ambiguous := 0
+	for asn, rule := range claims {
+		if rule == smart.ASNClaimAmbiguous {
+			ambiguous++
+		}
+		s.asnRule.Store(asn, rule)
+	}
+
+	log.Debugln("[Smart] Group: [%s] - network claims updated: [%d] networks, [%d] ambiguous", s.Name(), len(claims), ambiguous)
 }
 
 func (s *Smart) Close() error {

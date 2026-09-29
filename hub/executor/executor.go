@@ -104,7 +104,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
-	updateDNS(cfg.DNS, cfg.General.IPv6)
+	releaseDNSCache := updateDNS(cfg.DNS, cfg.General.IPv6)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
 	updateListeners(cfg.General, cfg.Listeners, force)
 	updateTun(cfg.General) // tun should not care "force"
@@ -117,6 +117,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	loadProvider(cfg.Providers)
 	updateProfile(cfg)
 	loadProvider(cfg.RuleProviders)
+	releaseDNSCache() // every 'rule-set:' nameserver-policy can match now
 	runtime.GC()
 	tunnel.OnRunning()
 	updateUpdater(cfg)
@@ -256,7 +257,10 @@ func storeFakeIPRanges(c *config.DNS) {
 	resolver.StoreFakeIPRanges(ipv4, ipv6)
 }
 
-func updateDNS(c *config.DNS, generalIPv6 bool) {
+// updateDNS returns the function that lets the new resolver cache answers.
+// Call it only once the rule providers have loaded; dns.Resolvers.HoldCache
+// explains why.
+func updateDNS(c *config.DNS, generalIPv6 bool) (releaseCache func()) {
 	// Publish the fake-ip ranges before anything can read them back: the eBPF
 	// inbound compiles them into a kernel policy when it starts, and listeners
 	// are (re)created right after this.
@@ -268,7 +272,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		resolver.ProxyServerHostResolver = nil
 		resolver.DirectHostResolver = nil
 		dns.ReCreateServer("", nil, nil)
-		return
+		return func() {}
 	}
 
 	ipv6 := c.IPv6 && generalIPv6
@@ -289,6 +293,9 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		CacheAlgorithm:       c.CacheAlgorithm,
 		CacheMaxSize:         c.CacheMaxSize,
 	})
+	// Held before the resolver is published below, so no answer routed by a
+	// nameserver-policy whose rule sets are still empty reaches the cache.
+	r.HoldCache()
 	m := dns.NewEnhancer(dns.EnhancerConfig{
 		IPv6:          ipv6,
 		EnhancedMode:  c.EnhancedMode,
@@ -326,6 +333,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	lc := inbound.NewListenConfig()
 	lc.SetRouteMark(c.ListenRoutingMark)
 	dns.ReCreateServer(c.Listen, lc, s)
+	return r.ReleaseCache
 }
 
 func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
@@ -411,10 +419,18 @@ func updateUpdater(cfg *config.Config) {
 
 //go:linkname temporaryUpdateGeneral github.com/metacubex/mihomo/config.temporaryUpdateGeneral
 func temporaryUpdateGeneral(general *config.General) func() {
+	// Hold mux from here until the rollback, so no ApplyConfig runs while a
+	// parse has its general applied. The rollback restores the general found
+	// here; an ApplyConfig in between -- the startup apply racing a PUT
+	// /configs, a reload racing a profile validation -- was silently undone,
+	// e.g. geodata-mode reset to false under rules built for geodata, which
+	// sends the next GEOIP match to an MMDB file that may not exist.
+	mux.Lock()
 	oldGeneral := GetGeneral()
 	updateGeneral(general, false)
 	return func() {
 		updateGeneral(oldGeneral, false)
+		mux.Unlock()
 	}
 }
 

@@ -49,3 +49,22 @@ func TestInitCollectorKeepsExistingHandlesValid(t *testing.T) {
 		t.Fatalf("collector size=%d, want %d", got, want)
 	}
 }
+
+// Reaching the size limit stops collection until the file is deleted, but a
+// reload that raises the limit has to resume it.
+func TestReconfigureRaisedLimitResumesCollection(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "samples.csv")
+	collector := &DataCollector{
+		dataPath:           dataPath,
+		smartCollectorSize: defaultSmartCollectorSize,
+		sizeLimited:        true,
+	}
+	t.Cleanup(func() { collector.Close() })
+
+	if err := collector.reconfigure(dataPath, 2*defaultSmartCollectorSize); err != nil {
+		t.Fatalf("reconfigure collector: %v", err)
+	}
+	if collector.sizeLimited {
+		t.Fatal("a raised limit left collection stopped")
+	}
+}

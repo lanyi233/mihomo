@@ -72,7 +72,6 @@ type cgroupRuntime struct {
 	host_ipv6_map_fd            int
 	socket_release_supported    bool
 	coarse_time_supported       bool
-	socket_storage_supported    bool
 	enable_tcp                  bool
 	enable_udp                  bool
 	uid_policy                  bool
@@ -80,6 +79,10 @@ type cgroupRuntime struct {
 	bypass_ipv4_policy          bool
 	bypass_ipv6_policy          bool
 	bypass_port_policy          bool
+
+	// displaced holds, per slot, the program another owner had attached
+	// exclusively and the exclusive fallback replaced; detach puts it back.
+	displaced [cgroupProgramCount]*CiliumEBPF.Program
 }
 
 type CgroupBackend struct {
@@ -197,10 +200,8 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	}
 	socketReleaseSupported := false
 	coarseTimeSupported := false
-	socketStorageSupported := false
 	if config.EnableUDP {
 		coarseTimeSupported = features.HaveProgramHelper(CiliumEBPF.CGroupSockAddr, asm.FnKtimeGetCoarseNs) == nil
-		socketStorageSupported = probeCgroupSocketStorageSupport()
 		socketReleaseSupported, err = probeSocketReleaseSupport(int(cgroupFile.Fd()))
 		if err != nil {
 			_ = cgroupFile.Close()
@@ -220,7 +221,6 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		bypass_port_policy:       len(policy.localBypassPortEntries) > 0,
 		socket_release_supported: socketReleaseSupported,
 		coarse_time_supported:    coarseTimeSupported,
-		socket_storage_supported: socketStorageSupported,
 	}
 	if err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries), config.SelfBypassMap); err != nil {
 		_ = closeMaps(runtimeState.maps)

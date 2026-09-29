@@ -22,6 +22,7 @@ import (
 
 type LoadBalanceOption struct {
 	Strategy string `group:"strategy,omitempty"`
+	HashKey  string `group:"hash-key,omitempty"`
 }
 
 type LoadBalance struct {
@@ -35,6 +36,10 @@ type LoadBalance struct {
 type strategyFn = func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy
 
 var errStrategy = errors.New("unsupported strategy")
+var errHashKey = errors.New("unsupported hash-key")
+
+// keyFn derives the value a hashing strategy pins a request on.
+type keyFn = func(metadata *C.Metadata) string
 
 func getKey(metadata *C.Metadata) string {
 	if metadata == nil {
@@ -74,6 +79,39 @@ func getKeyWithSrcAndDst(metadata *C.Metadata) string {
 
 func stickySessionKey(src, dst string) string {
 	return fmt.Sprintf("%d:%s%d:%s", len(src), src, len(dst), dst)
+}
+
+// getKeyWithInUser pins on the authenticated inbound user instead of on an
+// address. Both address-derived keys assume one client's traffic to one
+// destination is one unit of work, which is false for a client whose single
+// unit of work walks several destinations: the hash moves with the host, and
+// the egress IP changes underneath a session the destination is tracking.
+// The inbound user is the only identity the client itself controls, and
+// `IN-USER` rules already match on it -- hence the option value `in-user`,
+// which names the same thing those rules do. An unauthenticated request keeps
+// the strategy's own key rather than collapsing every such request onto one
+// node.
+func getKeyWithInUser(fallback keyFn) keyFn {
+	return func(metadata *C.Metadata) string {
+		if metadata != nil && metadata.InUser != "" {
+			return metadata.InUser
+		}
+
+		return fallback(metadata)
+	}
+}
+
+// hashKey resolves the `hash-key` option into a decorator over whichever key
+// the chosen strategy derives by default.
+func hashKey(name string) (func(keyFn) keyFn, error) {
+	switch name {
+	case "":
+		return func(fn keyFn) keyFn { return fn }, nil
+	case "in-user":
+		return getKeyWithInUser, nil
+	}
+
+	return nil, fmt.Errorf("%w: %s", errHashKey, name)
 }
 
 // DialContext implements C.ProxyAdapter
@@ -167,11 +205,12 @@ func strategyRoundRobin(url string, preferUDP, preferIPv6 bool) strategyFn {
 // provider refresh when the most flows are being established. Preferences are
 // applied where ranking is already time-varying (url-test, smart, round-robin);
 // here a node that cannot carry the traffic is handled by the normal
-// alive/dead path instead. preferUDP/preferIPv6 are kept in the signature so
-// every strategy shares one constructor shape.
-func strategyConsistentHashing(url string, preferUDP, preferIPv6 bool) strategyFn {
+// alive/dead path instead. preferUDP/preferIPv6 stay in the signature so the
+// call site hands every strategy the same group options, and so
+// TestAffinityStrategiesIgnoreCapabilityVerdicts can pin that they are ignored.
+func strategyConsistentHashing(url string, keyOf keyFn, preferUDP, preferIPv6 bool) strategyFn {
 	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
-		key := utils.MapHash(getKey(metadata))
+		key := utils.MapHash(keyOf(metadata))
 		var best, bestAlive C.Proxy
 		var bestScore, bestAliveScore uint64
 		for _, proxy := range proxies {
@@ -199,13 +238,13 @@ func rendezvousScore(key uint64, name string) uint64 {
 
 // See strategyConsistentHashing for why capability preferences are not
 // consulted here.
-func strategyStickySessions(url string, preferUDP, preferIPv6 bool) strategyFn {
+func strategyStickySessions(url string, keyOf keyFn, preferUDP, preferIPv6 bool) strategyFn {
 	ttl := time.Minute * 10
 	lruCache := lru.New[uint64, string](
 		lru.WithAge[uint64, string](int64(ttl.Seconds())),
 		lru.WithSize[uint64, string](1000))
 	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
-		key := utils.MapHash(getKeyWithSrcAndDst(metadata))
+		key := utils.MapHash(keyOf(metadata))
 		if identity, has := lruCache.Get(key); has {
 			for _, proxy := range proxies {
 				if adapter.ProxyIdentity(proxy) == identity && proxy.AliveForTestUrl(url) {
@@ -273,13 +312,22 @@ func (lb *LoadBalance) Now() string {
 
 func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (lb *LoadBalance, err error) {
 	var strategyFn strategyFn
+	withKey, err := hashKey(loadBalanceOption.HashKey)
+	if err != nil {
+		return nil, err
+	}
 	switch loadBalanceOption.Strategy {
 	case "", "consistent-hashing":
-		strategyFn = strategyConsistentHashing(option.URL, option.PreferUDP, option.PreferIPv6)
+		strategyFn = strategyConsistentHashing(option.URL, withKey(getKey), option.PreferUDP, option.PreferIPv6)
 	case "round-robin":
+		// Rejected rather than ignored: round-robin hashes nothing, so a
+		// hash-key here means the config expects stickiness it will not get.
+		if loadBalanceOption.HashKey != "" {
+			return nil, fmt.Errorf("%w: round-robin does not hash", errHashKey)
+		}
 		strategyFn = strategyRoundRobin(option.URL, option.PreferUDP, option.PreferIPv6)
 	case "sticky-sessions":
-		strategyFn = strategyStickySessions(option.URL, option.PreferUDP, option.PreferIPv6)
+		strategyFn = strategyStickySessions(option.URL, withKey(getKeyWithSrcAndDst), option.PreferUDP, option.PreferIPv6)
 	default:
 		return nil, fmt.Errorf("%w: %s", errStrategy, loadBalanceOption.Strategy)
 	}

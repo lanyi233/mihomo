@@ -420,7 +420,15 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 	_, qTypeStr := msgToQtype(m)
 	for _, client := range clients {
 		if _, isRCodeClient := client.(rcodeClient); isRCodeClient {
+			// An rcode client answers locally and returns before the goroutines
+			// below, which are where every other nameserver's query and answer
+			// get logged. Log them here too, or a domain blocked with rcode://
+			// leaves no trace in the debug log at all.
+			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
 			msg, err = client.ExchangeContext(ctx, m)
+			if err == nil {
+				log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(msg), client.Address())
+			}
 			return msg, false, err
 		}
 		client := client // shadow define client to ensure the value captured by the closure will not be changed in the next loop

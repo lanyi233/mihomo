@@ -644,6 +644,13 @@ INLINE bool source_mac_equal(const __u8 left[6], const __u8 right[6]) {
     return left_low == right_low && left_high == right_high;
 }
 
+// The assign functions below steer a packet with sk_assign first and record its
+// assignment after. A failed sk_assign drops only that packet, so it must leave
+// the table alone: deleting the entry, as recording first then undoing did, took
+// an unchanged assignment from a live flow on one transient failure, costing a
+// pending TCP accept its original destination and a delivery flow its socket
+// cookie. The packet reaches the socket only after the program returns, so the
+// entry is still in place before anything reads it.
 NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *control,
     const struct sb_tc_assign_key *key, const __u8 source_mac[6], __u8 path) {
     bool source_mac_valid = (path & SB_TC_PATH_SOURCE_MAC_VALID) != 0U;
@@ -670,16 +677,14 @@ NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *co
         existing->ifindex != value.ifindex ||
         existing->path != value.path || existing->source_mac_valid != value.source_mac_valid;
     if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
-    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
-        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
-        sk_release(socket);
-        return TC_ACT_SHOT;
-    }
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
         record_tc_stat(SB_TC_STAT_SK_ASSIGN_FAILED);
-        map_delete(&tc_assignment, &assignment_key);
+        return TC_ACT_SHOT;
+    }
+    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
         return TC_ACT_SHOT;
     }
     return TC_ACT_OK;
@@ -711,16 +716,14 @@ NOINLINE int assign_socket_legacy(struct __sk_buff *skb, const struct sb_tc_cont
         existing->ifindex != value.ifindex ||
         existing->path != value.path || existing->source_mac_valid != value.source_mac_valid;
     if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
-    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
-        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
-        sk_release(socket);
-        return TC_ACT_SHOT;
-    }
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
         record_tc_stat(SB_TC_STAT_SK_ASSIGN_FAILED);
-        map_delete(&tc_assignment, &assignment_key);
+        return TC_ACT_SHOT;
+    }
+    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
         return TC_ACT_SHOT;
     }
     return TC_ACT_OK;
@@ -749,16 +752,14 @@ NOINLINE int assign_udp_socket(struct __sk_buff *skb, const struct sb_tc_control
         existing->ifindex != value.ifindex || existing->path != value.path ||
         existing->source_mac_valid != value.source_mac_valid;
     if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
-    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
-        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
-        sk_release(socket);
-        return TC_ACT_SHOT;
-    }
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
         record_tc_stat(SB_TC_STAT_SK_ASSIGN_FAILED);
-        map_delete(&tc_assignment, &assignment_key);
+        return TC_ACT_SHOT;
+    }
+    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+        record_tc_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED);
         return TC_ACT_SHOT;
     }
     return TC_ACT_OK;

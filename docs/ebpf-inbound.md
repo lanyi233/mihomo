@@ -254,6 +254,14 @@ overridden with `cgroup-path`. Package policy is resolved to Android UIDs and
 `include-android-user` maps a user ID to its per-user UID range. The DNS
 tethering UID is always excluded.
 
+From Android 15, netd attaches its own connect, sendmsg and recvmsg programs to
+the cgroup v2 root exclusively, and nothing can attach beside them or below
+them. The cgroup data plane then takes those hooks over, logs which ones, and
+hands them back to netd's programs when the inbound stops. If mihomo is killed
+instead, its programs stay attached until it starts again and removes them, and
+netd's come back only when netd attaches again, normally at the next boot.
+`local.data-plane: tc` leaves the hooks alone.
+
 SELinux must permit BPF map/program creation, cgroup attach, and socket
 operations for the mihomo domain. On restricted Android builds the feature is
 usually only usable from a root or Magisk-provided service context. Run
@@ -437,10 +445,12 @@ reorders the policy routing the redirect address depends on.
 ### FakeIP
 
 The fake-ip ranges are pushed into the kernel policy so a fake destination is
-intercepted even when it would otherwise be bypassed -- the address only regains
-meaning once the tunnel maps it back to its domain. This matters when the
-configured range sits inside a bypassed range, as `fake-ip-range: 100.64.0.0/10`
-does. The ranges follow `dns.fake-ip-range`/`fake-ip-range6` at runtime, so a
+intercepted even when it would otherwise be bypassed, UID policy included --
+the address only regains meaning once the tunnel maps it back to its domain.
+A bypassed app still gets fake-ip answers wherever its lookups go through a
+resolver that is not bypassed, as they do through netd on Android. This also
+matters when the configured range sits inside a bypassed range, as
+`fake-ip-range: 100.64.0.0/10` does. The ranges follow `dns.fake-ip-range`/`fake-ip-range6` at runtime, so a
 config reload that changes them reaches a running inbound.
 
 A fake-ip address answers nothing on its own, so `ping` against a fake-ip

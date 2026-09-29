@@ -359,7 +359,14 @@ func ReCreateVmess(vmessConfig string, tunnel C.Tunnel) {
 }
 
 func ReCreateTuic(config LC.TuicServer, tunnel C.Tunnel) {
+	PatchTuic(func(LC.TuicServer) LC.TuicServer { return config }, tunnel)
+}
+
+// PatchTuic hands patch LastTuicConf under tuicMux, for the reason PatchTun
+// gives.
+func PatchTuic(patch func(last LC.TuicServer) LC.TuicServer, tunnel C.Tunnel) {
 	tuicMux.Lock()
+	config := patch(LastTuicConf)
 	defer func() {
 		LastTuicConf = config
 		tuicMux.Unlock()
@@ -505,9 +512,20 @@ func ReCreateMixed(port int, tunnel C.Tunnel) {
 }
 
 func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
+	PatchTun(func(LC.Tun) LC.Tun { return tunConf }, tunnel)
+}
+
+// PatchTun is ReCreateTun for a caller that amends the current configuration
+// instead of replacing it, as PATCH /configs does. patch is handed LastTunConf
+// under tunMux. Read before the lock, LastTunConf can still be the value from
+// before a rebuild that is in progress -- at startup the controller is up while
+// the first device is being built, so that is the empty config -- and writing
+// it back then closes the device that rebuild has just brought up.
+func PatchTun(patch func(last LC.Tun) LC.Tun, tunnel C.Tunnel) {
+	tunMux.Lock()
+	tunConf := patch(LastTunConf)
 	tunConf.Sort()
 
-	tunMux.Lock()
 	// The eBPF inbounds publish their route exclusion as they start, which on
 	// the config-apply path is updateListeners, just before this. Reading it
 	// here rather than only inside sing_tun.New is what lets an unchanged tun

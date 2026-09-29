@@ -2,11 +2,11 @@ package outboundgroup
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/component/smart"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -120,23 +120,25 @@ type cancelAwareStatusProxy struct {
 	started chan struct{}
 }
 
-func (p cancelAwareStatusProxy) StatusTest(ctx context.Context, _ string) (uint16, bool, error) {
+func (p cancelAwareStatusProxy) StatusProbe(ctx context.Context, _ string) (*smart.ProbeResult, error) {
 	close(p.started)
 	<-ctx.Done()
-	return 0, false, ctx.Err()
+	return nil, ctx.Err()
 }
 
-func TestSmartStatusTestInheritsGroupCancellation(t *testing.T) {
+// A probe runs under the group's context, so a group being torn down ends it,
+// and the cancellation it ends with says nothing about the node: it must not be
+// recorded as a verdict the way a timeout is.
+func TestSmartProbeInheritsGroupCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Smart{ctx: ctx}
 	proxy := cancelAwareStatusProxy{
 		strategyTestProxy: strategyTestProxy{name: "probe"},
 		started:           make(chan struct{}),
 	}
-	result := make(chan error, 1)
+	result := make(chan smart.Verdict, 1)
 	go func() {
-		_, _, err := s.StatusTest(proxy, "example.com")
-		result <- err
+		result <- s.probeVerdict(proxy, "example.com")
 	}()
 
 	select {
@@ -146,9 +148,9 @@ func TestSmartStatusTestInheritsGroupCancellation(t *testing.T) {
 	}
 	cancel()
 	select {
-	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("status probe error=%v, want context cancellation", err)
+	case verdict := <-result:
+		if verdict.Action != smart.VerdictIgnore {
+			t.Fatalf("a probe cancelled with its group gave verdict %+v, want it ignored", verdict)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("status probe outlived the smart group")

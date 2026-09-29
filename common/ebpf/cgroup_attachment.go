@@ -121,7 +121,7 @@ func (b *CgroupBackend) Attach() error {
 		if err == nil {
 			b.runtime.links[slot] = programLink
 		} else if cgroupLinkUnavailable(err) {
-			err = attachProgramRaw(cgroupFD, program, cgroupProgramDefinitions[slot].attachType)
+			b.runtime.displaced[slot], err = attachCgroupProgramRaw(cgroupFD, program, cgroupProgramDefinitions[slot].attachType)
 		}
 		if err != nil {
 			_ = b.detachProgramsLocked()
@@ -165,14 +165,102 @@ func (b *CgroupBackend) detachProgramsLocked() error {
 				detachErr = E.Errors(detachErr, err)
 			}
 			continue
+		} else if displaced := b.runtime.displaced[slot]; displaced != nil {
+			err = restoreDisplacedCgroupProgram(cgroupFD, b.runtime.programs[slot], displaced, cgroupProgramDefinitions[slot].attachType)
 		} else {
 			err = rawDetachProgram(cgroupFD, b.runtime.programs[slot], cgroupProgramDefinitions[slot].attachType)
 		}
 		if err == nil || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) {
 			b.runtime.attached[slot] = false
+			if displaced := b.runtime.displaced[slot]; displaced != nil {
+				_ = displaced.Close()
+				b.runtime.displaced[slot] = nil
+			}
 			continue
 		}
 		detachErr = E.Errors(detachErr, err)
 	}
 	return detachErr
+}
+
+// attachCgroupProgramRaw attaches program next to whatever holds the hook and,
+// failing that, in its place. It is the fallback for kernels that refuse
+// BPF_LINK_CREATE, and the in-place attach replaces a program another owner
+// attached exclusively: on Android 15 and later netd holds connect, sendmsg and
+// recvmsg on the cgroup v2 root that way, and nothing else can attach there
+// alongside it. Detaching ours afterwards used to leave that hook empty until
+// its owner attached again, typically at the next boot. So before replacing,
+// this takes a reference to the program being displaced and returns it, and
+// detach puts it back. If the reference cannot be taken, the attach goes ahead
+// as it did before, only without the restore.
+func attachCgroupProgramRaw(cgroupFD int, program *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) (*CiliumEBPF.Program, error) {
+	err := link.RawAttachProgram(link.RawAttachProgramOptions{
+		Target:  cgroupFD,
+		Program: program,
+		Attach:  attachType,
+		Flags:   unix.BPF_F_ALLOW_MULTI,
+	})
+	if err == nil {
+		return nil, nil
+	}
+	var displaced *CiliumEBPF.Program
+	// An exclusive attachment is the only kind the in-place attach can replace,
+	// and it holds exactly one program.
+	if ids, queryErr := queryCgroupProgramIDs(cgroupFD, attachType); queryErr == nil && len(ids) == 1 {
+		displaced, _ = CiliumEBPF.NewProgramFromID(ids[0])
+	}
+	err = link.RawAttachProgram(link.RawAttachProgramOptions{
+		Target:  cgroupFD,
+		Program: program,
+		Attach:  attachType,
+	})
+	if err != nil {
+		if displaced != nil {
+			_ = displaced.Close()
+		}
+		return nil, err
+	}
+	return displaced, nil
+}
+
+// restoreDisplacedCgroupProgram hands the hook back to the program ours
+// displaced. Attaching it exclusively replaces ours in one step, so the hook is
+// never left empty in between. If the kernel refuses, ours is detached anyway:
+// the hook ends up empty, which is what detaching did before the restore
+// existed.
+func restoreDisplacedCgroupProgram(cgroupFD int, program, displaced *CiliumEBPF.Program, attachType CiliumEBPF.AttachType) error {
+	if err := link.RawAttachProgram(link.RawAttachProgramOptions{
+		Target:  cgroupFD,
+		Program: displaced,
+		Attach:  attachType,
+	}); err == nil {
+		return nil
+	}
+	return rawDetachProgram(cgroupFD, program, attachType)
+}
+
+// DisplacedHooks names the hooks where attaching replaced a program another
+// owner had attached exclusively, with that program's name. Each is put back
+// when the backend detaches.
+func (b *CgroupBackend) DisplacedHooks() []string {
+	if b == nil {
+		return nil
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return nil
+	}
+	var hooks []string
+	for slot, displaced := range b.runtime.displaced {
+		if displaced == nil {
+			continue
+		}
+		name := "unnamed"
+		if info, err := displaced.Info(); err == nil && info.Name != "" {
+			name = info.Name
+		}
+		hooks = append(hooks, cgroupProgramDefinitions[slot].attachType.String()+" ("+name+")")
+	}
+	return hooks
 }

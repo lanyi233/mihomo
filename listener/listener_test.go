@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/netip"
 	"testing"
+	"time"
 
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
@@ -133,6 +134,41 @@ func TestCleanupClearsTheTunStateItInvalidated(t *testing.T) {
 	}
 	if lastTunEBPFExclude != nil {
 		t.Fatalf("expected the recorded route exclusion to be cleared, got %v", lastTunEBPFExclude)
+	}
+}
+
+// At startup the controller is up while the first TUN device is still being
+// built, and a GUI sends its first PATCH /configs -- typically just log-level --
+// the moment the controller answers. That PATCH writes the current tun config
+// back, and read before tunMux it is still the empty one, so the rebuild it
+// triggers closes the device the startup path has just brought up.
+//
+// The tunMux held here is that startup ReCreateTun: it publishes LastTunConf
+// as it releases the lock, exactly as ReCreateTun's deferred assignment does.
+func TestPatchTunReadsTheConfigOfARebuildInProgress(t *testing.T) {
+	previousConf, previousExclude := LastTunConf, lastTunEBPFExclude
+	t.Cleanup(func() { LastTunConf, lastTunEBPFExclude = previousConf, previousExclude })
+	LastTunConf, lastTunEBPFExclude = LC.Tun{}, nil
+	built := LC.Tun{Enable: true, Device: "utun1500", Stack: C.TunMixed, MTU: 9000}
+
+	tunMux.Lock()
+	read := make(chan LC.Tun, 1)
+	patched := make(chan struct{})
+	go func() {
+		defer close(patched)
+		PatchTun(func(last LC.Tun) LC.Tun { read <- last; return last }, nil)
+	}()
+	select {
+	case last := <-read:
+		t.Fatalf("patch read %+v while the rebuild still held tunMux", last)
+	case <-time.After(50 * time.Millisecond):
+	}
+	LastTunConf = built
+	tunMux.Unlock()
+	<-patched
+
+	if !LastTunConf.Equal(built) {
+		t.Fatalf("a PATCH that did not mention tun replaced its config with %+v", LastTunConf)
 	}
 }
 

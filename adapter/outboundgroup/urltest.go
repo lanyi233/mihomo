@@ -145,7 +145,11 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 		minDelay := u.rankDelay(fast)
 		fastNotExist := true
 
-		for _, proxy := range proxies[1:] {
+		// Scan from proxies[0], not proxies[1]: the existence check must see
+		// the first candidate too, or a current node sitting first is taken
+		// for gone and replaced by any faster node, ignoring tolerance.
+		// Revisiting proxies[0] cannot change fast, its delay equals minDelay.
+		for _, proxy := range proxies {
 			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
 				fastNotExist = false
 			}

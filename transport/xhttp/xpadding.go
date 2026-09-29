@@ -182,6 +182,14 @@ func (c *Config) GetNormalizedXPaddingBytes() (Range, error) {
 	if err != nil {
 		return Range{}, fmt.Errorf("invalid x-padding-bytes: %w", err)
 	}
+	// Xray-core reads a range whose upper bound is 0 as unset and falls back
+	// to 100-1000, and panels emit "0-0" when padding is switched off. Taken
+	// literally it made every request carry an empty padding, which
+	// IsPaddingValid (ours and Xray's alike) rejects with a 400, so the
+	// connection never came up.
+	if r.Max == 0 {
+		return Range{Min: 100, Max: 1000}, nil
+	}
 	return r, nil
 }
 

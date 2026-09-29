@@ -51,7 +51,7 @@ func TestCheckHostStatusProbesEveryRecoverableCode(t *testing.T) {
 		wildcardTarget = "example.com"
 	)
 	seedHostStatus(t, group, config, wildcardTarget, &HostStatus{Codes: map[BlockCode]*CodeNodeSet{
-		BlockAbnormalStatus: blockedNode("node-abnormal", "a.example.com", time.Hour),
+		BlockAbnormalStatus: blockedNode("node-abnormal", "a.example.com", probeMaxBlockTTL/2),
 		BlockDialFailure:    blockedNode("node-dial", "b.example.com", time.Hour),
 		BlockNoResponse:     blockedNode("node-zero-traffic", "c.example.com", time.Hour),
 		BlockLowWeight:      blockedNode("node-low-weight", "d.example.com", time.Hour),
@@ -133,7 +133,7 @@ func TestUpdateHostStatusRecordsTheHostForEveryBlockingCode(t *testing.T) {
 
 		store := &Store{}
 		metadata := &C.Metadata{Host: "probe.example.com"}
-		store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, true, true, blockCode)
+		store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, true, true, blockCode, 0)
 
 		cached, ok := hostStatusCache.Get(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
 		require.True(t, ok)
@@ -160,12 +160,12 @@ func TestUpdateHostStatusRecordsTheHostWhenCode3Blocks(t *testing.T) {
 	cachePath := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
 	metadata := &C.Metadata{Host: "probe.example.com"}
 
-	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, maxFailedTimes, 1_000, true, true, BlockDialFailure)
+	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, maxFailedTimes, 1_000, true, true, BlockDialFailure, 0)
 	cached, ok := hostStatusCache.Get(cachePath)
 	require.True(t, ok)
 	require.Empty(t, cached.Codes[BlockDialFailure].Nodes, "a single failure blocked the node outright")
 
-	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, maxFailedTimes, 1_000, true, true, BlockDialFailure)
+	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, maxFailedTimes, 1_000, true, true, BlockDialFailure, 0)
 	cached, ok = hostStatusCache.Get(cachePath)
 	require.True(t, ok)
 	require.NotEmpty(t, cached.Codes[BlockDialFailure].Nodes, "the node never blocked despite reaching the failure limit")
@@ -193,7 +193,7 @@ func TestUpdateHostStatusClearsEveryRecoverableBlockOnSuccess(t *testing.T) {
 
 	store := &Store{}
 	metadata := &C.Metadata{Host: "probe.example.com"}
-	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, false, true, BlockNone)
+	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, false, true, BlockNone, 0)
 
 	cached, ok := hostStatusCache.Get(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
 	require.True(t, ok)
@@ -228,7 +228,7 @@ func TestUpdateHostStatusReblockNeverExtendsTheDeadline(t *testing.T) {
 	store := &Store{}
 	metadata := &C.Metadata{Host: "probe.example.com"}
 	// What a failed recovery probe does: re-block as code 2.
-	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, true, true, BlockAbnormalStatus)
+	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, true, true, BlockAbnormalStatus, 0)
 
 	cached, ok := hostStatusCache.Get(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
 	require.True(t, ok)
@@ -252,7 +252,7 @@ func TestUpdateHostStatusFirstBlockGetsTheFullTTL(t *testing.T) {
 	store := &Store{}
 	metadata := &C.Metadata{Host: "probe.example.com"}
 	before := time.Now().Add(HostFailureNodeTTL).Unix()
-	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, true, true, BlockNoResponse)
+	store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, true, true, BlockNoResponse, 0)
 
 	cached, ok := hostStatusCache.Get(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
 	require.True(t, ok)
@@ -310,7 +310,7 @@ func TestUpdateHostStatusKeepsTheProbeTargetThroughADemotion(t *testing.T) {
 	// lower code, so the code-4 record is demoted away.
 	bareIP := &C.Metadata{}
 	for range 3 {
-		store.UpdateHostStatus(group, config, wildcardTarget, bareIP, node, 1, 1_000, true, true, BlockDialFailure)
+		store.UpdateHostStatus(group, config, wildcardTarget, bareIP, node, 1, 1_000, true, true, BlockDialFailure, 0)
 	}
 
 	cached, ok := hostStatusCache.Get(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))

@@ -329,3 +329,43 @@ func TestConvertsV2RayVmessBase64HTTPRemappedToH2Transport(t *testing.T) {
 	_, err = adapter.ParseProxy(proxies[0])
 	assert.NoError(t, err)
 }
+
+// The provider keeps only the first proxy of any given name, so a suffixed
+// name that collides with one already in the subscription silently drops a
+// proxy. MetaCubeX/mihomo#2931: `name, name-01, name, name` used to produce
+// `name, name-01, name-01, name-02` and the provider showed three proxies.
+func TestConvertsV2RayNeverGeneratesANameThatIsAlreadyTaken(t *testing.T) {
+	tests := []struct {
+		name      string
+		fragments []string
+		expected  []string
+	}{
+		{
+			name:      "suffix already used by a literal name",
+			fragments: []string{"name", "name-01", "name", "name"},
+			expected:  []string{"name", "name-01", "name-02", "name-03"},
+		},
+		{
+			name:      "literal name arrives after the generated one",
+			fragments: []string{"name", "name", "name-01"},
+			expected:  []string{"name", "name-01", "name-01-01"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var sub []byte
+			for _, fragment := range tt.fragments {
+				sub = append(sub, "http://example.com:443#"+fragment+"\n"...)
+			}
+
+			proxies, err := ConvertsV2Ray(sub)
+
+			assert.NoError(t, err)
+			names := make([]string, 0, len(proxies))
+			for _, proxy := range proxies {
+				names = append(names, proxy["name"].(string))
+			}
+			assert.Equal(t, tt.expected, names)
+		})
+	}
+}

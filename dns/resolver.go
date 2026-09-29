@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/arc"
@@ -48,6 +49,7 @@ type Resolver struct {
 	cache                 dnsCache
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
+	cacheHeld             atomic.Bool // see Resolvers.HoldCache
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -192,6 +194,10 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 		ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout) // reset timeout in singleflight
 		defer cancel()
 		cache := false
+		// Read before the query is routed: what matters is whether the policy
+		// was complete when it picked the nameserver, not when the answer came
+		// back.
+		held := r.cacheHeld.Load()
 
 		defer func() {
 			if err != nil {
@@ -201,7 +207,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 				return
 			}
 
-			if cache {
+			if cache && !held {
 				putMsgToCache(r.cache, q, result)
 			}
 		}()
@@ -513,6 +519,31 @@ func (rs Resolvers) ResetConnection() {
 	rs.Resolver.ResetConnection()
 	rs.ProxyResolver.ResetConnection()
 	rs.DirectResolver.ResetConnection()
+}
+
+// HoldCache keeps answers out of the cache until ReleaseCache is called.
+//
+// A 'rule-set:' nameserver-policy matches nothing until its rule provider has
+// loaded, and the providers load after the resolver is already answering:
+// proxy-provider health checks, provider downloads and hijacked queries all
+// resolve domains in between. Those answers come from whichever nameserver the
+// incomplete policy fell through to; caching them would keep the policy
+// bypassed for those domains until their TTL ran out.
+func (rs Resolvers) HoldCache() {
+	rs.setCacheHeld(true)
+}
+
+// ReleaseCache lets answers routed from now on be cached again.
+func (rs Resolvers) ReleaseCache() {
+	rs.setCacheHeld(false)
+}
+
+func (rs Resolvers) setCacheHeld(held bool) {
+	for _, r := range []*Resolver{rs.Resolver, rs.ProxyResolver, rs.DirectResolver} {
+		if r != nil {
+			r.cacheHeld.Store(held)
+		}
+	}
 }
 
 func NewResolverFromClient(client dnsClient) *Resolver {

@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	N "github.com/metacubex/mihomo/common/net"
@@ -21,14 +22,27 @@ type bodyWrapper struct {
 	io.ReadCloser
 	once     sync.Once
 	onHitEOF func()
+	finished atomic.Bool // no later Read or Close will touch the connection
 }
 
 func (b *bodyWrapper) Read(p []byte) (n int, err error) {
 	n, err = b.ReadCloser.Read(p)
-	if err == io.EOF && b.onHitEOF != nil {
-		b.once.Do(b.onHitEOF)
+	if err == io.EOF {
+		b.finished.Store(true)
+		if b.onHitEOF != nil {
+			b.once.Do(b.onHitEOF)
+		}
 	}
 	return n, err
+}
+
+// The Transport closes the body once it is done with it, but http.body.Close may
+// still drain the rest of the body from the connection, so it only counts as
+// finished once that returns.
+func (b *bodyWrapper) Close() error {
+	err := b.ReadCloser.Close()
+	b.finished.Store(true)
+	return err
 }
 
 func HandleConn(c net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...inbound.Addition) {
@@ -64,6 +78,7 @@ func HandleConn(c net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...
 		}
 		additions[inUserIdx] = inbound.WithInUser(user)
 
+		bodyInFlight := false
 		if trusted {
 			if request.Method == http.MethodConnect {
 				// Manual writing to support CONNECT for http 1.0 (workaround for uplay client)
@@ -114,15 +129,18 @@ func HandleConn(c net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...
 						}
 					}()
 				}
+				var body *bodyWrapper
 				if request.Body == nil || request.Body == http.NoBody {
 					startBackgroundRead()
 				} else {
-					request.Body = &bodyWrapper{ReadCloser: request.Body, onHitEOF: startBackgroundRead}
+					body = &bodyWrapper{ReadCloser: request.Body, onHitEOF: startBackgroundRead}
+					request.Body = body
 				}
 				resp, err = client.Do(request)
 				if err != nil {
 					resp = responseWith(request, http.StatusBadGateway)
 				}
+				bodyInFlight = body != nil && !body.finished.Load()
 			}
 
 			removeHopByHopHeaders(resp.Header)
@@ -133,6 +151,16 @@ func HandleConn(c net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...
 		}
 		if keepAlive && resp.ContentLength > 0 {
 			resp.Close = false // don't need to close connection if content length is positive numbers
+		}
+		if bodyInFlight {
+			// The upstream answered before the Transport finished sending the request
+			// body (e.g. a 413 without reading the upload). Its write goroutine keeps
+			// reading the body out of conn.Reader() after Do returns, without
+			// peekMutex, so going back to ReadRequest would share that bufio.Reader
+			// between two goroutines (it panics with r > w), and the unread rest of
+			// the body would be parsed as the next request anyway. Closing the
+			// connection also ends that read.
+			resp.Close = true
 		}
 
 		if !resp.Close {

@@ -15,6 +15,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/smart"
 	"github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -323,20 +324,70 @@ func urlToMetadata(rawURL string) (addr C.Metadata, err error) {
 	return
 }
 
+// StatusTest requests rawURL through the proxy and reports whether the answer
+// is one banStatus accepts. A timeout is reported as status 599, not an error.
 func (p *Proxy) StatusTest(ctx context.Context, rawURL string) (status uint16, ok bool, err error) {
-	if _, err = urlToMetadata(rawURL); err != nil {
+	var statusCode int
+	err = p.statusRequest(ctx, rawURL, func(resp *http.Response) {
+		statusCode = resp.StatusCode
+		ok = !banStatus[statusCode]
+		if !ok {
+			if statusCode == http.StatusForbidden {
+				if resp.Header.Get("Server") == "cloudflare" {
+					ok = true
+				}
+			}
+			if statusCode == 520 {
+				if resp.Header.Get("Server") != "cloudflare" {
+					ok = true
+				}
+			}
+		}
+	})
+	if err != nil {
+		if netErr, okNet := err.(net.Error); okNet && netErr.Timeout() {
+			return 599, false, nil
+		} else if err == context.Canceled || err == context.DeadlineExceeded {
+			return 599, false, nil
+		}
 		return 1, false, err
+	}
+	return uint16(statusCode), ok, nil
+}
+
+// StatusProbe is StatusTest for the Smart group's response classifier
+// (smart.ClassifyResponse), which reads the status and headers itself: a 403
+// with Retry-After, a challenge page and a 429 all mean different things there.
+// Errors are returned as they are, for smart.ClassifyProbeError.
+func (p *Proxy) StatusProbe(ctx context.Context, rawURL string) (*smart.ProbeResult, error) {
+	var result *smart.ProbeResult
+	err := p.statusRequest(ctx, rawURL, func(resp *http.Response) {
+		result = &smart.ProbeResult{StatusCode: resp.StatusCode, Header: resp.Header}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+var _ smart.StatusProber = (*Proxy)(nil)
+
+// statusRequest sends one browser-like GET for rawURL through the proxy and
+// hands the response to handle before closing it.
+func (p *Proxy) statusRequest(ctx context.Context, rawURL string, handle func(*http.Response)) error {
+	if _, err := urlToMetadata(rawURL); err != nil {
+		return err
 	}
 
 	tlsConfig, err := ca.GetTLSConfig(ca.Option{})
 	if err != nil {
-		return 1, false, err
+		return err
 	}
 
 	preset := convert.RandBrowserPreset()
 	fingerprint, ok2 := tls.GetFingerprint(preset.FingerprintName)
 	if !ok2 {
-		return 1, false, fmt.Errorf("failed to get TLS fingerprint: %s", preset.FingerprintName)
+		return fmt.Errorf("failed to get TLS fingerprint: %s", preset.FingerprintName)
 	}
 
 	// Resolve the target per hop instead of pinning the one from rawURL: redirects
@@ -401,38 +452,16 @@ func (p *Proxy) StatusTest(ctx context.Context, rawURL string) (status uint16, o
 
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
-		return 1, false, err
+		return err
 	}
 	req = req.WithContext(ctx)
 	req.Header = preset.Headers.Clone()
 
 	resp, err := client.Do(req)
-	var statusCode int
 	if err != nil {
-		if netErr, okNet := err.(net.Error); okNet && netErr.Timeout() {
-			statusCode = 599
-		} else if err == context.Canceled || err == context.DeadlineExceeded {
-			statusCode = 599
-		} else {
-			return 1, false, err
-		}
-	} else {
-		statusCode = resp.StatusCode
-		ok = !banStatus[statusCode]
-		if !ok {
-			if statusCode == http.StatusForbidden {
-				if resp.Header.Get("Server") == "cloudflare" {
-					ok = true
-				}
-			}
-			if statusCode == 520 {
-				if resp.Header.Get("Server") != "cloudflare" {
-					ok = true
-				}
-			}
-		}
-		_ = resp.Body.Close()
+		return err
 	}
-
-	return uint16(statusCode), ok, nil
+	handle(resp)
+	_ = resp.Body.Close()
+	return nil
 }

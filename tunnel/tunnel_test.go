@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"errors"
 	"net/netip"
 	"strings"
 	"testing"
@@ -168,5 +169,70 @@ func TestLogMetadataNamesTheDecidedMode(t *testing.T) {
 		case <-timeout:
 			t.Fatalf("timed out waiting for the log line for %s; unrelated lines seen: %q", destination, unrelated)
 		}
+	}
+}
+
+// rejectProxy is a stubProxy match can walk: it unwraps to nothing and reports
+// itself as REJECT.
+type rejectProxy struct{ stubProxy }
+
+func (*rejectProxy) Type() C.AdapterType              { return C.Reject }
+func (*rejectProxy) Unwrap(*C.Metadata, bool) C.Proxy { return nil }
+
+// uidRule decides like UID,<uid>,REJECT: it asks for the process lookup and
+// looks only at metadata.Uid. The real rule refuses to build off Linux.
+type uidRule struct {
+	C.Rule
+	uid uint32
+}
+
+func (uidRule) RuleType() C.RuleType { return C.Uid }
+
+func (r uidRule) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, string) {
+	helper.FindProcess()
+	return metadata.Uid == r.uid, "REJECT"
+}
+
+// On Linux the socket's owner comes from netlink and the process path from a
+// /proc search for the socket's inode, which misses short-lived sockets and
+// processes in another PID namespace (issue #3135: passt in a container). The
+// lookup then returns the uid together with an error, and the uid is still
+// right: dropping it made UID,1000,REJECT fall through to MATCH.
+func TestProcessLookupKeepsTheUidWhenOnlyTheProcessPathIsMissing(t *testing.T) {
+	setMode(t, Rule)
+	installDirectProxy(t)
+	reject := &rejectProxy{stubProxy{name: "REJECT"}}
+	proxies["REJECT"] = reject
+
+	previousRules := rules
+	t.Cleanup(func() { rules = previousRules })
+	rules = []C.Rule{uidRule{uid: 1000}}
+
+	previousFind := findProcessName
+	t.Cleanup(func() { findProcessName = previousFind })
+	findProcessName = func(string, netip.Addr, int) (uint32, string, error) {
+		return 1000, "", errors.New("process of uid(1000),inode(10047268) not found")
+	}
+
+	metadata := &C.Metadata{
+		NetWork: C.TCP,
+		Type:    C.TUN,
+		SrcIP:   netip.MustParseAddr("198.18.0.1"),
+		SrcPort: 52064,
+		DstIP:   netip.MustParseAddr("1.2.3.4"),
+		DstPort: 443,
+	}
+	proxy, _, _, err := resolveMetadata(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Uid != 1000 {
+		t.Fatalf("expected the uid the lookup found to be kept, got %d", metadata.Uid)
+	}
+	if proxy != reject {
+		t.Fatalf("expected UID,1000,REJECT to match, got %s", proxy.Name())
+	}
+	if metadata.Process != "" || metadata.ProcessPath != "" {
+		t.Fatalf("expected no process for a failed path lookup, got %q %q", metadata.Process, metadata.ProcessPath)
 	}
 }

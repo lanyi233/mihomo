@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/metacubex/mihomo/adapter"
 	C "github.com/metacubex/mihomo/constant"
+
+	"github.com/stretchr/testify/require"
 )
 
 var capabilityTestSequence atomic.Uint64
@@ -46,7 +49,7 @@ func strategyProxies(names ...string) []C.Proxy {
 
 func TestConsistentHashingStableAcrossCandidateReorder(t *testing.T) {
 	metadata := &C.Metadata{Host: "example.com"}
-	strategy := strategyConsistentHashing("test", false, false)
+	strategy := strategyConsistentHashing("test", getKey, false, false)
 	first := strategy(strategyProxies("a", "b", "c"), metadata, false)
 	second := strategy(strategyProxies("c", "a", "b"), metadata, false)
 	if first.Name() != second.Name() {
@@ -56,7 +59,7 @@ func TestConsistentHashingStableAcrossCandidateReorder(t *testing.T) {
 
 func TestStickySessionsStableAcrossCandidateReorder(t *testing.T) {
 	metadata := &C.Metadata{Host: "example.com"}
-	strategy := strategyStickySessions("test", false, false)
+	strategy := strategyStickySessions("test", getKeyWithSrcAndDst, false, false)
 	first := strategy(strategyProxies("a", "b", "c"), metadata, false)
 	second := strategy(strategyProxies("c", "a", "b"), metadata, false)
 	if first.Name() != second.Name() {
@@ -66,7 +69,7 @@ func TestStickySessionsStableAcrossCandidateReorder(t *testing.T) {
 
 func TestStickySessionsDistinguishesDuplicateNames(t *testing.T) {
 	metadata := &C.Metadata{Host: "example.com"}
-	strategy := strategyStickySessions("test", false, false)
+	strategy := strategyStickySessions("test", getKeyWithSrcAndDst, false, false)
 	first := strategy([]C.Proxy{
 		strategyTestProxy{name: "same", addr: "one", provider: "p1", alive: true},
 		strategyTestProxy{name: "same", addr: "two", provider: "p2", alive: true},
@@ -96,7 +99,7 @@ func TestUniqueProxiesByNameOmitsProviderCollisions(t *testing.T) {
 
 func TestStickySessionsSeparatesDelimiterCollisions(t *testing.T) {
 	metadata := &C.Metadata{Host: "example.com"}
-	strategy := strategyStickySessions("test", false, false)
+	strategy := strategyStickySessions("test", getKeyWithSrcAndDst, false, false)
 	a := strategyTestProxy{name: "same", provider: "provider|segment", addr: "endpoint", alive: true}
 	b := strategyTestProxy{name: "same", provider: "provider", addr: "segment|endpoint", alive: true}
 
@@ -112,7 +115,7 @@ func TestStickySessionsSeparatesDelimiterCollisions(t *testing.T) {
 
 func TestConsistentHashingSeparatesDelimiterCollisions(t *testing.T) {
 	metadata := &C.Metadata{Host: "example.com"}
-	strategy := strategyConsistentHashing("test", false, false)
+	strategy := strategyConsistentHashing("test", getKey, false, false)
 	a := strategyTestProxy{name: "same", provider: "provider|segment", addr: "endpoint", alive: true}
 	b := strategyTestProxy{name: "same", provider: "provider", addr: "segment|endpoint", alive: true}
 
@@ -221,7 +224,7 @@ func TestRoundRobinKeepsDemotedProxiesInRotation(t *testing.T) {
 func TestConsistentHashingKeepsDemotedProxiesSelectable(t *testing.T) {
 	metadata := &C.Metadata{Host: "example.com"}
 	proxies := demotedProxies("a", "b", "c")
-	strategy := strategyConsistentHashing("test", false, true)
+	strategy := strategyConsistentHashing("test", getKey, false, true)
 
 	// 全部降权时仍必须选出一个存活节点，且映射保持稳定。
 	first := strategy(proxies, metadata, false)
@@ -257,10 +260,10 @@ func TestAffinityStrategiesIgnoreCapabilityVerdicts(t *testing.T) {
 		build func(preferIPv6 bool) strategyFn
 	}{
 		{name: "consistent-hashing", build: func(preferIPv6 bool) strategyFn {
-			return strategyConsistentHashing("test", false, preferIPv6)
+			return strategyConsistentHashing("test", getKey, false, preferIPv6)
 		}},
 		{name: "sticky-sessions", build: func(preferIPv6 bool) strategyFn {
-			return strategyStickySessions("test", false, preferIPv6)
+			return strategyStickySessions("test", getKeyWithSrcAndDst, false, preferIPv6)
 		}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -373,4 +376,149 @@ func TestProxyIndexForAForeignSliceIsNotTheCachedOne(t *testing.T) {
 	if got["node-z"] == nil || got["node-a"] != nil {
 		t.Fatalf("index = %v, want it to describe the slice that was passed", got)
 	}
+}
+
+const testUrl = "https://www.gstatic.com/generate_204"
+
+// Upstream builds these from identical DIRECT adapters and tells them apart by
+// position. The hashing strategies here rank by adapter.ProxyIdentity, so
+// identical adapters would all tie and every key would land on the first one;
+// the members need distinct identities for the spread to be observable.
+func balancedProxies(count int) []C.Proxy {
+	names := make([]string, count)
+	for i := range names {
+		names[i] = fmt.Sprintf("node-%d", i)
+	}
+	return strategyProxies(names...)
+}
+
+func indexOf(t *testing.T, proxies []C.Proxy, selected C.Proxy) int {
+	t.Helper()
+	for i, proxy := range proxies {
+		if proxy == selected {
+			return i
+		}
+	}
+	require.Fail(t, "selected proxy is not a member of the group")
+	return -1
+}
+
+func request(user, host string) *C.Metadata {
+	return &C.Metadata{
+		NetWork: C.TCP,
+		Host:    host,
+		DstPort: 443,
+		SrcIP:   netip.MustParseAddr("127.0.0.1"),
+		InUser:  user,
+	}
+}
+
+// One unit of work walking several destinations is the case both address-derived
+// keys get wrong: the group is meant to hold that work on one egress, and the
+// default key moves it as soon as the host changes.
+func TestLoadBalanceHashKeyInUserSurvivesADestinationChange(t *testing.T) {
+	proxies := balancedProxies(8)
+	hosts := distinctKeys("www.site-%02d.com", 16)
+
+	byUser := strategyConsistentHashing(testUrl, getKeyWithInUser(getKey), false, false)
+	pinned := indexOf(t, proxies, byUser(proxies, request("job-1", hosts[0]), false))
+	for _, host := range hosts {
+		selected := byUser(proxies, request("job-1", host), false)
+		require.Equal(t, pinned, indexOf(t, proxies, selected),
+			"hash-key: user must ignore the destination")
+	}
+
+	byDestination := strategyConsistentHashing(testUrl, getKey, false, false)
+	seen := map[int]bool{}
+	for _, host := range hosts {
+		seen[indexOf(t, proxies, byDestination(proxies, request("job-1", host), false))] = true
+	}
+	require.Greater(t, len(seen), 1,
+		"the default key is expected to move with the destination")
+}
+
+// distinctKeys returns count distinct keys; for hosts, vary the registrable
+// domain, since getKey hashes the eTLD+1. utils.MapHash is
+// seeded per process, so "these keys do not all land on one node" is only
+// probably true: four keys over eight nodes all collide once in 512 runs,
+// which CI's two dozen runs of this package per push hit about one push in
+// twenty. Sixteen make it about one in 3e13.
+func distinctKeys(format string, count int) []string {
+	keys := make([]string, count)
+	for i := range keys {
+		keys[i] = fmt.Sprintf(format, i)
+	}
+	return keys
+}
+
+// Pinning must not become a single node: distinct users still spread.
+func TestLoadBalanceHashKeyInUserSpreadsUsers(t *testing.T) {
+	proxies := balancedProxies(8)
+	strategy := strategyConsistentHashing(testUrl, getKeyWithInUser(getKey), false, false)
+
+	seen := map[int]bool{}
+	for _, user := range distinctKeys("job-%02d", 16) {
+		selected := strategy(proxies, request(user, "a.example.com"), false)
+		seen[indexOf(t, proxies, selected)] = true
+	}
+	require.Greater(t, len(seen), 1)
+}
+
+// Sticky sessions keys on source and destination; a client behind one source
+// address cannot separate its own concurrent jobs without a supplied identity.
+func TestLoadBalanceHashKeyInUserSeparatesJobsSharingASourceAddress(t *testing.T) {
+	proxies := balancedProxies(8)
+	strategy := strategyStickySessions(testUrl, getKeyWithInUser(getKeyWithSrcAndDst), false, false)
+
+	first := indexOf(t, proxies, strategy(proxies, request("job-1", "a.example.com"), false))
+	require.Equal(t, first,
+		indexOf(t, proxies, strategy(proxies, request("job-1", "b.example.org"), false)))
+
+	shared := strategyStickySessions(testUrl, getKeyWithSrcAndDst, false, false)
+	require.Equal(t,
+		indexOf(t, proxies, shared(proxies, request("job-1", "a.example.com"), false)),
+		indexOf(t, proxies, shared(proxies, request("job-2", "a.example.com"), false)),
+		"without a supplied key the two jobs are one session")
+}
+
+// An unauthenticated request keeps the strategy's own key. Returning a constant
+// instead would herd every anonymous request onto one member.
+func TestLoadBalanceHashKeyInUserFallsBackWhenUnauthenticated(t *testing.T) {
+	keyed := getKeyWithInUser(getKey)
+	require.Equal(t, "example.com", keyed(request("", "a.example.com")))
+	require.Equal(t, "job-1", keyed(request("job-1", "a.example.com")))
+	require.Equal(t, getKey(nil), keyed(nil))
+}
+
+// The option name is the contract with the config file, and nothing else here
+// exercises it: every other test reaches the decorator directly, so renaming
+// the case would leave them all green while `hash-key: in-user` stopped working.
+func TestLoadBalanceHashKeyResolvesTheOptionName(t *testing.T) {
+	withInUser, err := hashKey("in-user")
+	require.NoError(t, err)
+	require.Equal(t, "job-1", withInUser(getKey)(request("job-1", "a.example.com")))
+
+	identity, err := hashKey("")
+	require.NoError(t, err)
+	require.Equal(t, getKey(request("job-1", "a.example.com")),
+		identity(getKey)(request("job-1", "a.example.com")))
+}
+
+func TestLoadBalanceHashKeyRejectsUnusableConfigs(t *testing.T) {
+	_, err := hashKey("session")
+	require.ErrorIs(t, err, errHashKey)
+
+	// `user` was the name this option carried before review. Rejecting it keeps
+	// the rename honest: without this the case above could still read `user`
+	// and every test here would stay green.
+	_, err = hashKey("user")
+	require.ErrorIs(t, err, errHashKey)
+
+	_, err = NewLoadBalance(GroupCommonOption{Name: "lb"},
+		LoadBalanceOption{Strategy: "round-robin", HashKey: "in-user"}, nil, nil)
+	require.ErrorIs(t, err, errHashKey)
+
+	_, err = NewLoadBalance(GroupCommonOption{Name: "lb"},
+		LoadBalanceOption{Strategy: "consistent-hashing", HashKey: "nonsense"}, nil, nil)
+	require.ErrorIs(t, err, errHashKey)
 }

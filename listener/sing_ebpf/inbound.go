@@ -573,6 +573,9 @@ func (i *Inbound) start() error {
 		if err := cgroupBackend.Attach(); err != nil {
 			return err
 		}
+		if displaced := cgroupBackend.DisplacedHooks(); len(displaced) > 0 {
+			log.Warnln("[EBPF] cgroup hooks held exclusively by another program were taken over and are handed back when this inbound stops: %s", strings.Join(displaced, ", "))
+		}
 	}
 	if backend != nil {
 		if err := backend.Enable(); err != nil {

@@ -716,14 +716,23 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 	return proxies, nil
 }
 
+// uniqueName returns name, or name-NN when name is already used. The suffixed
+// candidate is checked against names and recorded too: a subscription may
+// already carry a literal "name-01", and the provider drops every proxy whose
+// name repeats an earlier one, so a colliding suffix would lose a proxy.
 func uniqueName(names map[string]int, name string) string {
-	if index, ok := names[name]; ok {
-		index++
-		names[name] = index
-		name = fmt.Sprintf("%s-%02d", name, index)
-	} else {
-		index = 0
-		names[name] = index
+	index, ok := names[name]
+	if !ok {
+		names[name] = 0
+		return name
 	}
-	return name
+	for {
+		index++
+		candidate := fmt.Sprintf("%s-%02d", name, index)
+		if _, taken := names[candidate]; !taken {
+			names[name] = index
+			names[candidate] = 0
+			return candidate
+		}
+	}
 }

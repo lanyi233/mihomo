@@ -360,6 +360,10 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
+// findProcessName is process.FindProcessName; tests swap it to play a platform
+// whose lookup finds the socket's owner but not its process.
+var findProcessName = process.FindProcessName
+
 // resolveMetadata reports the mode it decided under, so the log line for the
 // connection names the same mode the routing did. Reading the global again when
 // the line is written would let a mode change land in between and rename a
@@ -409,13 +413,17 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, decidedM
 				attemptProcessLookup = false
 				if !features.CMFA {
 					// normal check for process
-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+					uid, path, err := findProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+					// On Linux the uid is the socket's owner from netlink, and the
+					// error may only mean the /proc search for its inode missed (a
+					// short-lived socket, a process in another PID namespace). UID
+					// rules need nothing more, so keep it; other platforms return 0.
+					metadata.Uid = uid
 					if err != nil {
 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
 					} else {
 						metadata.Process = filepath.Base(path)
 						metadata.ProcessPath = path
-						metadata.Uid = uid
 
 						if pkg, err := process.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
 							metadata.Process = pkg
@@ -736,7 +744,7 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 
 				// set target for Smart gorup nodes selected
 				if smartRuleType(rule.RuleType()) {
-					if rule.RuleType().String() != "GEOIP" || !countryCodeRegex.MatchString(rule.Payload()) {
+					if rule.RuleType() != C.GEOIP || !countryCodeRegex.MatchString(rule.Payload()) {
 						metadata.SmartTarget = fmt.Sprintf("%s [%s]", rule.RuleType().String(), rule.Payload())
 					}
 				}

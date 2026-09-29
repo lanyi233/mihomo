@@ -420,6 +420,7 @@ func (s *Smart) startGroupTasks() {
 	tasks := []smartScheduledTask{
 		{10 * time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true},
 		{5 * time.Minute, prefetchInterval, "Group targets prefetch", s.runPrefetch, false},
+		{time.Minute, claimInterval, "Group network claims refresh", s.claimASNEvidence, false},
 		{5 * time.Minute, checkInterval, "Group nodes stable check", s.checkNodesStable, false},
 		{5 * time.Minute, rankingInterval, "Group nodes ranking", s.updateNodeRanking, false},
 		{5 * time.Minute, recoveryCheckInterval, "Group nodes recovery check", s.checkBlockedNodes, false},
