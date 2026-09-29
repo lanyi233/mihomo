@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -66,10 +69,234 @@ func templateFuncMap() template.FuncMap {
 		return expanded, nil
 	}
 	funcs["cmd"] = runTemplateCommand
+	funcs["cat"] = templateCat
 	funcs["fromJson"] = templateFromJSON
 	funcs["fromYaml"] = templateFromYAML
 	funcs["fromToml"] = templateFromTOML
 	return funcs
+}
+
+// templateCat implements the cat template function. It returns the contents of
+// the requested files concatenated together, so a template can inline other
+// documents, for example {{ cat "subconfig/*.yaml" }}.
+//
+// Relative paths resolve against the directory of the configuration file
+// instead of the process working directory, which keeps templates independent
+// from where mihomo was started. Glob patterns keep shell semantics, plus a
+// ** segment matches zero or more directory levels like GitHub Actions
+// workflow path rules do. Directories are skipped, and a missing file or an
+// empty match is an error so a broken include never renders a partial
+// configuration.
+func templateCat(paths ...string) (string, error) {
+	if len(paths) == 0 {
+		return "", fmt.Errorf("cat requires at least one file path")
+	}
+	var out strings.Builder
+	endsWithNewline := true
+	for _, path := range paths {
+		matches, err := expandTemplateCatPath(path)
+		if err != nil {
+			return "", err
+		}
+		for _, match := range matches {
+			content, err := readTemplateFile(match)
+			if err != nil {
+				return "", err
+			}
+			if out.Len() > 0 && !endsWithNewline {
+				// Keep every included document on its own line so files
+				// without a trailing newline cannot merge YAML lines.
+				out.WriteByte('\n')
+			}
+			if out.Len()+len(content) > maxTemplateOutput {
+				return "", fmt.Errorf("cat output exceeds 8 MiB")
+			}
+			out.WriteString(content)
+			if content != "" {
+				endsWithNewline = strings.HasSuffix(content, "\n")
+			}
+		}
+	}
+	return out.String(), nil
+}
+
+// expandTemplateCatPath resolves one cat argument to a list of readable files.
+// Relative paths are anchored at the configuration file directory, plain shell
+// globs are expanded by filepath.Glob and a pattern containing ** recurses into
+// subdirectories. Directories are dropped: cat only reads files.
+func expandTemplateCatPath(path string) ([]string, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("cat file path is empty")
+	}
+	pattern := path
+	if filepath.IsAbs(pattern) {
+		pattern = filepath.Clean(pattern)
+	} else {
+		pattern = filepath.Join(filepath.Dir(C.Path.Config()), pattern)
+	}
+	var matches []string
+	var err error
+	if strings.Contains(pattern, "**") {
+		matches, err = globTemplateRecursive(pattern)
+	} else {
+		matches, err = filepath.Glob(pattern)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cat %q: %w", path, err)
+	}
+	files := filterTemplateFiles(matches)
+	if len(files) == 0 {
+		if strings.ContainsAny(path, "*?[") {
+			return nil, fmt.Errorf("cat: no file matched %q", path)
+		}
+		if info, statErr := os.Stat(pattern); statErr == nil && info.IsDir() {
+			return nil, fmt.Errorf("cat: %q is a directory", path)
+		}
+		return nil, fmt.Errorf("cat: file %q not found", path)
+	}
+	return files, nil
+}
+
+// filterTemplateFiles keeps only existing non-directory entries, so an include
+// never fails because a directory matched a pattern. Duplicates produced by
+// overlapping recursive expansions are removed.
+func filterTemplateFiles(paths []string) []string {
+	files := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		files = append(files, path)
+	}
+	return files
+}
+
+// globTemplateRecursive expands a pattern that contains the ** wildcard. A **
+// path segment stands for zero or more directory levels, so "subconfig/**"
+// covers the directory itself and everything below it, while every other
+// segment keeps plain shell glob behaviour. Paths are handled in slash form
+// internally and returned with the platform separator.
+func globTemplateRecursive(pattern string) ([]string, error) {
+	root, segments := splitTemplateGlobRoot(pattern)
+	candidates := []string{root}
+	for _, segment := range segments {
+		switch {
+		case segment == "**":
+			candidates = expandTemplateRecursiveSegment(candidates)
+		case !strings.ContainsAny(segment, "*?["):
+			joined := make([]string, 0, len(candidates))
+			for _, candidate := range candidates {
+				joined = append(joined, strings.TrimSuffix(candidate, "/")+"/"+segment)
+			}
+			candidates = joined
+		default:
+			expanded, err := expandTemplateMetaSegment(candidates, segment)
+			if err != nil {
+				return nil, err
+			}
+			candidates = expanded
+		}
+		if len(candidates) == 0 {
+			return nil, nil
+		}
+	}
+	sort.Strings(candidates)
+	paths := make([]string, len(candidates))
+	for index, candidate := range candidates {
+		paths[index] = filepath.FromSlash(candidate)
+	}
+	return paths, nil
+}
+
+// splitTemplateGlobRoot splits a pattern into its longest literal directory
+// prefix and the remaining segments, so recursion starts at the closest
+// relevant directory instead of scanning unrelated parts of the tree.
+func splitTemplateGlobRoot(pattern string) (string, []string) {
+	volume := filepath.VolumeName(pattern)
+	rest := filepath.ToSlash(pattern[len(volume):])
+	leading := strings.HasPrefix(rest, "/")
+	segments := strings.Split(strings.Trim(rest, "/"), "/")
+	literal := 0
+	for literal < len(segments) && !strings.ContainsAny(segments[literal], "*?[") {
+		literal++
+	}
+	root := volume
+	if leading {
+		root += "/"
+	}
+	root += strings.Join(segments[:literal], "/")
+	if root == "" {
+		root = "."
+	}
+	return root, segments[literal:]
+}
+
+// expandTemplateRecursiveSegment replaces every candidate with itself and all
+// of its descendants, which is what a ** segment matches. Symbolic links are
+// never followed, matching filepath.WalkDir, so a link loop cannot hang the
+// template.
+func expandTemplateRecursiveSegment(candidates []string) []string {
+	var expanded []string
+	for _, candidate := range candidates {
+		osPath := filepath.FromSlash(candidate)
+		info, err := os.Stat(osPath)
+		if err != nil {
+			continue
+		}
+		expanded = append(expanded, candidate)
+		if !info.IsDir() {
+			continue
+		}
+		_ = filepath.WalkDir(osPath, func(path string, _ fs.DirEntry, err error) error {
+			if err != nil || path == osPath {
+				return nil
+			}
+			expanded = append(expanded, filepath.ToSlash(path))
+			return nil
+		})
+	}
+	return expanded
+}
+
+// expandTemplateMetaSegment expands one shell-style segment below every
+// candidate with filepath.Glob, keeping the behaviour of *, ? and character
+// classes unchanged from plain shell globs.
+func expandTemplateMetaSegment(candidates []string, segment string) ([]string, error) {
+	var expanded []string
+	for _, candidate := range candidates {
+		matches, err := filepath.Glob(filepath.FromSlash(strings.TrimSuffix(candidate, "/") + "/" + segment))
+		if err != nil {
+			return nil, err
+		}
+		for _, match := range matches {
+			expanded = append(expanded, filepath.ToSlash(match))
+		}
+	}
+	return expanded, nil
+}
+
+// readTemplateFile reads one file bounded by the template output limit so a
+// large include fails instead of exhausting memory.
+func readTemplateFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("cat %q: %w", path, err)
+	}
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, maxTemplateOutput+1))
+	if err != nil {
+		return "", fmt.Errorf("cat %q: %w", path, err)
+	}
+	if len(data) > maxTemplateOutput {
+		return "", fmt.Errorf("cat %q exceeds 8 MiB", path)
+	}
+	return string(data), nil
 }
 
 // templateFromJSON decodes JSON text into a template value so conditions can

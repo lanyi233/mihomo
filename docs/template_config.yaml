@@ -207,6 +207,37 @@ sniffer:
 # Quote values containing colon, hash, brackets, or newlines.
 # 包含冒号、井号、方括号或换行的值应使用 quote。
 
+# The cat function reads file contents and returns them as a string.
+# cat 函数读取文件内容并返回字符串。
+# It replaces the Sprig string helper of the same name.
+# 它会覆盖 Sprig 中同名的字符串拼接函数。
+# Relative paths resolve against the configuration file directory, not the
+# 相对路径以配置文件所在目录为基准解析，而不是进程
+# process working directory, so includes work from any start directory.
+# 工作目录，因此从任意目录启动都能正常引入。
+# A glob pattern concatenates every match in sorted order.
+# glob 模式按排序顺序拼接所有匹配的文件。
+# A ** segment matches zero or more directory levels, following the path rules
+# ** 匹配零个或多个目录层级，规则与 GitHub
+# used by GitHub Actions workflow path filters.
+# Actions 工作流的路径过滤规则一致。
+# Other segments keep shell behaviour, so * never crosses a directory.
+# 其余段保持 shell 行为，* 不会跨目录匹配。
+# Directories matched by a pattern are skipped, cat only reads files.
+# 模式匹配到的目录会被跳过，cat 只读取文件。
+# Neighboring documents are separated by a newline when needed.
+# 相邻文档在必要时会用换行分隔。
+# A missing file, an empty match, or content above the output limit fails
+# 文件缺失、没有匹配项或内容超过输出上限都会
+# rendering before any YAML is decoded.
+# 在 YAML 解码前终止渲染。
+# Example form: inline every document in the subconfig directory.
+# 示例形式：内联 subconfig 目录下的所有文档。
+# cat "subconfig/*.yaml"
+# cat "subconfig/*.yaml"
+# The cat result can feed fromJson to read a JSON file.
+# cat 的结果可以传给 fromJson，用于读取 JSON 文件。
+
 # The fromJson function decodes JSON text into a value for field access.
 # fromJson 函数把 JSON 文本解码成可进行字段访问的值。
 # It accepts JSON as well as the JSONC and JSON5 derivatives: comments,
