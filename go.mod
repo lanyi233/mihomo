@@ -3,6 +3,7 @@ module github.com/metacubex/mihomo
 go 1.25.0
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/Masterminds/sprig/v3 v3.3.0
 	github.com/bahlo/generic-list-go v0.2.0
 	github.com/cilium/ebpf v0.22.1-0.20260724091036-00feb08ae4e5
@@ -57,6 +58,7 @@ require (
 	github.com/rasky/go-lzo v0.0.0-20200203143853-96a758eda86e
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
 	github.com/samber/lo v1.53.0
+	github.com/shoobyban/json5 v1.3.2
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.12.1
 	github.com/vernesong/leaves v0.0.0-20260629081247-2a1c022f37d0

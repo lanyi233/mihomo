@@ -139,6 +139,63 @@ func TestTemplateSystemData(t *testing.T) {
 	require.NotEmpty(t, os.Getenv("PATH"))
 }
 
+func TestRenderTemplateFromJSON(t *testing.T) {
+	// Strict JSON.
+	buf, err := renderTemplate([]byte(`{{ $anytest := fromJson "{\"success\":\"true\",\"port\":7890}" }}{{ if eq $anytest.success "true" }}cfg: hello world{{ end }}`))
+	require.NoError(t, err)
+	require.Equal(t, "cfg: hello world", string(buf))
+
+	buf, err = renderTemplate([]byte(`{{ $cfg := fromJson "{\"port\":7890}" }}{{ $cfg.port }}`))
+	require.NoError(t, err)
+	require.Equal(t, "7890", string(buf))
+
+	// JSONC: line and block comments, trailing commas.
+	buf, err = renderTemplate([]byte(`{{ $cfg := fromJson "{ /* status */ \"port\": 7890, // the port\n }" }}{{ $cfg.port }}`))
+	require.NoError(t, err)
+	require.Equal(t, "7890", string(buf))
+
+	// JSON5: unquoted keys, single quoted strings, hexadecimal numbers.
+	buf, err = renderTemplate([]byte(`{{ $cfg := fromJson "{ success: 'true', mask: 0xff, }" }}{{ if eq $cfg.success "true" }}cfg: {{ $cfg.mask }}{{ end }}`))
+	require.NoError(t, err)
+	require.Equal(t, "cfg: 255", string(buf))
+
+	// Malformed input stops rendering with an explicit error.
+	_, err = renderTemplate([]byte(`{{ fromJson "{" }}`))
+	require.ErrorContains(t, err, "invalid JSON")
+	_, err = renderTemplate([]byte(`{{ fromJson "{\"a\": 1," }}`))
+	require.ErrorContains(t, err, "invalid JSON")
+	_, err = renderTemplate([]byte(`{{ fromJson "}" }}`))
+	require.ErrorContains(t, err, "invalid JSON")
+	_, err = renderTemplate([]byte(`{{ fromJson "" }}`))
+	require.ErrorContains(t, err, "invalid JSON")
+}
+
+func TestRenderTemplateFromYAML(t *testing.T) {
+	buf, err := renderTemplate([]byte(`{{ $cfg := fromYaml "success: \"true\"\nport: 7890\nnames:\n  - a\n  - b\n" }}{{ if eq $cfg.success "true" }}cfg: {{ $cfg.port }} {{ len $cfg.names }}{{ end }}`))
+	require.NoError(t, err)
+	require.Equal(t, "cfg: 7890 2", string(buf))
+
+	buf, err = renderTemplate([]byte(`{{ $cfg := fromYaml "enabled: true\n" }}{{ $cfg.enabled }}`))
+	require.NoError(t, err)
+	require.Equal(t, "true", string(buf))
+
+	_, err = renderTemplate([]byte(`{{ fromYaml "items: [1, 2" }}`))
+	require.ErrorContains(t, err, "invalid YAML")
+}
+
+func TestRenderTemplateFromTOML(t *testing.T) {
+	buf, err := renderTemplate([]byte(`{{ $cfg := fromToml "success = \"true\"\n\n[extra]\nport = 7890\n" }}{{ if eq $cfg.success "true" }}cfg: {{ $cfg.extra.port }}{{ end }}`))
+	require.NoError(t, err)
+	require.Equal(t, "cfg: 7890", string(buf))
+
+	buf, err = renderTemplate([]byte(`{{ $cfg := fromToml "names = [\"a\", \"b\"]\n" }}{{ len $cfg.names }}`))
+	require.NoError(t, err)
+	require.Equal(t, "2", string(buf))
+
+	_, err = renderTemplate([]byte(`{{ fromToml "missing assignment" }}`))
+	require.ErrorContains(t, err, "invalid TOML")
+}
+
 func TestSplitTemplateCommand(t *testing.T) {
 	args, err := splitTemplateCommand(`'path/to/program' "argument with spaces" 1 2`)
 	require.NoError(t, err)

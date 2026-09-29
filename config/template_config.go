@@ -12,9 +12,12 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/Masterminds/sprig/v3"
+	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/component/age"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/shoobyban/json5"
 )
 
 const maxTemplateOutput = 8 << 20
@@ -63,7 +66,77 @@ func templateFuncMap() template.FuncMap {
 		return expanded, nil
 	}
 	funcs["cmd"] = runTemplateCommand
+	funcs["fromJson"] = templateFromJSON
+	funcs["fromYaml"] = templateFromYAML
+	funcs["fromToml"] = templateFromTOML
 	return funcs
+}
+
+// templateFromJSON decodes JSON text into a template value so conditions can
+// inspect structured data, for example a JSON status file kept next to the
+// configuration. The decoder implements the JSON5 superset, so JSONC comments
+// and trailing commas as well as JSON5 unquoted keys, single quoted strings
+// and hexadecimal numbers are accepted. Unlike the Sprig helper it reports
+// malformed input instead of silently producing nil, which would fail later
+// with an unrelated error.
+func templateFromJSON(value string) (interface{}, error) {
+	if err := checkTemplateJSON5Balance(value); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	output, err := json5.Unmarshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	return output, nil
+}
+
+// checkTemplateJSON5Balance rejects input whose brackets never close. The
+// JSON5 parser accepts a truncated object such as "{" or "{\"a\":1," as an
+// empty object, which would silently drop every field of a partially written
+// file, so the delimiters are matched again on the token stream. Comments are
+// ignored and braces inside strings never become tokens.
+func checkTemplateJSON5Balance(value string) error {
+	var stack []json5.TokenType
+	for _, token := range json5.Tokenize(value) {
+		switch token.Type {
+		case json5.TOKEN_LBRACE, json5.TOKEN_LBRACKET:
+			stack = append(stack, token.Type)
+		case json5.TOKEN_RBRACE, json5.TOKEN_RBRACKET:
+			expected := json5.TOKEN_LBRACE
+			if token.Type == json5.TOKEN_RBRACKET {
+				expected = json5.TOKEN_LBRACKET
+			}
+			if len(stack) == 0 || stack[len(stack)-1] != expected {
+				return fmt.Errorf("unexpected %q", token.Value)
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+	if len(stack) != 0 {
+		return fmt.Errorf("unexpected end of input")
+	}
+	return nil
+}
+
+// templateFromYAML decodes YAML text with the same library the mihomo
+// configuration itself uses, so mappings arrive as maps and can be read with
+// template field access.
+func templateFromYAML(value string) (interface{}, error) {
+	var output interface{}
+	if err := yaml.Unmarshal([]byte(value), &output); err != nil {
+		return nil, fmt.Errorf("invalid YAML: %w", err)
+	}
+	return output, nil
+}
+
+// templateFromTOML decodes TOML text, which is how rule sets and other
+// auxiliary files ship comments that JSON cannot carry.
+func templateFromTOML(value string) (interface{}, error) {
+	var output interface{}
+	if err := toml.Unmarshal([]byte(value), &output); err != nil {
+		return nil, fmt.Errorf("invalid TOML: %w", err)
+	}
+	return output, nil
 }
 
 func runTemplateCommand(command string) (string, error) {

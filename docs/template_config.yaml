@@ -207,6 +207,36 @@ sniffer:
 # Quote values containing colon, hash, brackets, or newlines.
 # 包含冒号、井号、方括号或换行的值应使用 quote。
 
+# The fromJson function decodes JSON text into a value for field access.
+# fromJson 函数把 JSON 文本解码成可进行字段访问的值。
+# It accepts JSON as well as the JSONC and JSON5 derivatives: comments,
+# # 它接受 JSON 以及 JSONC、JSON5 衍生格式：注释、
+# trailing commas, unquoted keys, single quoted strings and hex numbers.
+# 尾随逗号、不带引号的键、单引号字符串与十六进制数字。
+# Malformed input stops rendering with an explicit error.
+# 无效输入会以明确的错误终止渲染。
+# Field access reads keys as template values, so compare strings with eq and
+# 字段访问把键读作模板值，字符串用 eq 比较，
+# keep the decoded types consistent with the comparison.
+# 并保证解码类型与比较目标一致。
+# Example form: assign fromJson output, then test its success field with eq
+# 示例形式：把 fromJson 结果赋值后，再用 eq 判断其 success 字段，
+# to emit a section conditionally.
+# 以条件输出区块。
+# $anytest := fromJson "{\"success\":\"true\"}"
+# $anytest := fromJson "{\"success\":\"true\"}"
+# if eq $anytest.success "true"
+# if eq $anytest.success "true"
+
+# The fromYaml and fromToml functions decode YAML and TOML the same way, so
+# fromYaml 与 fromToml 函数以同样方式解码 YAML 和 TOML，因此
+# rule files that need comments can be inlined and inspected as well.
+# 需要注释的规则文件也可以被内联和读取。
+# Example form: read a field from a decoded TOML table.
+# 示例形式：读取解码后的 TOML 表中的字段。
+# $cfg := fromToml "success = \"true\""
+# $cfg := fromToml "success = \"true\""
+
 # Execute one program directly with parsed arguments.
 # 直接执行一个程序，并解析其参数。
 # The command is not passed through a shell in this form.
