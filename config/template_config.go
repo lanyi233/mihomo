@@ -34,14 +34,19 @@ type TemplateData struct {
 }
 
 type SystemTemplateData struct {
-	OS   string
-	Arch string
+	OS       string
+	Arch     string
+	HostName string
 }
 
 func newTemplateData() TemplateData {
 	return TemplateData{System: SystemTemplateData{
 		OS:   runtime.GOOS,
 		Arch: runtime.GOARCH,
+		HostName: func() string {
+			name, _ := os.Hostname()
+			return name
+		}(),
 	}}
 }
 
