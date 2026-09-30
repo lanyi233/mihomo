@@ -107,6 +107,7 @@ func templateCat(paths ...string) (string, error) {
 				// Keep every included document on its own line so files
 				// without a trailing newline cannot merge YAML lines.
 				out.WriteByte('\n')
+				endsWithNewline = true
 			}
 			if out.Len()+len(content) > maxTemplateOutput {
 				return "", fmt.Errorf("cat output exceeds 8 MiB")

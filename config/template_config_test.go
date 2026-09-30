@@ -153,11 +153,16 @@ func TestRenderTemplateCat(t *testing.T) {
 	// Sorted glob order, and the first file has no trailing newline so the
 	// include must add the separator itself.
 	require.NoError(t, os.WriteFile(filepath.Join(subconfig, "a.yaml"), []byte("port-a: 1"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(subconfig, "empty.yaml"), []byte(""), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(subconfig, "b.yaml"), []byte("port-b: 2\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "single.yaml"), []byte("port-s: 3\n"), 0o600))
 	setTemplateConfigFile(t, filepath.Join(dir, "config.yaml"))
 
 	buf, err := renderTemplate([]byte(`{{ cat "subconfig/*.yaml" }}`))
+	require.NoError(t, err)
+	require.Equal(t, "port-a: 1\nport-b: 2\n", string(buf))
+
+	buf, err = renderTemplate([]byte(`{{ cat "subconfig/a.yaml" "subconfig/empty.yaml" "subconfig/b.yaml" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "port-a: 1\nport-b: 2\n", string(buf))
 
