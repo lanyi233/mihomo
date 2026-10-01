@@ -39,15 +39,81 @@ type SystemTemplateData struct {
 	HostName string
 }
 
+func androidGetProp(prop string) string {
+	if runtime.GOOS != "android" {
+		return ""
+	}
+
+	out, err := exec.Command("getprop", prop).Output()
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(string(out))
+}
+
+func androidGetSettings(namespace, key string) string {
+	if runtime.GOOS != "android" {
+		return ""
+	}
+
+	switch namespace {
+	case "system", "secure", "global", "vendor":
+	default:
+		fmt.Errorf(
+			"[androidGetSettings] invalid android settings namespace: %q",
+			namespace,
+		)
+		return ""
+	}
+
+	out, err := exec.Command("settings", "get", namespace, key).Output()
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(string(out))
+}
+
 func newTemplateData() TemplateData {
-	return TemplateData{System: SystemTemplateData{
-		OS:   runtime.GOOS,
-		Arch: runtime.GOARCH,
-		HostName: func() string {
-			name, _ := os.Hostname()
-			return name
-		}(),
-	}}
+	return TemplateData{
+		System: SystemTemplateData{
+			OS:   runtime.GOOS,
+			Arch: runtime.GOARCH,
+
+			HostName: func() string {
+				if runtime.GOOS == "android" {
+					if name := androidGetSettings("global", "device_name"); name != "" {
+						return name
+					}
+
+					if name := androidGetSettings("secure", "bluetooth_name"); name != "" {
+						return name
+					}
+
+					if name := androidGetProp("ro.product.device"); name != "" {
+						return name
+					}
+
+					if name := androidGetProp("ro.product.model"); name != "" {
+						return name
+					}
+
+					fmt.Errorf(
+						"[System.HostName] all Android hostname queries returned empty, fallback to os.Hostname()",
+					)
+				}
+
+				name, err := os.Hostname()
+				if err != nil {
+					fmt.Errorf("[System.HostName] os.Hostname() failed: %v", err)
+					return ""
+				}
+
+				return name
+			}(),
+		},
+	}
 }
 
 func templateFuncMap() template.FuncMap {
