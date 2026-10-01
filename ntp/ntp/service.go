@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/power"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -21,7 +22,7 @@ var globalMu sync.Mutex
 type Service struct {
 	server         M.Socksaddr
 	dialer         proxydialer.SingDialer
-	ticker         *time.Ticker
+	interval       time.Duration
 	ctx            context.Context
 	cancel         context.CancelFunc
 	syncSystemTime bool
@@ -44,7 +45,7 @@ func ReCreateNTPService(server string, interval time.Duration, dialerProxy strin
 	globalSrv = &Service{
 		server:         M.ParseSocksaddr(server),
 		dialer:         proxydialer.NewSingDialer(cDialer),
-		ticker:         time.NewTicker(interval * time.Minute),
+		interval:       interval * time.Minute,
 		ctx:            ctx,
 		cancel:         cancel,
 		syncSystemTime: syncSystemTime,
@@ -97,16 +98,14 @@ func (srv *Service) update() error {
 
 func (srv *Service) loopUpdate() {
 	defer mihomoNtp.SetOffset(0)
-	defer srv.ticker.Stop()
-	for {
+	// Clock synchronization is still immediate when started online and on an
+	// overdue resume: TLS users need corrected time before optional downloads.
+	next := time.Now()
+	for power.WaitUntil(srv.ctx, next, 0) {
 		err := srv.update()
 		if err != nil {
 			log.Warnln("Sync time failed: %s", err)
 		}
-		select {
-		case <-srv.ctx.Done():
-			return
-		case <-srv.ticker.C:
-		}
+		next = time.Now().Add(srv.interval)
 	}
 }

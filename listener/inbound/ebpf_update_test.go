@@ -116,6 +116,28 @@ func TestEBPFUpdateAppliesTheFieldsItCan(t *testing.T) {
 	}
 }
 
+// The per-scope bypass-rule-set keys go in place like the top-level one. Only
+// that key is cleared inside each section, so the rest of a section still
+// forces a rebuild; see "local section" below.
+func TestEBPFUpdateAppliesScopedBypassRuleSets(t *testing.T) {
+	listener, stub := runningEBPF(t, baseEBPFOption())
+
+	changed := baseEBPFOption()
+	changed.Local.BypassRuleSet = []string{"LAN"}
+	changed.Shared.BypassRuleSet = []string{"ChinaIP"}
+	handled, err := listener.Update(changed)
+	if err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if !handled {
+		t.Fatal("a per-scope bypass-rule-set change was refused, so the inbound is rebuilt")
+	}
+	if !slices.Equal(stub.applied.Local.BypassRuleSet, []string{"LAN"}) ||
+		!slices.Equal(stub.applied.Shared.BypassRuleSet, []string{"ChinaIP"}) {
+		t.Fatalf("applied local=%v shared=%v", stub.applied.Local.BypassRuleSet, stub.applied.Shared.BypassRuleSet)
+	}
+}
+
 func TestEBPFUpdateRefusesWhatItCannotApply(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string

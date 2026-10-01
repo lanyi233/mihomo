@@ -98,6 +98,7 @@ func runSmartTaskSchedule(
 			readyTimer.Reset(readyPoll)
 		}
 	}
+	readyTimer.Stop()
 
 	now := time.Now()
 	states := make([]smartScheduledTaskState, len(tasks))
@@ -128,6 +129,17 @@ func runSmartTaskSchedule(
 	}()
 
 	wasPaused := false
+	complete := func(idx int) {
+		state := &states[idx]
+		state.running = false
+		// Running jobs do not need timer wakeups. Skip the deadlines they
+		// missed once, on completion, preserving the original cadence.
+		now := time.Now()
+		if !state.next.After(now) {
+			missed := now.Sub(state.next)/state.period + 1
+			state.next = state.next.Add(missed * state.period)
+		}
+	}
 	for {
 		paused, changed := power.BackgroundState()
 		if paused {
@@ -159,6 +171,9 @@ func runSmartTaskSchedule(
 				continue
 			}
 			unfinished++
+			if states[i].running {
+				continue
+			}
 			if earliest.IsZero() || states[i].next.Before(earliest) {
 				earliest = states[i].next
 			}
@@ -167,17 +182,17 @@ func runSmartTaskSchedule(
 			return
 		}
 
-		wait := time.Until(earliest)
-		if wait < 0 {
-			wait = 0
-		}
 		if !timer.Stop() {
 			select {
 			case <-timer.C:
 			default:
 			}
 		}
-		timer.Reset(wait)
+		var timerC <-chan time.Time
+		if !earliest.IsZero() {
+			timer.Reset(max(time.Until(earliest), 0))
+			timerC = timer.C
+		}
 
 		select {
 		case <-ctx.Done():
@@ -185,8 +200,8 @@ func runSmartTaskSchedule(
 		case <-changed:
 			continue
 		case idx := <-done:
-			states[idx].running = false
-		case now = <-timer.C:
+			complete(idx)
+		case now = <-timerC:
 			if ctx.Err() != nil {
 				return
 			}

@@ -31,6 +31,8 @@ const (
 	TCMapTcListenerSockets                     = "tc_listener_sockets"
 	TCMapTcLocalBypassPort                     = "tc_local_bypass_port"
 	TCMapTcSelfSockets                         = "tc_self_sockets"
+	TCMapTcSharedBypassIpv4                    = "tc_shared_bypass_ipv4"
+	TCMapTcSharedBypassIpv6                    = "tc_shared_bypass_ipv6"
 	TCMapTcSharedBypassPort                    = "tc_shared_bypass_port"
 	TCMapTcStats                               = "tc_stats"
 	TCMapTcUidPolicy                           = "tc_uid_policy"
@@ -125,6 +127,8 @@ type TCMapSpecs struct {
 	TcListenerSockets   *ebpf.MapSpec `ebpf:"tc_listener_sockets"`
 	TcLocalBypassPort   *ebpf.MapSpec `ebpf:"tc_local_bypass_port"`
 	TcSelfSockets       *ebpf.MapSpec `ebpf:"tc_self_sockets"`
+	TcSharedBypassIpv4  *ebpf.MapSpec `ebpf:"tc_shared_bypass_ipv4"`
+	TcSharedBypassIpv6  *ebpf.MapSpec `ebpf:"tc_shared_bypass_ipv6"`
 	TcSharedBypassPort  *ebpf.MapSpec `ebpf:"tc_shared_bypass_port"`
 	TcStats             *ebpf.MapSpec `ebpf:"tc_stats"`
 	TcUidPolicy         *ebpf.MapSpec `ebpf:"tc_uid_policy"`
@@ -171,6 +175,8 @@ type TCMaps struct {
 	TcListenerSockets   *ebpf.Map `ebpf:"tc_listener_sockets"`
 	TcLocalBypassPort   *ebpf.Map `ebpf:"tc_local_bypass_port"`
 	TcSelfSockets       *ebpf.Map `ebpf:"tc_self_sockets"`
+	TcSharedBypassIpv4  *ebpf.Map `ebpf:"tc_shared_bypass_ipv4"`
+	TcSharedBypassIpv6  *ebpf.Map `ebpf:"tc_shared_bypass_ipv6"`
 	TcSharedBypassPort  *ebpf.Map `ebpf:"tc_shared_bypass_port"`
 	TcStats             *ebpf.Map `ebpf:"tc_stats"`
 	TcUidPolicy         *ebpf.Map `ebpf:"tc_uid_policy"`
@@ -193,6 +199,8 @@ func (m *TCMaps) Close() error {
 		m.TcListenerSockets,
 		m.TcLocalBypassPort,
 		m.TcSelfSockets,
+		m.TcSharedBypassIpv4,
+		m.TcSharedBypassIpv6,
 		m.TcSharedBypassPort,
 		m.TcStats,
 		m.TcUidPolicy,

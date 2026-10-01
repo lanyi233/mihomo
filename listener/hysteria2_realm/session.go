@@ -54,6 +54,7 @@ type server struct {
 	realms         map[string]*session // realmID -> session
 	sessions       map[string]*session // sessionID -> session
 	ipCounts       map[string]int      // clientIP -> realm count
+	reaperWake     chan struct{}
 	realmToken     string
 	maxRealms      int
 	maxRealmsPerIP int
@@ -70,6 +71,7 @@ func newServer(cfg serverConfig) *server {
 		realms:         make(map[string]*session),
 		sessions:       make(map[string]*session),
 		ipCounts:       make(map[string]int),
+		reaperWake:     make(chan struct{}, 1),
 		realmToken:     cfg.realmToken,
 		maxRealms:      cfg.maxRealms,
 		maxRealmsPerIP: cfg.maxRealmsPerIP,
@@ -116,20 +118,13 @@ func (s *server) removeSessionLocked(sess *session) {
 		}
 	}
 	delete(s.sessions, sess.id)
+	if len(s.sessions) == 0 {
+		s.wakeReaper()
+	}
 	for nonce, ch := range sess.pending {
 		close(ch)
 		delete(sess.pending, nonce)
 	}
-}
-
-func (s *server) removeExpiredSession(sess *session, now time.Time) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if sess.closed || !now.After(sess.expires) {
-		return false
-	}
-	s.removeSessionLocked(sess)
-	return true
 }
 
 func (s *server) registerPending(sess *session, nonce string) (chan punchResponsePayload, bool) {
@@ -186,28 +181,67 @@ func (s *server) sendEvent(sess *session, ev sessionEvent) bool {
 }
 
 func (s *server) reaper(ctx context.Context) {
-	t := time.NewTicker(reaperInterval)
-	defer t.Stop()
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+		next := s.reapExpiredSessions(time.Now())
+		var timerC <-chan time.Time
+		if !next.IsZero() {
+			// Keep the existing one-second sweep bound for a busy server,
+			// while skipping all polls before the earliest possible expiry.
+			delay := max(time.Until(next), reaperInterval)
+			if timer == nil {
+				timer = time.NewTimer(delay)
+			} else {
+				timer.Reset(delay)
+			}
+			timerC = timer.C
+		} else if timer != nil {
+			timer.Stop()
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			s.mu.Lock()
-			now := time.Now()
-			var expired []*session
-			for _, sess := range s.sessions {
-				if now.After(sess.expires) {
-					expired = append(expired, sess)
-				}
-			}
-			s.mu.Unlock()
-			for _, sess := range expired {
-				if s.removeExpiredSession(sess, now) {
-					debugf("session expired realm=%s session=%s", sess.realmID, sess.id)
-				}
-			}
+		case <-s.reaperWake:
+		case <-timerC:
 		}
 	}
+}
 
+func (s *server) wakeReaper() {
+	select {
+	case s.reaperWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *server) reapExpiredSessions(now time.Time) time.Time {
+	s.mu.Lock()
+	var next time.Time
+	var expired []*session
+	for _, sess := range s.sessions {
+		if now.After(sess.expires) {
+			s.removeSessionLocked(sess)
+			expired = append(expired, sess)
+		} else if next.IsZero() || sess.expires.Before(next) {
+			next = sess.expires
+		}
+	}
+	s.mu.Unlock()
+	for _, sess := range expired {
+		debugf("session expired realm=%s session=%s", sess.realmID, sess.id)
+	}
+	if !next.IsZero() {
+		// Session authorization remains valid at the exact deadline, and
+		// expires just after it, as in getSessionByToken.
+		next = next.Add(time.Nanosecond)
+	}
+	return next
 }

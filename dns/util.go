@@ -25,14 +25,28 @@ const (
 
 const serverFailureCacheTTL uint32 = 5
 
-func minimalTTL(records []D.RR) uint32 {
-	rr := lo.MinBy(records, func(r1 D.RR, r2 D.RR) bool {
-		return r1.Header().Ttl < r2.Header().Ttl
-	})
-	if rr == nil {
+func minimalTTL(recordSets ...[]D.RR) uint32 {
+	ttl := ^uint32(0)
+	found := false
+	for _, records := range recordSets {
+		for _, rr := range records {
+			found = true
+			if value := rr.Header().Ttl; value < ttl {
+				ttl = value
+			}
+		}
+	}
+	if !found {
 		return 0
 	}
-	return rr.Header().Ttl
+	return ttl
+}
+
+// questionKey avoids formatting a presentation-format DNS question on every
+// cache lookup. The fixed-size suffix keeps names, classes and types distinct.
+func questionKey(q D.Question) string {
+	suffix := [4]byte{byte(q.Qclass >> 8), byte(q.Qclass), byte(q.Qtype >> 8), byte(q.Qtype)}
+	return q.Name + string(suffix[:])
 }
 
 func updateTTL(records []D.RR, ttl uint32) {
@@ -48,7 +62,7 @@ func updateTTL(records []D.RR, ttl uint32) {
 // getMsgFromCache returns a cached dns message if it exists, otherwise returns nil.
 // the returned msg is a copy of the original msg, so it can be modified without affecting the original msg.
 func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
-	msg, expireTime, hit := c.GetWithExpire(q.String())
+	msg, expireTime, hit := c.GetWithExpire(questionKey(q))
 	if msg != nil {
 		msg = msg.Copy() // never modify the original msg
 	}
@@ -67,8 +81,8 @@ func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
 	msg = msg.Copy() // never modify the original msg
 
 	// OPT RRs MUST NOT be cached, forwarded, or stored in or loaded from master files.
-	msg.Extra = lo.Filter(msg.Extra, func(rr D.RR, index int) bool {
-		return rr.Header().Rrtype != D.TypeOPT
+	msg.Extra = slices.DeleteFunc(msg.Extra, func(rr D.RR) bool {
+		return rr.Header().Rrtype == D.TypeOPT
 	})
 
 	var ttl uint32
@@ -77,13 +91,13 @@ func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
 		// If it does so it MUST NOT cache it for longer than five (5) minutes [...]
 		ttl = serverFailureCacheTTL
 	} else {
-		ttl = minimalTTL(lo.Concat(msg.Answer, msg.Ns, msg.Extra))
+		ttl = minimalTTL(msg.Answer, msg.Ns, msg.Extra)
 	}
 	if ttl == 0 {
 		return
 	}
 
-	c.SetWithExpire(q.String(), msg, time.Now().Add(time.Duration(ttl)*time.Second))
+	c.SetWithExpire(questionKey(q), msg, time.Now().Add(time.Duration(ttl)*time.Second))
 }
 
 func setMsgTTL(msg *D.Msg, ttl uint32) {
@@ -424,16 +438,20 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 			// below, which are where every other nameserver's query and answer
 			// get logged. Log them here too, or a domain blocked with rcode://
 			// leaves no trace in the debug log at all.
-			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
+			if log.DebugEnabled() {
+				log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
+			}
 			msg, err = client.ExchangeContext(ctx, m)
-			if err == nil {
+			if err == nil && log.DebugEnabled() {
 				log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(msg), client.Address())
 			}
 			return msg, false, err
 		}
 		client := client // shadow define client to ensure the value captured by the closure will not be changed in the next loop
 		fast.Go(func() (*D.Msg, error) {
-			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
+			if log.DebugEnabled() {
+				log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
+			}
 			m, err := client.ExchangeContext(ctx, m)
 			if err != nil {
 				return nil, err
@@ -442,7 +460,9 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 				// so we would ignore RCode errors from RCode clients.
 				return nil, errors.New("server failure: " + D.RcodeToString[m.Rcode])
 			}
-			log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(m), client.Address())
+			if log.DebugEnabled() {
+				log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(m), client.Address())
+			}
 			return m, nil
 		})
 	}

@@ -16,7 +16,8 @@ import (
 
 func updatableInboundForTest(t *testing.T, providerTunnel *fakeRuleProviderTunnel, tags ...string) *Inbound {
 	t.Helper()
-	i := &Inbound{providerTunnel: providerTunnel, bypassRuleSetTags: tags}
+	// A local-only inbound, laid out the way New leaves one.
+	i := &Inbound{providerTunnel: providerTunnel, localEnabled: true, bypassRuleSetTags: tags, localBypassTags: tags}
 	i.udpTimeout.Store(int64(300 * time.Second))
 	i.bypassTUNDirect = true
 	i.bypassPublisher = resolver.NewEBPFBypassPublisher()
@@ -178,6 +179,8 @@ func TestUpdateOnlyDemandsARebuildForThePlaneThatNeedsOne(t *testing.T) {
 	}
 
 	withShared := updatableInboundForTest(t, providerTunnel, "ChinaIP")
+	withShared.sharedEnabled = true
+	withShared.sharedBypassTags = withShared.localBypassTags
 	withShared.sharedRewrite = &sharedRewrite{}
 	err := withShared.Update(updateOptions(nil, 300))
 	if !errors.Is(err, ErrRebuildRequired) {

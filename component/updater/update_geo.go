@@ -190,11 +190,10 @@ var ErrGetDatabaseUpdateSkip = errors.New("GEO database is updating, skip")
 func UpdateGeoDatabases() error {
 	log.Infoln("[GEO] Start updating GEO database")
 
-	if updatingGeo.Load() {
+	if !updatingGeo.CompareAndSwap(false, true) {
 		return ErrGetDatabaseUpdateSkip
 	}
 
-	updatingGeo.Store(true)
 	defer updatingGeo.Store(false)
 
 	log.Infoln("[GEO] Updating GEO database")
@@ -232,10 +231,8 @@ func RegisterGeoUpdater() {
 		return
 	}
 
+	interval := time.Duration(updateInterval) * time.Hour
 	go func() {
-		ticker := time.NewTicker(time.Duration(updateInterval) * time.Hour)
-		defer ticker.Stop()
-
 		lastUpdate, err := getUpdateTime()
 		if err != nil {
 			log.Errorln("[GEO] Get GEO database update time error: %s", err.Error())
@@ -243,19 +240,12 @@ func RegisterGeoUpdater() {
 		}
 
 		log.Infoln("[GEO] last update time %s", lastUpdate)
-		if lastUpdate.Add(time.Duration(updateInterval) * time.Hour).Before(time.Now()) {
-			log.Infoln("[GEO] Database has not been updated for %v, update now", time.Duration(updateInterval)*time.Hour)
-			if err := UpdateGeoDatabases(); err != nil {
-				log.Errorln("[GEO] Failed to update GEO database: %s", err.Error())
-				return
-			}
-		}
-
-		for range ticker.C {
-			log.Infoln("[GEO] updating database every %d hours", updateInterval)
+		overdue := lastUpdate.Add(interval).Before(time.Now())
+		runPeriodicUpdates(context.Background(), interval, overdue, func() {
+			log.Infoln("[GEO] updating database every %s", interval)
 			if err := UpdateGeoDatabases(); err != nil {
 				log.Errorln("[GEO] Failed to update GEO database: %s", err.Error())
 			}
-		}
+		})
 	}()
 }

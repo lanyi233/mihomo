@@ -60,3 +60,64 @@ func TestSharedNetworkTCPReleaseGrace(t *testing.T) {
 		t.Fatalf("unexpected conservative release deadline: available=%v delay=%v", available, delay)
 	}
 }
+
+func BenchmarkSharedNetworkTCPReleaseLaterDeadline(b *testing.B) {
+	backend := &SharedNetworkBackend{flowWake: make(chan struct{}, 1)}
+	now := time.Now()
+	backend.deferTCPFlowReleaseLocked(SharedNetworkFlowHandle{}, now)
+	<-backend.flowWake
+	flows := make([]SharedNetworkFlowHandle, 1024)
+	for index := range flows {
+		flows[index].generation = uint64(index + 1)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := range b.N {
+		backend.deferTCPFlowReleaseLocked(flows[index%len(flows)], now.Add(time.Second))
+		select {
+		case <-backend.flowWake:
+		default:
+		}
+	}
+}
+
+func TestSharedNetworkFlowWakeOnlyForNewWorkOrEarlierDeadline(t *testing.T) {
+	backend := &SharedNetworkBackend{flowWake: make(chan struct{}, 1)}
+	expectWake := func(want bool) {
+		t.Helper()
+		select {
+		case <-backend.TCPFlowWake():
+			if !want {
+				t.Fatal("unchanged maintenance deadline or occupancy woke the janitor")
+			}
+		default:
+			if want {
+				t.Fatal("new work did not wake the janitor")
+			}
+		}
+	}
+	flow := SharedNetworkFlowHandle{generation: 1}
+	backend.retainFlowLocked(flow)
+	expectWake(true)
+	backend.retainFlowLocked(flow)
+	expectWake(false)
+	if backend.releaseFlowReferenceLocked(flow) {
+		t.Fatal("extra owner was lost")
+	}
+	if !backend.releaseFlowReferenceLocked(flow) {
+		t.Fatal("last owner did not release the flow")
+	}
+	now := time.Now()
+	backend.deferTCPFlowReleaseLocked(flow, now)
+	expectWake(true)
+	backend.deferTCPFlowReleaseLocked(SharedNetworkFlowHandle{generation: 2}, now.Add(time.Second))
+	expectWake(false)
+	if len(backend.flowReleases) != 2 {
+		t.Fatal("later release was not retained for the scheduled flush")
+	}
+	backend.deferTCPFlowReleaseLocked(SharedNetworkFlowHandle{generation: 3}, now.Add(-time.Second))
+	expectWake(true)
+	if delay, available := backend.NextTCPFlowReleaseDelay(now); !available || delay != sharedNetworkTCPReleaseGrace-time.Second {
+		t.Fatalf("earlier release was not scheduled: delay=%s available=%v", delay, available)
+	}
+}

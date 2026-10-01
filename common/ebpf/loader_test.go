@@ -80,6 +80,8 @@ func TestEmbeddedTCObjectLayout(t *testing.T) {
 		"tc_uid_policy":          {8, 1},
 		"tc_bypass_ipv4":         {8, 1},
 		"tc_bypass_ipv6":         {20, 1},
+		"tc_shared_bypass_ipv4":  {8, 1},
+		"tc_shared_bypass_ipv6":  {20, 1},
 		"tc_include_source_ipv4": {8, 1},
 		"tc_include_source_ipv6": {20, 1},
 		"tc_exclude_source_ipv4": {8, 1},

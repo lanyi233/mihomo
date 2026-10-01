@@ -180,13 +180,12 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, proxies [
 		return
 	}
 
-	names := make([]string, len(proxies))
-	for i, p := range proxies {
-		names[i] = p.Name()
-	}
-
 	targetKey := FormatDBKey(config, group, target)
 	if existing, expireTime, found := unwrapCache.GetWithExpire(targetKey); !found || len(existing.Proxies) == 0 || expireTime.Before(time.Now()) {
+		names := make([]string, len(proxies))
+		for i, p := range proxies {
+			names[i] = p.Name()
+		}
 		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
 	}
 }

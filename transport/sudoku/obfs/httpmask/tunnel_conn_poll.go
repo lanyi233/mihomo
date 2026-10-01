@@ -222,10 +222,10 @@ func (c *pollConn) pushLoop() {
 		buf        bytes.Buffer
 		encoded    = make([]byte, base64.StdEncoding.EncodedLen(maxLineRawBytes)+1)
 		pendingRaw int
-		timer      = time.NewTimer(flushInterval)
+		timer      batchTimer
 		writeErr   error
 	)
-	defer timer.Stop()
+	defer timer.stop()
 	defer func() { c.completeWrite(writeErr) }()
 
 	fail := func(err error) {
@@ -234,6 +234,7 @@ func (c *pollConn) pushLoop() {
 	}
 
 	flush := func() error {
+		timer.stop()
 		if buf.Len() == 0 {
 			return nil
 		}
@@ -280,8 +281,6 @@ func (c *pollConn) pushLoop() {
 		return nil
 	}
 
-	resetTimer(timer, flushInterval)
-
 	enqueue := func(b []byte) error {
 		for len(b) > 0 {
 			chunk := b
@@ -302,6 +301,7 @@ func (c *pollConn) pushLoop() {
 			encoded[encLen] = '\n'
 			_, _ = buf.Write(encoded[:encLen+1])
 			pendingRaw += len(chunk)
+			timer.start(flushInterval)
 		}
 		return nil
 	}
@@ -323,14 +323,12 @@ func (c *pollConn) pushLoop() {
 					fail(fmt.Errorf("poll push flush failed: %w", err))
 					return
 				}
-				resetTimer(timer, flushInterval)
 			}
 		case <-timer.C:
 			if err := flush(); err != nil {
 				fail(fmt.Errorf("poll push flush failed: %w", err))
 				return
 			}
-			resetTimer(timer, flushInterval)
 		case <-c.writeClosed:
 			// Drain any already-accepted writes so CloseWrite does not lose data.
 			for {

@@ -2,6 +2,7 @@ package statistic
 
 import (
 	"os"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -35,7 +36,9 @@ type Manager struct {
 	uploadTotal   atomic.Int64
 	downloadTotal atomic.Int64
 	pid           int32
-	memory        uint64
+	memory        atomic.Uint64
+	memoryMu      sync.Mutex
+	memoryUpdated time.Time
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -81,7 +84,7 @@ func (m *Manager) Total() (up, down int64) {
 
 func (m *Manager) Memory() uint64 {
 	m.updateMemory()
-	return m.memory
+	return m.memory.Load()
 }
 
 func (m *Manager) Snapshot() *Snapshot {
@@ -94,16 +97,24 @@ func (m *Manager) Snapshot() *Snapshot {
 		UploadTotal:   m.uploadTotal.Load(),
 		DownloadTotal: m.downloadTotal.Load(),
 		Connections:   connections,
-		Memory:        m.memory,
+		Memory:        m.memory.Load(),
 	}
 }
 
 func (m *Manager) updateMemory() {
+	m.memoryMu.Lock()
+	defer m.memoryMu.Unlock()
+	// Multiple dashboards share one on-demand sample. No background timer is
+	// needed when nobody is watching, and failed queries are rate limited too.
+	if time.Since(m.memoryUpdated) < time.Second {
+		return
+	}
+	m.memoryUpdated = time.Now()
 	stat, err := memory.GetMemoryInfo(m.pid)
 	if err != nil {
 		return
 	}
-	m.memory = stat.RSS
+	m.memory.Store(stat.RSS)
 }
 
 func (m *Manager) ResetStatistic() {
@@ -176,4 +187,3 @@ func (m *Manager) RangeSmartTarget(target string, fn func(id string) bool) {
 		})
 	}
 }
-

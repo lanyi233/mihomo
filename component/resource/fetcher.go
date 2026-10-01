@@ -4,11 +4,13 @@ import (
 	"context"
 	"io"
 	"io/fs"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/power"
 	"github.com/metacubex/mihomo/component/slowdown"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
@@ -34,6 +36,7 @@ type Fetcher[V any] struct {
 	onUpdate     func(V)
 	watcher      *fswatch.Watcher
 	loadBufMutex sync.Mutex
+	stateMu      sync.RWMutex
 	backoff      slowdown.Backoff
 }
 
@@ -50,7 +53,15 @@ func (f *Fetcher[V]) VehicleType() P.VehicleType {
 }
 
 func (f *Fetcher[V]) UpdatedAt() time.Time {
+	f.stateMu.RLock()
+	defer f.stateMu.RUnlock()
 	return f.updatedAt
+}
+
+func (f *Fetcher[V]) setUpdatedAt(updatedAt time.Time) {
+	f.stateMu.Lock()
+	f.updatedAt = updatedAt
+	f.stateMu.Unlock()
 }
 
 func (f *Fetcher[V]) Initial() (V, error) {
@@ -59,7 +70,7 @@ func (f *Fetcher[V]) Initial() (V, error) {
 		buf, err := os.ReadFile(f.vehicle.Path())
 		modTime := stat.ModTime()
 		contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), false)
-		f.updatedAt = modTime // reset updatedAt to file's modTime
+		f.setUpdatedAt(modTime) // reset updatedAt to file's modTime
 
 		if err == nil {
 			err = f.startPullLoop(time.Since(modTime) > f.interval)
@@ -81,7 +92,7 @@ func (f *Fetcher[V]) Initial() (V, error) {
 				modTime = stat.ModTime()
 			}
 			contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), true)
-			f.updatedAt = modTime // reset updatedAt to file's modTime
+			f.setUpdatedAt(modTime) // reset updatedAt to file's modTime
 
 			if err == nil {
 				log.Infoln("[Provider] %s extract successful from bundle file", f.Name())
@@ -114,7 +125,10 @@ func (f *Fetcher[V]) Initial() (V, error) {
 }
 
 func (f *Fetcher[V]) Update() (V, bool, error) {
-	buf, hash, err := f.vehicle.Read(f.ctx, f.hash)
+	f.stateMu.RLock()
+	oldHash := f.hash
+	f.stateMu.RUnlock()
+	buf, hash, err := f.vehicle.Read(f.ctx, oldHash)
 	if err != nil {
 		f.backoff.AddAttempt() // add a failed attempt to backoff
 		return lo.Empty[V](), false, err
@@ -135,7 +149,7 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
 		if updateFile {
 			_ = os.Chtimes(f.vehicle.Path(), now, now)
 		}
-		f.updatedAt = now
+		f.setUpdatedAt(now)
 		f.backoff.Reset() // no error, reset backoff
 		return lo.Empty[V](), true, nil
 	}
@@ -156,8 +170,10 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
 			return lo.Empty[V](), false, err
 		}
 	}
+	f.stateMu.Lock()
 	f.updatedAt = now
 	f.hash = hash
+	f.stateMu.Unlock()
 
 	if f.onUpdate != nil {
 		f.onUpdate(contents)
@@ -175,38 +191,73 @@ func (f *Fetcher[V]) Close() error {
 }
 
 func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
-	initialInterval := f.interval - time.Since(f.updatedAt)
-	if initialInterval > f.interval {
-		initialInterval = f.interval
-	}
-
+	initialInterval := min(f.interval, f.interval-time.Since(f.UpdatedAt()))
 	if forceUpdate {
-		log.Warnln("[Provider] %s not updated for a long time, force refresh", f.Name())
-		f.updateWithLog()
-	}
-	if attempt := f.backoff.Attempt(); attempt > 0 { // f.Update() was failed, decrease the interval from backoff to achieve fast retry
-		if duration := f.backoff.ForAttempt(attempt); duration < initialInterval {
-			initialInterval = duration
-		}
+		initialInterval = 0
+	} else if f.backoff.Attempt() > 0 {
+		// A failed initial read has no updatedAt. Honor retry backoff instead
+		// of interpreting the zero timestamp as an immediately due refresh.
+		initialInterval = f.nextPullInterval()
 	}
 
-	timer := time.NewTimer(initialInterval)
+	next := time.Now().Add(initialInterval)
+	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
+	wasPaused := false
 	for {
+		if f.ctx.Err() != nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		paused, changed := power.BackgroundState()
+		if paused {
+			wasPaused = true
+			select {
+			case <-changed:
+				continue
+			case <-f.ctx.Done():
+				return
+			}
+		}
+		if wasPaused {
+			if !next.After(time.Now()) {
+				// Give the network time to settle and spread overdue providers
+				// across the resume window rather than downloading all at once.
+				delay := min(f.interval, 30*time.Second)
+				delay = delay/2 + time.Duration(rand.Int64N(int64(delay-delay/2)+1))
+				next = time.Now().Add(delay)
+			}
+			wasPaused = false
+		}
+		timer.Reset(time.Until(next))
 		select {
 		case <-timer.C:
-			f.updateWithLog()
-			interval := f.interval
-			if attempt := f.backoff.Attempt(); attempt > 0 { // f.Update() was failed, decrease the interval from backoff to achieve fast retry
-				if duration := f.backoff.ForAttempt(attempt); duration < interval {
-					interval = duration
-				}
+			if paused, _ := power.BackgroundState(); paused || f.ctx.Err() != nil {
+				continue
 			}
-			timer.Reset(interval)
+			if forceUpdate {
+				log.Warnln("[Provider] %s not updated for a long time, force refresh", f.Name())
+				forceUpdate = false
+			}
+			f.updateWithLog()
+			next = time.Now().Add(f.nextPullInterval())
+		case <-changed:
 		case <-f.ctx.Done():
 			return
 		}
 	}
+}
+
+func (f *Fetcher[V]) nextPullInterval() time.Duration {
+	if attempt := f.backoff.Attempt(); attempt > 0 {
+		return min(f.interval, f.backoff.ForAttempt(attempt))
+	}
+	return f.interval
 }
 
 func (f *Fetcher[V]) startPullLoop(forceUpdate bool) (err error) {

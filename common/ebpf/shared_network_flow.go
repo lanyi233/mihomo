@@ -267,8 +267,10 @@ func (b *SharedNetworkBackend) deferTCPFlowReleaseLocked(flow SharedNetworkFlowH
 	b.flowReleases[flow] = deadline
 	if b.flowReleaseDeadline.IsZero() || deadline.Before(b.flowReleaseDeadline) {
 		b.flowReleaseDeadline = deadline
+		// The janitor already has a timer for the earliest release. Later
+		// releases join that flush without waking it to reset the same timer.
+		b.signalFlowWake()
 	}
-	b.signalFlowWake()
 }
 
 func (b *SharedNetworkBackend) signalFlowWake() {
@@ -363,7 +365,10 @@ func (b *SharedNetworkBackend) retainFlowLocked(flow SharedNetworkFlowHandle) {
 		b.flowReferences = make(map[SharedNetworkFlowHandle]uint32)
 	}
 	b.flowReferences[flow]++
-	b.signalFlowWake()
+	if b.flowReferences[flow] == 1 {
+		// An extra owner does not change known map occupancy or deadlines.
+		b.signalFlowWake()
+	}
 }
 
 func (b *SharedNetworkBackend) FlushReleasedTCPFlows(now time.Time, budget uint32) (uint32, error) {

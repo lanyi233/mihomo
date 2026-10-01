@@ -131,6 +131,9 @@ func validateLocalOptions(enabled bool, options LC.EBPFLocal) error {
 	if options.BypassPrivateAddress != nil {
 		return E.New("local.bypass_private_address requires local or hybrid mode")
 	}
+	if len(options.BypassRuleSet) > 0 {
+		return E.New("local.bypass_rule_set requires local or hybrid mode")
+	}
 	if len(options.IncludeUID) > 0 || len(options.IncludeUIDRange) > 0 ||
 		len(options.ExcludeUID) > 0 || len(options.ExcludeUIDRange) > 0 ||
 		len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 ||
@@ -430,12 +433,12 @@ func normalizeLocalDataPlane(options LC.EBPFLocal) (string, string, error) {
 func normalizeModeWithEnabled(mode string, localEnabled, sharedEnabled *bool) (string, bool, bool, error) {
 	if localEnabled != nil || sharedEnabled != nil {
 		if mode != "" {
-			return "", false, false, E.New("mode cannot be combined with local.enabled or shared.enabled")
+			return "", false, false, E.New("mode cannot be combined with local.enable or shared.enable")
 		}
 		local := localEnabled != nil && *localEnabled
 		shared := sharedEnabled != nil && *sharedEnabled
 		if !local && !shared {
-			return "", false, false, E.New("local.enabled or shared.enabled must be enabled")
+			return "", false, false, E.New("local.enable or shared.enable must be true")
 		}
 		switch {
 		case local && shared:

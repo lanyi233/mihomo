@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/netip"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -130,7 +129,19 @@ type Inbound struct {
 	providerTunnel P.Tunnel
 
 	bypassRuleSetAccess sync.Mutex
-	bypassRuleSetTags   []string
+	// bypassRuleSetTags is every rule set bypassed anywhere, the union of the
+	// two scopes below. It is what the rule-provider callback filters on and
+	// what the DNS fake-ip middleware and TUN coexistence are published from.
+	bypassRuleSetTags []string
+	// localBypassTags and sharedBypassTags are what each scope bypasses; see
+	// effectiveBypassRuleSets. Unless bypassSplit, they name the same rule
+	// sets and one policy serves every data plane.
+	localBypassTags  []string
+	sharedBypassTags []string
+	// bypassSplit is fixed when the data planes are built, because it decides
+	// whether the shared packet-rewrite plane borrows the cgroup's bypass
+	// table; see bypassScopesSplit.
+	bypassSplit bool
 	// Read on the publish path and rewritten by an in-place config update.
 	bypassTUNDirect       bool
 	bypassRuleSetMissing  warningLimiter
@@ -138,6 +149,9 @@ type Inbound struct {
 	bypassRuleSetStarted  bool
 	bypassCIDR            []netip.Prefix
 	bypassRuleSetPolicy   ECommon.BypassCIDRPolicy
+	// sharedBypassRuleSetPolicy is the policy the shared data planes hold. It
+	// is bypassRuleSetPolicy itself unless bypassSplit.
+	sharedBypassRuleSetPolicy ECommon.BypassCIDRPolicy
 	// bypassRuleSetNeedsRetry records that a refresh failed and the previous
 	// policy is still live. Nothing else will ask for that refresh again --
 	// rule-provider callbacks are the only other driver -- so the
@@ -360,12 +374,17 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	// Only the tags are kept; see providerTunnel. Resolving them here is purely
 	// a check that each one exists, so a typo fails the listener outright
 	// instead of quietly bypassing nothing at all.
-	for _, ruleSetTag := range options.BypassRuleSet {
+	localBypassTags, sharedBypassTags := effectiveBypassRuleSets(options, localEnabled, sharedEnabled)
+	allBypassTags := mergeRuleSetTags(localBypassTags, sharedBypassTags)
+	for _, ruleSetTag := range allBypassTags {
 		if _, loaded := rp.RuleProviders()[ruleSetTag]; !loaded {
 			return nil, E.New("parse bypass_rule_set: rule-set not found: ", ruleSetTag)
 		}
 	}
-	inbound.bypassRuleSetTags = slices.Clone(options.BypassRuleSet)
+	inbound.bypassRuleSetTags = allBypassTags
+	inbound.localBypassTags = localBypassTags
+	inbound.sharedBypassTags = sharedBypassTags
+	inbound.bypassSplit = bypassScopesSplit(localEnabled, sharedEnabled, localBypassTags, sharedBypassTags)
 	inbound.udpTimeout.Store(int64(resolveUDPTimeout(options.UDPTimeout)))
 	if err := inbound.compilePolicy(); err != nil {
 		return nil, err

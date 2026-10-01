@@ -6,10 +6,12 @@ import (
 )
 
 type EBPF struct {
-	Mode          string     `json:"mode" yaml:"mode" inbound:"mode,omitempty"`
-	Network       []string   `json:"network" yaml:"network"`
-	UDPTimeout    int64      `json:"udp-timeout" yaml:"udp-timeout"`
-	TCPriority    uint16     `json:"tc-priority" yaml:"tc-priority" inbound:"tc-priority,omitempty"`
+	Mode       string   `json:"mode" yaml:"mode" inbound:"mode,omitempty"`
+	Network    []string `json:"network" yaml:"network"`
+	UDPTimeout int64    `json:"udp-timeout" yaml:"udp-timeout"`
+	TCPriority uint16   `json:"tc-priority" yaml:"tc-priority" inbound:"tc-priority,omitempty"`
+	// BypassRuleSet is bypassed by every data plane. local.bypass-rule-set and
+	// shared.bypass-rule-set add rule sets for one scope only.
 	BypassRuleSet []string   `json:"bypass-rule-set" yaml:"bypass-rule-set"`
 	FakeIPICMP    string     `json:"fakeip-icmp" yaml:"fakeip-icmp" inbound:"fakeip-icmp,omitempty"`
 	Local         EBPFLocal  `json:"local" yaml:"local" inbound:"local,omitempty"`
@@ -31,7 +33,11 @@ type EBPF struct {
 }
 
 type EBPFLocal struct {
+	// Enable is the sing-box spelling of Enabled. Either may be set; when both
+	// are, they must agree.
+	Enable               *bool    `json:"enable" yaml:"enable" inbound:"enable,omitempty"`
 	Enabled              *bool    `json:"enabled" yaml:"enabled" inbound:"enabled,omitempty"`
+	BypassRuleSet        []string `json:"bypass-rule-set" yaml:"bypass-rule-set" inbound:"bypass-rule-set,omitempty"`
 	DataPlane            string   `json:"data-plane" yaml:"data-plane" inbound:"data-plane,omitempty"`
 	CgroupPath           string   `json:"cgroup-path" yaml:"cgroup-path" inbound:"cgroup-path,omitempty"`
 	DNSMode              string   `json:"dns-mode" yaml:"dns-mode" inbound:"dns-mode,omitempty"`
@@ -53,7 +59,9 @@ type EBPFLocal struct {
 }
 
 type EBPFShared struct {
+	Enable               *bool          `json:"enable" yaml:"enable" inbound:"enable,omitempty"`
 	Enabled              *bool          `json:"enabled" yaml:"enabled" inbound:"enabled,omitempty"`
+	BypassRuleSet        []string       `json:"bypass-rule-set" yaml:"bypass-rule-set" inbound:"bypass-rule-set,omitempty"`
 	DataPlane            string         `json:"data-plane" yaml:"data-plane" inbound:"data-plane,omitempty"`
 	DNSMode              string         `json:"dns-mode" yaml:"dns-mode" inbound:"dns-mode,omitempty"`
 	Interface            []string       `json:"interface" yaml:"interface" inbound:"interface,omitempty"`

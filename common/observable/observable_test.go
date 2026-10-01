@@ -85,6 +85,39 @@ func TestObservable_UnSubscribeWithNotExistSubscription(t *testing.T) {
 	src.UnSubscribe(sub)
 }
 
+func TestObservableHasSubscribersDuringConcurrentChurn(t *testing.T) {
+	input := make(chan int)
+	src := NewObservable[int](input)
+	defer close(input)
+	permanent, err := src.Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				sub, err := src.Subscribe()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				src.UnSubscribe(sub)
+				if !src.HasSubscribers() {
+					t.Error("lost the permanent subscriber during subscription churn")
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	src.UnSubscribe(permanent)
+	if src.HasSubscribers() {
+		t.Fatal("last unsubscribe left publishing enabled")
+	}
+}
+
 func TestObservable_SubscribeGoroutineLeak(t *testing.T) {
 	iter := iterator[int]([]int{1, 2, 3, 4, 5})
 	src := NewObservable[int](iter)

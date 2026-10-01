@@ -167,17 +167,18 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 	}()
 
 	q := m.Question[0]
-	domain := msgToDomain(m)
 	msg, expireTime, hit := getMsgFromCache(r.cache, q)
 	if hit {
-		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
+		if log.DebugEnabled() {
+			log.Debugln("[DNS] cache hit %s --> %s, expire at %s", msgToDomain(m), msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
+		}
 		now := time.Now()
 		if expireTime.Before(now) {
 			setMsgTTL(msg, uint32(1)) // Continue fetch
 			continueFetch = true
 		} else {
 			// updating TTL by subtracting common delta time from each DNS record
-			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
+			updateMsgTTL(msg, uint32(expireTime.Sub(now)/time.Second))
 		}
 		return
 	}
@@ -226,7 +227,8 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 		return
 	}
 
-	ch := r.group.DoChan(q.String(), fn)
+	key := questionKey(q)
+	ch := r.group.DoChan(key, fn)
 
 	var result singleflight.Result[*D.Msg]
 
@@ -242,7 +244,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 				result := <-ch
 				ret, err, shared := result.Val, result.Err, result.Shared
 				if err != nil && !shared && ret.Opcode < retryMax { // retry
-					r.group.DoChan(q.String(), fn)
+					r.group.DoChan(key, fn)
 				}
 			}()
 			return nil, ctx.Err()
@@ -251,7 +253,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 
 	ret, err, shared := result.Val, result.Err, result.Shared
 	if err != nil && !shared && ret.Opcode < retryMax { // retry
-		r.group.DoChan(q.String(), fn)
+		r.group.DoChan(key, fn)
 	}
 
 	if err == nil {
@@ -304,24 +306,22 @@ func (r *Resolver) shouldOnlyQueryFallback(m *D.Msg) bool {
 
 func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
 	if matched := r.matchPolicy(m); len(matched) != 0 {
-		res := <-r.asyncExchange(ctx, matched, m)
-		return res.Msg, res.Error
+		msg, _, err = batchExchange(ctx, matched, m)
+		return
 	}
 
 	onlyFallback := r.shouldOnlyQueryFallback(m)
 
 	if onlyFallback {
-		res := <-r.asyncExchange(ctx, r.fallback, m)
-		return res.Msg, res.Error
-	}
-
-	msgCh := r.asyncExchange(ctx, r.main, m)
-
-	if r.fallback == nil { // directly return if no fallback servers are available
-		res := <-msgCh
-		msg, err = res.Msg, res.Error
+		msg, _, err = batchExchange(ctx, r.fallback, m)
 		return
 	}
+
+	if r.fallback == nil { // directly return if no fallback servers are available
+		msg, _, err = batchExchange(ctx, r.main, m)
+		return
+	}
+	msgCh := r.asyncExchange(ctx, r.main, m)
 
 	var fallbackMsg <-chan *result
 	if !r.fallbackLazyQuery {

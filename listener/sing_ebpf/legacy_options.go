@@ -50,6 +50,10 @@ func resolveUDPTimeout(configured int64) time.Duration {
 // new keys is never overridden by a leftover legacy one.
 func applyLegacyOptions(options LC.EBPF) (LC.EBPF, []string, error) {
 	var notes []string
+	options, err := resolveEnableAliases(options)
+	if err != nil {
+		return options, nil, err
+	}
 	_, localEnabled, sharedEnabled, err := normalizeModeWithEnabled(options.Mode, options.Local.Enabled, options.Shared.Enabled)
 	if err != nil {
 		// New reports the mode error itself; there is nothing to fold.

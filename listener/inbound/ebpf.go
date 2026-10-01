@@ -87,6 +87,8 @@ func ebpfListenerConfig(options *EBPFOption) LC.EBPF {
 func withoutInPlaceUpdatableFields(options EBPFOption) EBPFOption {
 	options.UDPTimeout = 0
 	options.BypassRuleSet = nil
+	options.Local.BypassRuleSet = nil
+	options.Shared.BypassRuleSet = nil
 	options.BypassTUNDirect = nil
 	return options
 }

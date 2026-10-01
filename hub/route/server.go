@@ -376,9 +376,14 @@ func traffic(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
+		defer wsConn.Close()
 	}
+	ctx := streamContext(r, wsConn)
 
+	var httpStream *httpStreamWriter
 	if wsConn == nil {
+		httpStream = newHTTPStreamWriter(ctx, w)
+		defer httpStream.Close()
 		w.Header().Set("Content-Type", "application/json")
 		render.Status(r, http.StatusOK)
 	}
@@ -388,7 +393,12 @@ func traffic(w http.ResponseWriter, r *http.Request) {
 	t := statistic.DefaultManager
 	buf := &bytes.Buffer{}
 	var err error
-	for range tick.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 		buf.Reset()
 		up, down := t.Now()
 		upTotal, downTotal := t.Total()
@@ -402,8 +412,7 @@ func traffic(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if wsConn == nil {
-			_, err = w.Write(buf.Bytes())
-			w.(http.Flusher).Flush()
+			err = httpStream.Write(buf.Bytes())
 		} else {
 			err = wsWriteServerText(wsConn, buf.Bytes())
 		}
@@ -422,9 +431,14 @@ func memory(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
+		defer wsConn.Close()
 	}
+	ctx := streamContext(r, wsConn)
 
+	var httpStream *httpStreamWriter
 	if wsConn == nil {
+		httpStream = newHTTPStreamWriter(ctx, w)
+		defer httpStream.Close()
 		w.Header().Set("Content-Type", "application/json")
 		render.Status(r, http.StatusOK)
 	}
@@ -435,7 +449,12 @@ func memory(w http.ResponseWriter, r *http.Request) {
 	buf := &bytes.Buffer{}
 	var err error
 	first := true
-	for range tick.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 		buf.Reset()
 
 		inuse := t.Memory()
@@ -452,8 +471,7 @@ func memory(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if wsConn == nil {
-			_, err = w.Write(buf.Bytes())
-			w.(http.Flusher).Flush()
+			err = httpStream.Write(buf.Bytes())
 		} else {
 			err = wsWriteServerText(wsConn, buf.Bytes())
 		}
@@ -505,9 +523,14 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
+		defer wsConn.Close()
 	}
+	ctx := streamContext(r, wsConn)
 
+	var httpStream *httpStreamWriter
 	if wsConn == nil {
+		httpStream = newHTTPStreamWriter(ctx, w)
+		defer httpStream.Close()
 		w.Header().Set("Content-Type", "application/json")
 		render.Status(r, http.StatusOK)
 	}
@@ -527,7 +550,17 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
 		close(ch)
 	}()
 
-	for logM := range ch {
+	for {
+		var logM log.Event
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			logM = event
+		}
 		if logM.LogLevel < level {
 			continue
 		}
@@ -557,8 +590,7 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
 
 		var err error
 		if wsConn == nil {
-			_, err = w.Write(buf.Bytes())
-			w.(http.Flusher).Flush()
+			err = httpStream.Write(buf.Bytes())
 		} else {
 			err = wsWriteServerText(wsConn, buf.Bytes())
 		}

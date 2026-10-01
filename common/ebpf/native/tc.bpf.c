@@ -55,6 +55,13 @@
 #define SB_TC_FLAG_SHARED_IPV6 (1U << 18)
 #define SB_TC_FLAG_LOCAL_BYPASS_PORT (1U << 20)
 #define SB_TC_FLAG_SHARED_BYPASS_PORT (1U << 21)
+// The shared path reads a destination bypass table of its own only once
+// SB_TC_FLAG_SHARED_BYPASS_SEPARATE is set, which userspace does when the local
+// and shared scopes bypass different rule sets. Until then both paths read
+// tc_bypass_ipv4/6, gated by SB_TC_FLAG_BYPASS_IPV4/6.
+#define SB_TC_FLAG_SHARED_BYPASS_IPV4 (1U << 22)
+#define SB_TC_FLAG_SHARED_BYPASS_IPV6 (1U << 23)
+#define SB_TC_FLAG_SHARED_BYPASS_SEPARATE (1U << 24)
 
 #define SB_TC_SOCKET_POLICY_BYPASS 1U
 #define SB_TC_SOCKET_POLICY_INTERCEPT 2U
@@ -223,6 +230,8 @@ MAP(tc_self_sockets, __u64, __u32, BPF_MAP_TYPE_LRU_HASH, 65536U);
 MAP(tc_uid_policy, struct sb_tc_uid_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 4096U);
 MAP(tc_bypass_ipv4, struct sb_tc_ipv4_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 65536U);
 MAP(tc_bypass_ipv6, struct sb_tc_ipv6_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 65536U);
+MAP(tc_shared_bypass_ipv4, struct sb_tc_ipv4_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 65536U);
+MAP(tc_shared_bypass_ipv6, struct sb_tc_ipv6_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 65536U);
 MAP(tc_include_source_ipv4, struct sb_tc_ipv4_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 4096U);
 MAP(tc_include_source_ipv6, struct sb_tc_ipv6_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 4096U);
 MAP(tc_exclude_source_ipv4, struct sb_tc_ipv4_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 4096U);
@@ -367,16 +376,21 @@ INLINE bool must_intercept_fakeip(const struct sb_tc_control *control,
 }
 
 INLINE bool bypass_destination(const struct sb_tc_control *control,
-    const struct sb_tc_assign_key *flow) {
+    const struct sb_tc_assign_key *flow, bool shared) {
+    bool own_table = shared && (control->flags & SB_TC_FLAG_SHARED_BYPASS_SEPARATE) != 0U;
     if (flow->family == AF_INET_VALUE) {
-        if ((control->flags & SB_TC_FLAG_BYPASS_IPV4) == 0U) return false;
+        __u32 gate = own_table ? SB_TC_FLAG_SHARED_BYPASS_IPV4 : SB_TC_FLAG_BYPASS_IPV4;
+        if ((control->flags & gate) == 0U) return false;
         struct sb_tc_ipv4_lpm_key key = {.prefixlen = 32U};
         __builtin_memcpy(key.address, flow->destination_addr, 4U);
+        if (own_table) return map_lookup(&tc_shared_bypass_ipv4, &key) != 0;
         return map_lookup(&tc_bypass_ipv4, &key) != 0;
     }
-    if ((control->flags & SB_TC_FLAG_BYPASS_IPV6) == 0U) return false;
+    __u32 gate = own_table ? SB_TC_FLAG_SHARED_BYPASS_IPV6 : SB_TC_FLAG_BYPASS_IPV6;
+    if ((control->flags & gate) == 0U) return false;
     struct sb_tc_ipv6_lpm_key key = {.prefixlen = 128U};
     __builtin_memcpy(key.address, flow->destination_addr, 16U);
+    if (own_table) return map_lookup(&tc_shared_bypass_ipv6, &key) != 0;
     return map_lookup(&tc_bypass_ipv6, &key) != 0;
 }
 
@@ -432,7 +446,7 @@ INLINE bool local_selected(struct __sk_buff *skb, const struct sb_tc_control *co
     if (port_bypassed(control, key, false)) return false;
     if (host_destination(control, key)) return false;
     if ((control->flags & SB_TC_FLAG_LOCAL_BYPASS_PRIVATE) != 0U && private_destination(key)) return false;
-    return !bypass_destination(control, key);
+    return !bypass_destination(control, key, false);
 }
 
 INLINE bool shared_selected(const struct sb_tc_control *control,
@@ -445,7 +459,7 @@ INLINE bool shared_selected(const struct sb_tc_control *control,
     if (port_bypassed(control, key, true)) return false;
     if (host_destination(control, key)) return false;
     if ((control->flags & SB_TC_FLAG_SHARED_BYPASS_PRIVATE) != 0U && private_destination(key)) return false;
-    return !bypass_destination(control, key);
+    return !bypass_destination(control, key, true);
 }
 
 INLINE bool parse_ethernet(void *data, void *data_end, __u16 *protocol, __u32 *l3_offset, __u8 source_mac[6]) {

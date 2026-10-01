@@ -124,12 +124,22 @@ func wsUpgrade(r *http.Request, w http.ResponseWriter) (conn net.Conn, rw *bufio
 	header.Write(rw.Writer)
 	rw.Writer.WriteString("\r\n")
 	err = rw.Writer.Flush()
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	conn = newWebsocketStream(r.Context(), conn, rw.Reader)
 
 	return conn, rw, err
 }
 
 // wsWriteServerMessage writes message to w, considering that caller represents server side.
 func wsWriteServerMessage(w io.Writer, op byte, p []byte) error {
+	if stream, ok := w.(*websocketStream); ok {
+		stream.writeMu.Lock()
+		defer stream.writeMu.Unlock()
+		_ = stream.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+	}
 	dataLen := len(p)
 
 	// Make slice of bytes with capacity 14 that could hold any header.

@@ -255,10 +255,10 @@ func (c *streamSplitConn) pushLoop() {
 
 	var (
 		buf      bytes.Buffer
-		timer    = time.NewTimer(flushInterval)
+		timer    batchTimer
 		writeErr error
 	)
-	defer timer.Stop()
+	defer timer.stop()
 	defer func() { c.completeWrite(writeErr) }()
 
 	fail := func(err error) {
@@ -267,6 +267,7 @@ func (c *streamSplitConn) pushLoop() {
 	}
 
 	flush := func() error {
+		timer.stop()
 		if buf.Len() == 0 {
 			return nil
 		}
@@ -311,8 +312,6 @@ func (c *streamSplitConn) pushLoop() {
 		return nil
 	}
 
-	resetTimer(timer, flushInterval)
-
 	for {
 		select {
 		case b := <-c.writeCh:
@@ -324,22 +323,20 @@ func (c *streamSplitConn) pushLoop() {
 					fail(fmt.Errorf("stream push flush failed: %w", err))
 					return
 				}
-				resetTimer(timer, flushInterval)
 			}
 			_, _ = buf.Write(b)
+			timer.start(flushInterval)
 			if buf.Len() >= maxBatchBytes {
 				if err := flush(); err != nil {
 					fail(fmt.Errorf("stream push flush failed: %w", err))
 					return
 				}
-				resetTimer(timer, flushInterval)
 			}
 		case <-timer.C:
 			if err := flush(); err != nil {
 				fail(fmt.Errorf("stream push flush failed: %w", err))
 				return
 			}
-			resetTimer(timer, flushInterval)
 		case <-c.writeClosed:
 			// Drain any already-accepted writes so CloseWrite does not lose data.
 			for {

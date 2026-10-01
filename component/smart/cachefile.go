@@ -415,7 +415,7 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 	}
 
 	type kv struct {
-		key string
+		key []byte
 		val []byte
 	}
 
@@ -450,9 +450,7 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 			}
 
 			if len(reservoir) < maxResults {
-				dataCopy := make([]byte, len(v))
-				copy(dataCopy, v)
-				reservoir = append(reservoir, kv{key: string(k), val: dataCopy})
+				reservoir = append(reservoir, kv{key: k, val: v})
 				seen++
 				continue
 			}
@@ -460,10 +458,15 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 			seen++
 			j := rand.Intn(seen)
 			if j < maxResults {
-				dataCopy := make([]byte, len(v))
-				copy(dataCopy, v)
-				reservoir[j] = kv{key: string(k), val: dataCopy}
+				reservoir[j] = kv{key: k, val: v}
 			}
+		}
+		// Cursor slices remain valid for the transaction. Copy only the final
+		// sample, before closing it, rather than every candidate later evicted.
+		for _, item := range reservoir {
+			dataCopy := make([]byte, len(item.val))
+			copy(dataCopy, item.val)
+			result[string(item.key)] = dataCopy
 		}
 		return nil
 	})
@@ -474,10 +477,6 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 
 	if maxResults > 0 && seen > maxResults {
 		log.Debugln("[SmartStore] Prefix [%s] scan hit the record limit: found [%d] records, kept [%d]...", prefix, seen, maxResults)
-	}
-
-	for _, item := range reservoir {
-		result[item.key] = item.val
 	}
 
 	return result, nil

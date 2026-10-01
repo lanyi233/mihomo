@@ -28,6 +28,22 @@ var healthCheckClockStart = time.Now()
 type extraOption struct {
 	expectedStatus utils.IntRanges[uint16]
 	filters        map[string]struct{}
+	filterOnce     sync.Once
+	filterReg      *regexp2.Regexp
+}
+
+func (o *extraOption) compiledFilter() *regexp2.Regexp {
+	o.filterOnce.Do(func() {
+		if len(o.filters) == 0 {
+			return
+		}
+		filters := make([]string, 0, len(o.filters))
+		for filter := range o.filters {
+			filters = append(filters, filter)
+		}
+		o.filterReg = regexp2.MustCompile(strings.Join(filters, "|"), regexp2.None)
+	})
+	return o.filterReg
 }
 
 type HealthCheck struct {
@@ -412,14 +428,9 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 	var expectedStatus utils.IntRanges[uint16]
 	if option != nil {
 		expectedStatus = option.expectedStatus
-		if len(option.filters) != 0 {
-			filters := make([]string, 0, len(option.filters))
-			for filter := range option.filters {
-				filters = append(filters, filter)
-			}
-
-			filterReg = regexp2.MustCompile(strings.Join(filters, "|"), regexp2.None)
-		}
+		// Options are immutable snapshots. Reuse their compiled filter across
+		// checks; registering new filters creates a fresh option and cache.
+		filterReg = option.compiledFilter()
 	}
 
 	for _, proxy := range proxies {

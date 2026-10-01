@@ -139,6 +139,9 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 	}
 	var bypassIPv4Map *CiliumEBPF.Map
 	var bypassIPv6Map *CiliumEBPF.Map
+	if config.OwnBypassCIDR {
+		cgroupBackend = nil
+	}
 	if cgroupBackend != nil {
 		cgroupBackend.access.RLock()
 		if err := cgroupBackend.health.requireUsable(cgroupBackend.runtime != nil); err != nil {

@@ -56,7 +56,7 @@ type sharedRewrite struct {
 func newSharedRewrite(inbound *Inbound, options LC.EBPFShared) *sharedRewrite {
 	mapCapacity := effectiveSharedNetworkMapCapacity(
 		inbound.sharedMapCapacity(),
-		len(inbound.bypassRuleSetTags) > 0 ||
+		len(inbound.sharedBypassTags) > 0 ||
 			len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 			len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0,
 	)
@@ -99,6 +99,9 @@ func (s *sharedRewrite) prepareBackend() (*ECommon.SharedNetworkBackend, error) 
 		redirectIPv6 = s.inbound.redirectIPv6Prefix
 	}
 	cgroupBackend := s.inbound.cgroupBackendInstance()
+	// The shared plane borrows the cgroup's bypass table while both scopes
+	// bypass the same rule sets, and keeps its own once they differ.
+	ownBypassCIDR := s.inbound.bypassSplit
 	backend, err := ECommon.PrepareSharedNetwork(cgroupBackend, ECommon.SharedNetworkConfig{
 		ListenerPort:    s.listeners.selectedPort(),
 		EnableTCP:       s.inbound.enableTCP,
@@ -109,16 +112,17 @@ func (s *sharedRewrite) prepareBackend() (*ECommon.SharedNetworkBackend, error) 
 		MapCapacity:     s.mapCapacity,
 		UDPTimeout:      s.inbound.udpTimeoutValue(),
 		FakeIPICMPReply: s.inbound.fakeIPICMPReply,
+		OwnBypassCIDR:   ownBypassCIDR,
 	})
 	if err != nil {
 		return nil, err
 	}
 	s.inbound.bypassRuleSetAccess.Lock()
-	if cgroupBackend != nil {
+	if cgroupBackend != nil && !ownBypassCIDR {
 		ipv4Count, ipv6Count := cgroupBackend.BypassCIDRCount()
 		err = backend.SetBypassCIDRState(ipv4Count, ipv6Count)
 	} else {
-		_, err = backend.UpdateCompiledBypassCIDR(s.inbound.bypassRuleSetPolicy)
+		_, err = backend.UpdateCompiledBypassCIDR(s.inbound.sharedBypassRuleSetPolicy)
 	}
 	if err == nil {
 		s.setSharedBackend(backend)

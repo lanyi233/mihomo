@@ -33,7 +33,6 @@ func LgbmUpdateInterval() int {
 	return lgbmUpdateInterval
 }
 
-
 func SetLgbmAutoUpdate(newAutoUpdate bool) {
 	lgbmAutoUpdate = newAutoUpdate
 }
@@ -41,7 +40,6 @@ func SetLgbmAutoUpdate(newAutoUpdate bool) {
 func SetLgbmUpdateInterval(newUpdateInterval int) {
 	lgbmUpdateInterval = newUpdateInterval
 }
-
 
 func UpdateLgbmModel() (err error) {
 	modelUrl := lightgbm.LgbmUrl()
@@ -133,10 +131,8 @@ func RegisterLgbmUpdater() {
 		return
 	}
 
+	interval := time.Duration(lgbmUpdateInterval) * time.Hour
 	go func() {
-		ticker := time.NewTicker(time.Duration(lgbmUpdateInterval) * time.Hour)
-		defer ticker.Stop()
-
 		lastUpdate, err := getLgbmModelUpdateTime()
 		if err != nil {
 			log.Errorln("[Smart] Get LightGBM model update time error: %s", err.Error())
@@ -144,19 +140,12 @@ func RegisterLgbmUpdater() {
 		}
 
 		log.Infoln("[Smart] last update time %s", lastUpdate)
-		if lastUpdate.Add(time.Duration(lgbmUpdateInterval) * time.Hour).Before(time.Now()) {
-			log.Infoln("[Smart] Model has not been updated for %v, update now", time.Duration(lgbmUpdateInterval)*time.Hour)
-			if err := UpdateLgbmModelDatabase(); err != nil {
-				log.Errorln("[Smart] Failed to update LightGBM model: %s", err.Error())
-				return
-			}
-		}
-
-		for range ticker.C {
-			log.Infoln("[Smart] updating model every %d hours", lgbmUpdateInterval)
+		overdue := lastUpdate.Add(interval).Before(time.Now())
+		runPeriodicUpdates(context.Background(), interval, overdue, func() {
+			log.Infoln("[Smart] updating model every %s", interval)
 			if err := UpdateLgbmModelDatabase(); err != nil {
 				log.Errorln("[Smart] Failed to update LightGBM model: %s", err.Error())
 			}
-		}
+		})
 	}()
 }

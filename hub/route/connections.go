@@ -3,6 +3,7 @@ package route
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"strconv"
 	"time"
 
@@ -29,16 +30,11 @@ func getConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, _, err := wsUpgrade(r, w)
-	if err != nil {
-		return
-	}
-
 	intervalStr := r.URL.Query().Get("interval")
 	interval := 1000
 	if intervalStr != "" {
 		t, err := strconv.Atoi(intervalStr)
-		if err != nil {
+		if err != nil || t <= 0 || int64(t) > math.MaxInt64/int64(time.Millisecond) {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, ErrBadRequest)
 			return
@@ -46,6 +42,12 @@ func getConnections(w http.ResponseWriter, r *http.Request) {
 
 		interval = t
 	}
+	conn, _, err := wsUpgrade(r, w)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	ctx := streamContext(r, conn)
 
 	buf := &bytes.Buffer{}
 	sendSnapshot := func() error {
@@ -64,7 +66,12 @@ func getConnections(w http.ResponseWriter, r *http.Request) {
 
 	tick := time.NewTicker(time.Millisecond * time.Duration(interval))
 	defer tick.Stop()
-	for range tick.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 		if err := sendSnapshot(); err != nil {
 			break
 		}

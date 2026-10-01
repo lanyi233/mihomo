@@ -240,8 +240,8 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string, 
 	}
 
 	preferIPVersion := opt.prefer
-	fallbackTicker := time.NewTicker(dualStackFallbackTimeout)
-	defer fallbackTicker.Stop()
+	fallbackTimer := time.NewTimer(dualStackFallbackTimeout)
+	defer fallbackTimer.Stop()
 
 	results := make(chan dialResult)
 	returned := make(chan struct{})
@@ -281,11 +281,13 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string, 
 
 	var fallback dialResult
 	var errs []error
+	fallbackReady := false
 
 loop:
 	for {
 		select {
-		case <-fallbackTicker.C:
+		case <-fallbackTimer.C:
+			fallbackReady = true
 			if fallback.error == nil && fallback.Conn != nil {
 				return fallback.Conn, nil
 			}
@@ -294,7 +296,7 @@ loop:
 				break loop
 			}
 			if res.error == nil {
-				if res.isPrimary {
+				if res.isPrimary || fallbackReady {
 					if fallback.error == nil && fallback.Conn != nil {
 						go func() { // close fallback connection in new goroutine to avoid blocking
 							_ = fallback.Conn.Close()

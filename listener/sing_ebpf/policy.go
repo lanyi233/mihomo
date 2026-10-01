@@ -157,6 +157,13 @@ func (i *Inbound) sharedRewriteBackend() *ECommon.SharedNetworkBackend {
 // Failing instead would pin the kernel to the policy it already had and hand
 // the retry scheduler a failure that retrying can never clear.
 func (i *Inbound) bypassRuleSetPrefixesLocked() []netip.Prefix {
+	return collectBypassPrefixes(i.resolveBypassRuleSetsLocked(), i.bypassRuleSetTags)
+}
+
+// resolveBypassRuleSetsLocked resolves every tag in bypassRuleSetTags once,
+// mapping each to the CIDRs it carries, and warns about the ones that no longer
+// resolve. See bypassRuleSetPrefixesLocked for why those are dropped.
+func (i *Inbound) resolveBypassRuleSetsLocked() map[string][]netip.Prefix {
 	if len(i.bypassRuleSetTags) == 0 {
 		return nil
 	}
@@ -164,7 +171,7 @@ func (i *Inbound) bypassRuleSetPrefixesLocked() []netip.Prefix {
 	if i.providerTunnel != nil {
 		providers = i.providerTunnel.RuleProviders()
 	}
-	var prefixes []netip.Prefix
+	resolved := make(map[string][]netip.Prefix, len(i.bypassRuleSetTags))
 	var missing []string
 	for _, ruleSetTag := range i.bypassRuleSetTags {
 		ruleSet, loaded := providers[ruleSetTag]
@@ -181,17 +188,28 @@ func (i *Inbound) bypassRuleSetPrefixesLocked() []netip.Prefix {
 		if ipSet == nil {
 			continue
 		}
-		prefixes = append(prefixes, ipSet.Prefixes()...)
+		resolved[ruleSetTag] = ipSet.Prefixes()
 	}
 	if len(missing) > 0 {
 		i.bypassRuleSetMissing.warn(i.logWarn,
 			"[EBPF] bypass_rule_set is not a registered rule-set and is no longer bypassed:",
 			joinStringList(missing))
 	}
+	return resolved
+}
+
+func collectBypassPrefixes(resolved map[string][]netip.Prefix, tags []string) []netip.Prefix {
+	var prefixes []netip.Prefix
+	for _, tag := range tags {
+		prefixes = append(prefixes, resolved[tag]...)
+	}
 	return prefixes
 }
 
 func (i *Inbound) refreshBypassCIDRsLocked() error {
+	if i.bypassSplit {
+		return i.refreshSplitBypassCIDRsLocked()
+	}
 	prefixes := i.bypassRuleSetPrefixesLocked()
 	if conflicts := i.fakeIPBypassConflictCount(prefixes); conflicts > 0 {
 		log.Warnln("[EBPF] FakeIP force interception overrides bypass_rule_set CIDRs: overlaps=%d", conflicts)
@@ -250,8 +268,88 @@ func (i *Inbound) refreshBypassCIDRsLocked() error {
 	if err = applyReversibleSteps(steps); err != nil {
 		return err
 	}
-	i.bypassRuleSetPolicy = policy
-	i.bypassCIDR = policy.Prefixes()
+	i.commitBypassPolicyLocked(policy, policy, policy)
+	return nil
+}
+
+// refreshSplitBypassCIDRsLocked is refreshBypassCIDRsLocked for scopes that
+// bypass different rule sets: the local data planes get the local policy and
+// the shared ones the shared policy, still as one transaction.
+func (i *Inbound) refreshSplitBypassCIDRsLocked() error {
+	resolved := i.resolveBypassRuleSetsLocked()
+	localPrefixes := collectBypassPrefixes(resolved, i.localBypassTags)
+	sharedPrefixes := collectBypassPrefixes(resolved, i.sharedBypassTags)
+	allPrefixes := append(slices.Clip(localPrefixes), sharedPrefixes...)
+	localPolicy, err := ECommon.CompileBypassCIDRPolicy(localPrefixes)
+	if err != nil {
+		return err
+	}
+	sharedPolicy, err := ECommon.CompileBypassCIDRPolicy(sharedPrefixes)
+	if err != nil {
+		return err
+	}
+	unionPolicy, err := ECommon.CompileBypassCIDRPolicy(allPrefixes)
+	if err != nil {
+		return err
+	}
+	// Counted on the union, so a rule set both roles list is not counted twice.
+	if conflicts := i.fakeIPBypassConflictCount(unionPolicy.Prefixes()); conflicts > 0 {
+		log.Warnln("[EBPF] FakeIP force interception overrides bypass_rule_set CIDRs: overlaps=%d", conflicts)
+	}
+	previousLocal, previousShared := i.bypassRuleSetPolicy, i.sharedBypassRuleSetPolicy
+	var steps []reversibleStep
+	if backend := i.tcBackend(); backend != nil {
+		// One TC backend carries whichever TC paths are enabled. Its common
+		// table belongs to the local path when that path runs on TC and to the
+		// shared path otherwise; with both on TC the shared path is given a
+		// table of its own.
+		commonPolicy, previousCommon := sharedPolicy, previousShared
+		if i.localTCEnabled() {
+			commonPolicy, previousCommon = localPolicy, previousLocal
+		}
+		steps = append(steps, reversibleStep{
+			name:   "TC bypass policy",
+			apply:  func() error { _, applyErr := backend.UpdateCompiledBypassCIDR(commonPolicy); return applyErr },
+			revert: func() error { _, undoErr := backend.UpdateCompiledBypassCIDR(previousCommon); return undoErr },
+		})
+		if i.localTCEnabled() && i.sharedSocketAssignEnabled() {
+			steps = append(steps, reversibleStep{
+				name:   "TC shared bypass policy",
+				apply:  func() error { _, applyErr := backend.UpdateCompiledSharedBypassCIDR(sharedPolicy); return applyErr },
+				revert: func() error { _, undoErr := backend.UpdateCompiledSharedBypassCIDR(previousShared); return undoErr },
+			})
+		}
+	}
+	if backend := i.cgroupBackendInstance(); backend != nil {
+		steps = append(steps, reversibleStep{
+			name:   "cgroup bypass policy",
+			apply:  func() error { _, applyErr := backend.UpdateCompiledBypassCIDR(localPolicy); return applyErr },
+			revert: func() error { _, undoErr := backend.UpdateCompiledBypassCIDR(previousLocal); return undoErr },
+		})
+	}
+	// Split, the shared packet-rewrite plane keeps a table of its own instead of
+	// borrowing the cgroup's; see sharedRewrite.prepareBackend.
+	if shared := i.sharedRewriteBackend(); shared != nil {
+		steps = append(steps, reversibleStep{
+			name:   "shared packet-rewrite bypass policy",
+			apply:  func() error { _, applyErr := shared.UpdateCompiledBypassCIDR(sharedPolicy); return applyErr },
+			revert: func() error { _, undoErr := shared.UpdateCompiledBypassCIDR(previousShared); return undoErr },
+		})
+	}
+	if err = applyReversibleSteps(steps); err != nil {
+		return err
+	}
+	i.commitBypassPolicyLocked(localPolicy, sharedPolicy, unionPolicy)
+	return nil
+}
+
+// commitBypassPolicyLocked records the policies the data planes now hold and
+// republishes what is derived from every scope at once: the DNS fake-ip set and
+// the TUN coexistence policy, both built from the union.
+func (i *Inbound) commitBypassPolicyLocked(local, shared, union ECommon.BypassCIDRPolicy) {
+	i.bypassRuleSetPolicy = local
+	i.sharedBypassRuleSetPolicy = shared
+	i.bypassCIDR = union.Prefixes()
 	// Recompute the set the DNS fake-ip middleware consults, so domains whose
 	// real addresses fall inside it keep their real IP and the kernel eBPF
 	// bypass can engage. Only bypass_rule_set feeds it; publishing the private
@@ -269,5 +367,4 @@ func (i *Inbound) refreshBypassCIDRsLocked() error {
 		}
 	}
 	i.publishBypassPolicyLocked()
-	return nil
 }

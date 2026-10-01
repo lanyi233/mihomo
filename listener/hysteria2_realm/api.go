@@ -123,6 +123,11 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	s.realms[id] = sess
 	s.sessions[sess.id] = sess
 	s.ipCounts[ip]++
+	if len(s.sessions) == 1 {
+		// Every session has the same TTL. Subsequent registrations and
+		// heartbeats cannot precede the currently armed expiry deadline.
+		s.wakeReaper()
+	}
 	s.mu.Unlock()
 	debugf("registered realm=%s session=%s addresses=%d remote=%s", id, sess.id, len(req.Addresses), ip)
 

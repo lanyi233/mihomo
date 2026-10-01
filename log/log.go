@@ -37,6 +37,9 @@ func (e *Event) Type() string {
 }
 
 func Infoln(format string, v ...any) {
+	if !Enabled(INFO) {
+		return
+	}
 	event := newLog(INFO, format, v...)
 	logCh <- event
 	print(event)
@@ -93,7 +96,13 @@ func SetLevel(newLevel LogLevel) {
 // a live log subscriber. Callers can use it to defer expensive debug-only
 // formatting without changing the observable log stream.
 func DebugEnabled() bool {
-	return Level() <= DEBUG || source.HasSubscribers()
+	return Enabled(DEBUG)
+}
+
+// Enabled reports whether the level can be printed or delivered to a live
+// subscriber. Check it before constructing expensive optional log arguments.
+func Enabled(logLevel LogLevel) bool {
+	return Level() <= logLevel || source.HasSubscribers()
 }
 
 func print(data Event) {

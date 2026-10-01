@@ -13,7 +13,28 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/power"
 	C "github.com/metacubex/mihomo/constant"
+
+	"github.com/dlclark/regexp2"
 )
+
+func BenchmarkHealthCheckFilter(b *testing.B) {
+	const pattern = "^selected$|^other$|region-(?:us|jp|sg)"
+	b.Run("compile_each_check", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			filter := regexp2.MustCompile(pattern, regexp2.None)
+			_, _ = filter.MatchString("region-sg")
+		}
+	})
+	b.Run("reuse_option_filter", func(b *testing.B) {
+		option := &extraOption{filters: map[string]struct{}{pattern: {}}}
+		option.compiledFilter()
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = option.compiledFilter().MatchString("region-sg")
+		}
+	})
+}
 
 type healthCheckProbe struct {
 	C.Proxy

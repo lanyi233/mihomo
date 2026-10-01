@@ -447,8 +447,14 @@ func (p *udpReplySocketPool) sweepIdle(now time.Time, maxIdle time.Duration) err
 		shard := &p.shards[index]
 		shard.access.Lock()
 		for entry := shard.oldest; entry != nil; {
+			// Insert and lease release update lastUsed under this same lock
+			// and move the entry to newest. Once an entry is recent, every
+			// following entry is recent too, including any leased entries.
+			if entry.lastUsed.After(cutoff) {
+				break
+			}
 			next := entry.newer
-			if entry.leases == 0 && !entry.lastUsed.After(cutoff) {
+			if entry.leases == 0 {
 				socket := shard.retireLocked(entry)
 				closeErr = errors.Join(closeErr, socket.Close())
 			}

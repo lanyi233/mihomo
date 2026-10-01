@@ -3,14 +3,16 @@ package observable
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 )
 
 type Observable[T any] struct {
-	iterable Iterable[T]
-	listener map[Subscription[T]]*Subscriber[T]
-	mux      sync.Mutex
-	done     bool
-	stopCh   chan struct{}
+	iterable       Iterable[T]
+	listener       map[Subscription[T]]*Subscriber[T]
+	mux            sync.Mutex
+	done           bool
+	stopCh         chan struct{}
+	hasSubscribers atomic.Bool
 }
 
 func (o *Observable[T]) process() {
@@ -29,6 +31,7 @@ func (o *Observable[T]) close() {
 	defer o.mux.Unlock()
 
 	o.done = true
+	o.hasSubscribers.Store(false)
 	for _, sub := range o.listener {
 		sub.Close()
 	}
@@ -43,6 +46,7 @@ func (o *Observable[T]) Subscribe() (Subscription[T], error) {
 	}
 	subscriber := newSubscriber[T]()
 	o.listener[subscriber.Out()] = subscriber
+	o.hasSubscribers.Store(true)
 	return subscriber.Out(), nil
 }
 
@@ -54,6 +58,7 @@ func (o *Observable[T]) UnSubscribe(sub Subscription[T]) {
 		return
 	}
 	delete(o.listener, sub)
+	o.hasSubscribers.Store(len(o.listener) != 0 && !o.done)
 	subscriber.Close()
 }
 
@@ -61,9 +66,7 @@ func (o *Observable[T]) UnSubscribe(sub Subscription[T]) {
 // It is intended for callers that can avoid expensive, optional event
 // construction when nobody is listening.
 func (o *Observable[T]) HasSubscribers() bool {
-	o.mux.Lock()
-	defer o.mux.Unlock()
-	return !o.done && len(o.listener) != 0
+	return o.hasSubscribers.Load()
 }
 
 func NewObservable[T any](iter Iterable[T]) *Observable[T] {

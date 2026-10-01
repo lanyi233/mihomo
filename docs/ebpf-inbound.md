@@ -90,7 +90,7 @@ listeners:
     network: [tcp, udp]
     udp-timeout: 300          # seconds
     tc-priority: 1            # TC filter priority; 1 also enables TCX
-    bypass-rule-set: []       # rule providers (behavior: ipcidr) bypassed in kernel
+    bypass-rule-set: []       # rule providers (behavior: ipcidr) bypassed by every role
     bypass-tun-direct: true   # see "Coexisting with TUN"
     fakeip-icmp: off          # off (default) | reply, see "FakeIP"
     local:
@@ -99,6 +99,7 @@ listeners:
       dns-mode: hijack        # hijack (default) | respect_policy | off
       ipv6: true
       bypass-private-address: true
+      bypass-rule-set: []     # bypassed by the local role only, on top of the list above
       include-uid: []
       include-uid-range: []   # "start:end"
       exclude-uid: []
@@ -114,6 +115,7 @@ listeners:
       interface: [br0]        # downstream interfaces, required when shared runs
       ipv6: true
       bypass-private-address: true
+      bypass-rule-set: []     # bypassed by the shared role only, on top of the list above
       include-source-cidr: []
       exclude-source-cidr: []
       include-mac-address: []
@@ -122,12 +124,29 @@ listeners:
       bypass-port-range: []
 ```
 
+The same listener can also be written the way sing-box and the upstream eBPF
+listener spell it, with per-role switches and rule sets and no `mode`:
+
+```yaml
+listeners:
+  - name: ebpf-inbound
+    type: ebpf
+    local:
+      enable: true
+      bypass-rule-set: [geoip-cn]
+    shared:
+      enable: true
+      interface: [wlan0]
+```
+
 Field behavior:
 
 - `mode`: `local` intercepts sockets created on this host, `shared` intercepts
   traffic forwarded from the `shared.interface` list, `hybrid` runs both. The
-  explicit `local.enabled` / `shared.enabled` booleans are accepted instead of
-  `mode`, not together with it. When shared interception is disabled (including
+  explicit `local.enable` / `shared.enable` booleans are accepted instead of
+  `mode`, not together with it: set either, and a role left unset is off; set
+  neither, and only local runs. `local.enabled` / `shared.enabled` is an older
+  spelling of the same key. When shared interception is disabled (including
   `mode: local`), shared settings other than the enablement selector are ignored.
 - `network`: `tcp`, `udp`, or both. Defaults to both when omitted.
 - `udp-timeout`: UDP session timeout in seconds. Defaults to 300, floor 5.
@@ -135,7 +154,16 @@ Field behavior:
   attaches through TCX on kernels that support it and falls back to clsact
   filters otherwise; any other value always uses clsact filters.
 - `bypass-rule-set`: rule provider tags whose CIDRs populate the bypass LPM
-  maps. Only `behavior: ipcidr` providers contribute; others are skipped.
+  maps. Only `behavior: ipcidr` providers contribute; others are skipped. The
+  top-level list is bypassed by every role. `local.bypass-rule-set` and
+  `shared.bypass-rule-set` add rule sets for one role, so a phone can, say,
+  keep its own domestic traffic off the proxy while its hotspot clients go
+  through it. While both roles bypass the same rule sets they share one set of
+  kernel tables. Once they differ, each data plane gets its own: the shared
+  packet-rewrite plane stops borrowing the cgroup's table, and with
+  `local.data-plane: tc` and `shared.data-plane: socket_assign` the shared TC
+  path reads a table of its own. The DNS fake-ip exemption and the TUN
+  coexistence policy use every role's rule sets together.
 - `bypass-tun-direct`: whether a destination this inbound bypasses is
   connected directly when a TUN listener claims it anyway. Defaults to true.
 - `fakeip-icmp`: `off` (default) leaves ICMP alone, `reply` answers ICMP Echo
@@ -195,10 +223,13 @@ inbound:
 - `udp-timeout`. The kernel compares it against each session's last-seen
   stamp rather than storing a deadline, so a change reaches the sessions that
   already exist, and the userspace sweep re-paces itself on the next round.
-- `bypass-rule-set`, as long as the list does not become empty or stop being
-  empty. The shared packet-rewrite backend sizes its bypass flow cache to a
-  single entry when nothing is bypassed, and that is fixed when the map is
-  created, so crossing that line still needs a rebuild.
+- `bypass-rule-set`, including the per-role lists, with two limits. The shared
+  role's list must not become empty or stop being empty: the shared
+  packet-rewrite backend sizes its bypass flow cache to a single entry when
+  nothing is bypassed, and that is fixed when the map is created. And the two
+  roles must not move between bypassing the same rule sets and different ones,
+  which decides whether they share kernel tables. Crossing either line needs a
+  rebuild.
 - `bypass-tun-direct`, which only republishes what a TUN listener reads.
 
 Changing anything else in the section -- or changing one of the three

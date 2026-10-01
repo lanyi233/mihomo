@@ -22,6 +22,11 @@ type SharedNetworkConfig struct {
 	Policy       CompiledPolicy
 	MapCapacity  SharedNetworkMapCapacities
 	UDPTimeout   time.Duration
+	// OwnBypassCIDR keeps a destination bypass table of this backend's own
+	// even when a cgroup backend is passed in. By default the two share the
+	// cgroup's, which is right while the local and shared scopes bypass the
+	// same rule sets and wrong once they differ.
+	OwnBypassCIDR bool
 	// FakeIPICMPReply loads a FakeIPICMPBackend (see fakeip_icmp_backend.go)
 	// alongside this one, answering ICMP Echo Request to the FakeIP prefixes
 	// already in Policy the same way TCBackend's shared socket_assign path

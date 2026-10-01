@@ -328,6 +328,7 @@ func (c *Conn) Input(segments []segment) {
 			c.deliverLocked()
 			wakeFlush = true
 		case *ackSegment:
+			wakeFlush = true
 			c.handleOptionLocked(s.option)
 			if s.receivingWindow > c.remoteRecvWin {
 				c.remoteRecvWin = s.receivingWindow
@@ -351,8 +352,10 @@ func (c *Conn) Input(segments []segment) {
 					c.updateRTTLocked(current-s.timestamp, current)
 				}
 			}
-			wakeFlush = true
 		case *cmdOnlySegment:
+			// Control packets can change the close state or free the send
+			// window while an otherwise idle connection waits for its ping.
+			wakeFlush = true
 			c.handleOptionLocked(s.option)
 			if s.cmd == commandTerminate {
 				switch c.state {
@@ -504,18 +507,39 @@ func (c *Conn) wakeFlush() {
 }
 
 func (c *Conn) flushLoop() {
-	ticker := time.NewTicker(time.Duration(c.cfg.tti()) * time.Millisecond)
-	defer ticker.Stop()
+	timer := time.NewTimer(c.nextFlushDelay(time.Now()))
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
-			c.flush()
+		case <-timer.C:
 		case <-c.flushNotify:
-			c.flush()
 		case <-c.done:
 			return
 		}
+		started := time.Now()
+		c.flush()
+		timer.Reset(c.nextFlushDelay(started))
 	}
+}
+
+// Keep the configured transmission cadence while data, ACKs or closing state
+// need servicing. An idle active connection only needs its existing keepalive
+// and inactivity deadlines; writes and incoming packets wake flushLoop directly.
+func (c *Conn) nextFlushDelay(lastFlush time.Time) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != stateActive || len(c.sendWindow) > 0 || len(c.ackList) > 0 || c.firstUnackedWasUpdated {
+		// A slow packet write must not add another full TTI before pending
+		// retransmissions are checked again.
+		return time.Until(lastFlush.Add(time.Duration(c.cfg.tti()) * time.Millisecond))
+	}
+	current := c.elapsed()
+	sincePing := current - c.lastPing
+	sinceIncoming := current - c.lastIncoming
+	if sincePing >= 3000 || sinceIncoming >= 30000 {
+		return 0
+	}
+	return time.Duration(min(3000-sincePing, 30000-sinceIncoming)) * time.Millisecond
 }
 
 func (c *Conn) flush() {

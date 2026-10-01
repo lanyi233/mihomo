@@ -4,6 +4,8 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"io"
+
+	"github.com/metacubex/mihomo/common/pool"
 )
 
 type packetReader struct {
@@ -64,7 +66,8 @@ func (w packetWriter) overhead() int {
 }
 
 func (w packetWriter) writeSegment(seg segment) error {
-	payload := make([]byte, seg.byteSize())
+	payload := pool.Get(seg.byteSize())
+	defer pool.Put(payload)
 	seg.serialize(payload)
 
 	headerSize := 0
@@ -72,13 +75,20 @@ func (w packetWriter) writeSegment(seg segment) error {
 		headerSize = w.header.size()
 	}
 
-	out := make([]byte, headerSize, headerSize+len(payload)+w.securityOverhead()+3)
+	nonceSize := 0
+	if w.security != nil {
+		nonceSize = w.security.NonceSize()
+	}
+	// simpleAuthenticator needs up to three padding bytes while encoding.
+	// Keep plaintext separate: its Seal implementation prepends its header.
+	buffer := pool.Get(headerSize + nonceSize + len(payload) + w.securityOverhead() + 3)
+	defer pool.Put(buffer)
+	out := buffer[:headerSize]
 	if headerSize > 0 {
 		w.header.serialize(out[:headerSize])
 	}
 
 	if w.security != nil {
-		nonceSize := w.security.NonceSize()
 		out = out[:headerSize+nonceSize]
 		if nonceSize > 0 {
 			_, _ = rand.Read(out[headerSize : headerSize+nonceSize])

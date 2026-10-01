@@ -133,6 +133,104 @@ func TestSmartTaskSchedulePreventsOverlap(t *testing.T) {
 	}
 }
 
+func TestSmartTaskScheduleRunsIndependentTaskWhileAnotherIsBlocked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	independent := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runSmartTaskSchedule(ctx, []smartScheduledTask{
+			{interval: 5 * time.Millisecond, run: func() {
+				select {
+				case <-started:
+				default:
+					close(started)
+				}
+				<-release
+			}},
+			{initialDelay: 30 * time.Millisecond, interval: time.Hour, runOnce: true, run: func() { close(independent) }},
+		}, func() bool { return true }, time.Millisecond, func() time.Duration { return 0 })
+	}()
+	t.Cleanup(func() {
+		cancel()
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("scheduler did not stop after blocked task finished")
+		}
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("blocking task did not start")
+	}
+	select {
+	case <-independent:
+	case <-time.After(time.Second):
+		t.Fatal("running task prevented an independent deadline from firing")
+	}
+}
+
+func TestSmartTaskScheduleSlowCompletionPreservesPhase(t *testing.T) {
+	// The scheduler also selects on the process-wide power notification
+	// channel, so it cannot become durably blocked inside a synctest bubble.
+	// Use a long period to leave ample headroom for Windows timer precision.
+	const period = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan time.Time, 16)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var calls atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runSmartTaskSchedule(ctx, []smartScheduledTask{{
+			interval: period,
+			run: func() {
+				first := calls.Add(1) == 1
+				select {
+				case started <- time.Now():
+				default:
+				}
+				if first {
+					<-release
+				}
+			},
+		}}, func() bool { return true }, time.Millisecond, func() time.Duration { return 0 })
+	}()
+	t.Cleanup(func() {
+		cancel()
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("scheduler did not stop")
+		}
+	})
+	var first time.Time
+	select {
+	case first = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("slow task did not start")
+	}
+	// Miss the deadlines at 1s and 2s, then finish at 2.6s. The next run
+	// belongs at 3s, not immediately at completion or at completion + 1s.
+	time.Sleep(time.Until(first.Add(26 * period / 10)))
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case next := <-started:
+		elapsed := next.Sub(first)
+		if elapsed < 28*period/10 || elapsed > 34*period/10 {
+			t.Fatalf("next run after %s, want original 3s phase (2.8s–3.4s tolerance)", elapsed)
+		}
+	case <-time.After(2 * period):
+		t.Fatal("slow task was not scheduled again after completion")
+	}
+}
+
 func TestSmartTaskScheduleCancelsWhileWaitingForTunnel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

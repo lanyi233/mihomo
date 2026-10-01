@@ -135,6 +135,61 @@ func BenchmarkReplySocketCachedLease(b *testing.B) {
 	}
 }
 
+func BenchmarkReplySocketSweepRecentlyUsed(b *testing.B) {
+	var pool udpReplySocketPool
+	now := time.Now()
+	for index := range pool.shards {
+		shard := &pool.shards[index]
+		for range udpReplySocketShardCapacity {
+			shard.insertNewestLocked(&udpReplySocketEntry{lastUsed: now})
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = pool.sweepIdle(now, time.Minute)
+	}
+}
+
+func TestReplySocketSweepSkipsLeasedOldEntryAndKeepsRecentTail(t *testing.T) {
+	var pool udpReplySocketPool
+	defer pool.close()
+	var keys []netip.AddrPort
+	for port := uint16(1); len(keys) < 3; port++ {
+		key := netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)
+		if pool.shardIndex(key) == 0 {
+			keys = append(keys, key)
+		}
+	}
+	leases := make([]udpReplySocketLease, len(keys))
+	for index, key := range keys {
+		lease, err := pool.lease(key, testReplySocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leases[index] = lease
+	}
+	defer leases[0].release()
+	leases[1].release()
+	leases[2].release()
+	now := time.Now()
+	shard := &pool.shards[0]
+	shard.access.Lock()
+	leases[0].entry.lastUsed = now.Add(-time.Hour)
+	leases[1].entry.lastUsed = now.Add(-time.Minute)
+	leases[2].entry.lastUsed = now
+	shard.access.Unlock()
+	if err := pool.sweepIdle(now, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if leases[0].entry.retired || !leases[1].entry.retired || leases[2].entry.retired {
+		t.Fatal("sweep must protect leased entries, expire older idle entries, and preserve recent entries")
+	}
+	if shard.live != 2 {
+		t.Fatalf("live sockets = %d, want 2", shard.live)
+	}
+}
+
 // A port-only shard key collapses whenever many distinct addresses share one
 // port, which is the normal case rather than the exotic one: reply sockets are
 // keyed by destination and those cluster on well-known ports, and client keys

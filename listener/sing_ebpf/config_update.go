@@ -37,7 +37,7 @@ var ErrRebuildRequired = E.New("eBPF inbound requires a rebuild to apply this ch
 // next reload should not be running on a configuration that never existed.
 func (i *Inbound) Update(options LC.EBPF) error {
 	steps := i.udpTimeoutSteps(resolveUDPTimeout(options.UDPTimeout))
-	bypassStep, err := i.bypassRuleSetStep(options.BypassRuleSet)
+	bypassStep, err := i.bypassRuleSetStep(options)
 	if err != nil {
 		return err
 	}
@@ -81,50 +81,64 @@ func (i *Inbound) udpTimeoutSteps(next time.Duration) []reversibleStep {
 	return steps
 }
 
-// bypassRuleSetStep swaps the configured rule-set tags and recompiles the
-// kernel bypass policy from them. Only the tags are held, so this is a slice
-// swap and a refresh the rule-provider callback already performs on its own
-// schedule; refreshBypassCIDRsLocked is itself transactional across the data
-// planes.
+// bypassRuleSetStep swaps the configured rule-set tags, for both scopes, and
+// recompiles the kernel bypass policy from them. Only the tags are held, so
+// this is a slice swap and a refresh the rule-provider callback already
+// performs on its own schedule; refreshBypassCIDRsLocked is itself
+// transactional across the data planes.
 //
 // A tag that does not resolve is refused here rather than dropped. Dropping is
 // right when a rule-provider disappears from under a running listener -- the
 // honest policy is one without it -- but a tag the user just typed into this
 // listener's own config is a typo, and starting with it silently missing is the
 // same failure New refuses outright.
-func (i *Inbound) bypassRuleSetStep(tags []string) (*reversibleStep, error) {
+func (i *Inbound) bypassRuleSetStep(options LC.EBPF) (*reversibleStep, error) {
+	if !i.localEnabled && len(options.Local.BypassRuleSet) > 0 {
+		return nil, E.New("local.bypass_rule_set requires local or hybrid mode")
+	}
+	nextLocal, nextShared := effectiveBypassRuleSets(options, i.localEnabled, i.sharedEnabled)
 	i.bypassRuleSetAccess.Lock()
-	unchanged := slices.Equal(tags, i.bypassRuleSetTags)
+	currentLocal, currentShared := i.localBypassTags, i.sharedBypassTags
 	i.bypassRuleSetAccess.Unlock()
-	if unchanged {
+	if slices.Equal(nextLocal, currentLocal) && slices.Equal(nextShared, currentShared) {
 		return nil, nil
+	}
+	// Whether the scopes share one bypass table is decided when the data
+	// planes are built: the shared packet-rewrite plane either borrows the
+	// cgroup's table or creates its own. Moving between the two takes a rebuild.
+	if bypassScopesSplit(i.localEnabled, i.sharedEnabled, nextLocal, nextShared) != i.bypassSplit {
+		return nil, ErrRebuildRequired
 	}
 	// The shared packet-rewrite backend sizes its bypass flow cache to a single
 	// entry when nothing is bypassed, and that size is fixed when the map is
 	// created. Only that plane has the constraint -- the cgroup and TC bypass
 	// maps are fixed-capacity either way -- so only an inbound actually running
-	// it has to be rebuilt when the list crosses between empty and non-empty.
-	if i.sharedRewrite != nil && (len(tags) == 0) != (len(i.bypassRuleSetTags) == 0) {
+	// it has to be rebuilt when its list crosses between empty and non-empty.
+	if i.sharedRewrite != nil && (len(nextShared) == 0) != (len(currentShared) == 0) {
 		return nil, ErrRebuildRequired
 	}
 	if i.providerTunnel == nil {
 		return nil, E.New("tunnel does not expose rule providers")
 	}
 	providers := i.providerTunnel.RuleProviders()
-	for _, tag := range tags {
+	for _, tag := range mergeRuleSetTags(nextLocal, nextShared) {
 		if _, loaded := providers[tag]; !loaded {
 			return nil, E.New("parse bypass_rule_set: rule-set not found: ", tag)
 		}
 	}
-	next := slices.Clone(tags)
-	var previous []string
-	swap := func(to []string) error {
+	type scopeTags struct{ local, shared []string }
+	next := scopeTags{nextLocal, nextShared}
+	var previous scopeTags
+	swap := func(to scopeTags) error {
 		i.bypassRuleSetAccess.Lock()
 		defer i.bypassRuleSetAccess.Unlock()
-		restore := i.bypassRuleSetTags
-		i.bypassRuleSetTags = to
+		restore := scopeTags{i.localBypassTags, i.sharedBypassTags}
+		restoreAll := i.bypassRuleSetTags
+		i.localBypassTags, i.sharedBypassTags = to.local, to.shared
+		i.bypassRuleSetTags = mergeRuleSetTags(to.local, to.shared)
 		if err := i.refreshBypassCIDRsLocked(); err != nil {
-			i.bypassRuleSetTags = restore
+			i.localBypassTags, i.sharedBypassTags = restore.local, restore.shared
+			i.bypassRuleSetTags = restoreAll
 			return err
 		}
 		return nil
@@ -133,7 +147,7 @@ func (i *Inbound) bypassRuleSetStep(tags []string) (*reversibleStep, error) {
 		name: "bypass_rule_set",
 		apply: func() error {
 			i.bypassRuleSetAccess.Lock()
-			previous = i.bypassRuleSetTags
+			previous = scopeTags{i.localBypassTags, i.sharedBypassTags}
 			i.bypassRuleSetAccess.Unlock()
 			return swap(next)
 		},
