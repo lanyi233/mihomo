@@ -1,7 +1,5 @@
 package tcpstats
 
-import "net"
-
 type Stats struct {
 	BytesSent    uint64
 	BytesRetrans uint64
@@ -45,11 +43,4 @@ func (s *Stats) TotalRetrans() uint64 {
 		return s.RetransSegs
 	}
 	return s.BytesRetrans
-}
-
-func GetTCPStats(conn net.Conn) *Stats {
-	if conn == nil {
-		return nil
-	}
-	return getTCPStats(conn)
 }

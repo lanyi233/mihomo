@@ -6,16 +6,21 @@ import (
 	"syscall"
 )
 
-func getTCPStats(conn net.Conn) *Stats {
-	seen := make(map[uintptr]bool, 12)
+// GetTCPStats unwraps the connection wrappers until a socket is found; nil means the
+// counters are not available for this connection.
+func GetTCPStats(conn net.Conn) *Stats {
+	// one slot per unwrap step, the range is bounded by the array so a cycle cannot spin
+	var seen [32]uintptr
 outer:
-	for depth := 0; depth < 32; depth++ {
+	for depth := 0; depth < len(seen); depth++ {
 		if rv := reflect.ValueOf(conn); rv.Kind() == reflect.Ptr {
 			ptr := rv.Pointer()
-			if seen[ptr] {
-				return nil
+			for i := 0; i < depth; i++ {
+				if seen[i] == ptr {
+					return nil
+				}
 			}
-			seen[ptr] = true
+			seen[depth] = ptr
 		}
 
 		if sc, ok := conn.(interface {

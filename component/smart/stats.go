@@ -19,14 +19,27 @@ import (
 	"github.com/metacubex/mihomo/log"
 )
 
-const asnEvidenceRebuildInterval = 30 * time.Minute
+const (
+	asnEvidencePrefix = "asn:"
+
+	RankMostUsed   = "MostUsed"
+	RankOccasional = "OccasionalUsed"
+	RankRarelyUsed = "RarelyUsed"
+
+	HostFailureNodeTTL       = 24 * time.Hour
+	hostStatusRetryAfter     = 4 * time.Hour
+	hostStatusViewTTLSeconds = 30
+
+	RecordExpiredTime = 7 * 24 * time.Hour
+
+	asnEvidenceRebuildInterval = 30 * time.Minute
+)
 
 var asnEvidenceCache xsync.Map[string, *asnEvidenceEntry]
 
-var (
-	shardedLocks     [1024]*sync.Mutex
-	shardedLocksOnce sync.Once
-)
+var shardedLocks [1024]*sync.Mutex
+
+var shardedLocksOnce sync.Once
 
 type asnEvidenceEntry struct {
 	mutex   sync.Mutex
@@ -56,6 +69,11 @@ type NodeState struct {
 	LastChecked    int64  `json:"last_checked"`
 	BlockedUntil   int64  `json:"blocked_until"`
 	ThresholdGrade int    `json:"threshold_grade,omitempty"`
+	ExitRegion     string `json:"exit_region,omitempty"`
+	ExitASN        string `json:"exit_asn,omitempty"`
+	ExitKey        string `json:"exit_key,omitempty"`
+	ExitUpdated    int64  `json:"exit_updated,omitempty"`
+	ExitFailed     int64  `json:"exit_failed,omitempty"`
 }
 
 type AtomicStatsRecord struct {
@@ -75,52 +93,6 @@ type AtomicStatsRecord struct {
 	cumulRetrans    atomic.Int64
 
 	weights *lru.LruCache[string, float64]
-}
-
-// BlockCode says why a node is excluded from a target. The values are the keys
-// of HostStatus.Codes and are persisted, so they are an on-disk format: they
-// can be added to, never renumbered.
-//
-// They are ordered by severity, lowest first, and UpdateHostStatus relies on
-// that -- a new verdict that is numerically lower replaces a higher one, and a
-// higher one is discarded while a lower one stands.
-type BlockCode int
-
-const (
-	// BlockNone is not a block. It is what a healthy close reports, and what
-	// tells UpdateHostStatus to clear the node instead of recording anything.
-	BlockNone BlockCode = 0
-	// BlockManual is the dashboard's block. Permanent, never probed, and never
-	// cleared by anything the network does -- it is the user's decision.
-	BlockManual BlockCode = 1
-	// BlockAbnormalStatus is a status test through the node answering badly.
-	// The only code a recovery probe can itself raise.
-	BlockAbnormalStatus BlockCode = 2
-	// BlockDialFailure accumulates: it counts failures and only blocks once
-	// they reach maxFailedTimes.
-	BlockDialFailure BlockCode = 3
-	// BlockNoResponse is a request that went out and got nothing back.
-	BlockNoResponse BlockCode = 4
-	// BlockLowWeight is a computed weight under AllowedWeight.
-	BlockLowWeight BlockCode = 5
-	// BlockPacketLoss is loss over the threshold.
-	BlockPacketLoss BlockCode = 6
-)
-
-// Recoverable reports whether a probe may return this node to service. Only
-// BlockManual is excluded: it is the user's decision, not the network's, and
-// nothing should undo it behind their back.
-func (c BlockCode) Recoverable() bool {
-	return c != BlockNone && c != BlockManual
-}
-
-// CountsTowardBlock reports whether a node blocked with this code counts toward
-// hostFailLimit, past which the whole target is marked Blocked. Neither the
-// user's own blocks nor a site's short-lived answers do: a site that limits
-// traffic would otherwise flip its target in and out of Blocked every few
-// minutes.
-func (c BlockCode) CountsTowardBlock() bool {
-	return c.Recoverable() && c != BlockAbnormalStatus
 }
 
 type CodeNodeSet struct {
@@ -152,32 +124,6 @@ type hostStatusView struct {
 	blocked bool
 }
 
-func buildHostStatusView(codes map[BlockCode]*CodeNodeSet, now int64, hostFailLimit int) (map[string]BlockCode, bool) {
-	var nodes map[string]BlockCode
-	blockingCount := 0
-
-	for code, codeSet := range codes {
-		if codeSet == nil {
-			continue
-		}
-		for nodeName, nodeEntry := range codeSet.Nodes {
-			if nodeEntry == 0 || nodeEntry > now {
-				if nodes == nil {
-					nodes = make(map[string]BlockCode)
-				}
-				if oldCode, exists := nodes[nodeName]; !exists || code < oldCode {
-					nodes[nodeName] = code
-				}
-			}
-			if code.CountsTowardBlock() && nodeEntry > now {
-				blockingCount++
-			}
-		}
-	}
-
-	return nodes, blockingCount > hostFailLimit
-}
-
 type ActiveTarget struct {
 	Target   string
 	IsUDP    bool
@@ -197,7 +143,6 @@ type NodeRank struct {
 
 type targetMinHeap []ActiveTarget
 
-// 域名节点锁
 func initShardedLocks() {
 	shardedLocksOnce.Do(func() {
 		for i := range shardedLocks {
@@ -228,44 +173,55 @@ func GetTargetNodeLock(target, group, proxy string) *sync.Mutex {
 	return shardedLocks[h&1023]
 }
 
-// 获取或创建原子记录
 func (s *Store) GetOrCreateAtomicRecord(cacheKey string, group, config, target, proxy string) *AtomicStatsRecord {
-	record, _ := recordCache.GetOrStore(cacheKey, func() *AtomicStatsRecord {
-		r := &AtomicStatsRecord{
-			weights: lru.New[string, float64](lru.WithSize[string, float64](100)),
-		}
+	if record, ok := recordCache.Get(cacheKey); ok {
+		return record
+	}
 
-		if existingData, err := s.GetStatsForTarget(group, config, target, proxy); err == nil {
-			if data, exists := existingData[proxy]; exists {
-				var existingRecord StatsRecord
-				if json.Unmarshal(data, &existingRecord) == nil {
-					r.success.Store(existingRecord.Success)
-					r.failure.Store(existingRecord.Failure)
-					r.connectTime.Store(existingRecord.ConnectTime)
-					r.latency.Store(existingRecord.Latency)
-					r.lastUsed.Store(existingRecord.LastUsed)
-					r.uploadTotal.Store(existingRecord.UploadTotal)
-					r.downloadTotal.Store(existingRecord.DownloadTotal)
-					r.duration.Store(existingRecord.ConnectionDuration)
-					r.maxUploadRate.Store(existingRecord.MaxUploadRate)
-					r.maxDownloadRate.Store(existingRecord.MaxDownloadRate)
-					r.lossRate.Store(existingRecord.LossRate)
-					r.cumulSent.Store(int64(existingRecord.CumulSent))
-					r.cumulRetrans.Store(int64(existingRecord.CumulRetrans))
-					if existingRecord.Weights != nil {
-						for k, v := range existingRecord.Weights {
-							r.weights.Set(k, v)
-						}
-					}
-				}
-			}
-		}
-		return r
-	})
+	record := s.loadAtomicRecord(group, config, target, proxy)
+	record, _ = recordCache.GetOrStore(cacheKey, func() *AtomicStatsRecord { return record })
 	return record
 }
 
-// 创建统计快照
+// loadAtomicRecord restores one node's persisted counters; the cache lock is not held here
+// on purpose, a database read must not hold up every other key of the cache.
+func (s *Store) loadAtomicRecord(group, config, target, proxy string) *AtomicStatsRecord {
+	r := &AtomicStatsRecord{weights: lru.New[string, float64](lru.WithSize[string, float64](100))}
+
+	existingData, err := s.GetStatsForTarget(group, config, target, proxy)
+	if err != nil {
+		return r
+	}
+	data, exists := existingData[proxy]
+	if !exists {
+		return r
+	}
+	var existingRecord StatsRecord
+	if json.Unmarshal(data, &existingRecord) != nil {
+		return r
+	}
+
+	r.success.Store(existingRecord.Success)
+	r.failure.Store(existingRecord.Failure)
+	r.connectTime.Store(existingRecord.ConnectTime)
+	r.latency.Store(existingRecord.Latency)
+	r.lastUsed.Store(existingRecord.LastUsed)
+	r.uploadTotal.Store(existingRecord.UploadTotal)
+	r.downloadTotal.Store(existingRecord.DownloadTotal)
+	r.duration.Store(existingRecord.ConnectionDuration)
+	r.maxUploadRate.Store(existingRecord.MaxUploadRate)
+	r.maxDownloadRate.Store(existingRecord.MaxDownloadRate)
+	r.lossRate.Store(existingRecord.LossRate)
+	r.cumulSent.Store(int64(existingRecord.CumulSent))
+	r.cumulRetrans.Store(int64(existingRecord.CumulRetrans))
+	if existingRecord.Weights != nil {
+		for k, v := range existingRecord.Weights {
+			r.weights.Set(k, v)
+		}
+	}
+	return r
+}
+
 func (record *AtomicStatsRecord) CreateStatsSnapshot(cacheKey string) *StatsRecord {
 	if record == nil {
 		return &StatsRecord{}
@@ -293,158 +249,150 @@ func (record *AtomicStatsRecord) CreateStatsSnapshot(cacheKey string) *StatsReco
 	return snapshot
 }
 
-func (r *AtomicStatsRecord) Get(field string) interface{} {
-	switch field {
-	case "success":
-		return r.success.Load()
-	case "failure":
-		return r.failure.Load()
-	case "connectTime":
-		return r.connectTime.Load()
-	case "latency":
-		return r.latency.Load()
-	case "lastUsed":
-		return r.lastUsed.Load()
-	case "uploadTotal":
-		return r.uploadTotal.Load()
-	case "downloadTotal":
-		return r.downloadTotal.Load()
-	case "maxUploadRate":
-		return r.maxUploadRate.Load()
-	case "maxDownloadRate":
-		return r.maxDownloadRate.Load()
-	case "duration":
-		return r.duration.Load()
-	case "lossRate":
-		return r.lossRate.Load()
-	case "cumulSent":
-		return r.cumulSent.Load()
-	case "cumulRetrans":
-		return r.cumulRetrans.Load()
-	default:
-		return nil
+func (r *AtomicStatsRecord) Success() int64 {
+	return r.success.Load()
+}
+
+func (r *AtomicStatsRecord) AddSuccess(v int64) {
+	current := r.success.Load()
+	if v > 0 && current > math.MaxInt64/2-v {
+		r.success.Store(math.MaxInt64 / 4)
+	} else {
+		r.success.Add(v)
 	}
 }
 
-func (r *AtomicStatsRecord) Set(field string, value interface{}) {
-	switch field {
-	case "success":
-		if v, ok := value.(int64); ok {
-			r.success.Store(v)
-		}
-	case "failure":
-		if v, ok := value.(int64); ok {
-			r.failure.Store(v)
-		}
-	case "connectTime":
-		if v, ok := value.(int64); ok {
-			r.connectTime.Store(v)
-		}
-	case "latency":
-		if v, ok := value.(int64); ok {
-			r.latency.Store(v)
-		}
-	case "lastUsed":
-		if v, ok := value.(int64); ok {
-			r.lastUsed.Store(v)
-		}
-	case "uploadTotal":
-		if v, ok := value.(float64); ok {
-			r.uploadTotal.Store(v)
-		}
-	case "downloadTotal":
-		if v, ok := value.(float64); ok {
-			r.downloadTotal.Store(v)
-		}
-	case "maxUploadRate":
-		if v, ok := value.(float64); ok {
-			r.maxUploadRate.Store(v)
-		}
-	case "maxDownloadRate":
-		if v, ok := value.(float64); ok {
-			r.maxDownloadRate.Store(v)
-		}
-	case "duration":
-		if v, ok := value.(float64); ok {
-			r.duration.Store(v)
-		}
-	case "lossRate":
-		if v, ok := value.(float64); ok {
-			r.lossRate.Store(v)
-		}
-	case "cumulSent":
-		if v, ok := value.(int64); ok {
-			r.cumulSent.Store(v)
-		}
-	case "cumulRetrans":
-		if v, ok := value.(int64); ok {
-			r.cumulRetrans.Store(v)
-		}
+func (r *AtomicStatsRecord) Failure() int64 {
+	return r.failure.Load()
+}
+
+func (r *AtomicStatsRecord) AddFailure(v int64) {
+	current := r.failure.Load()
+	if v > 0 && current > math.MaxInt64/2-v {
+		r.failure.Store(math.MaxInt64 / 4)
+	} else {
+		r.failure.Add(v)
 	}
 }
 
-func (r *AtomicStatsRecord) Add(field string, value interface{}) {
-	switch field {
-	case "success":
-		if v, ok := value.(int64); ok {
-			current := r.success.Load()
-			if v > 0 && current > math.MaxInt64/2-v {
-				r.success.Store(math.MaxInt64 / 4)
-			} else {
-				r.success.Add(v)
-			}
-		}
-	case "failure":
-		if v, ok := value.(int64); ok {
-			current := r.failure.Load()
-			if v > 0 && current > math.MaxInt64/2-v {
-				r.failure.Store(math.MaxInt64 / 4)
-			} else {
-				r.failure.Add(v)
-			}
-		}
-	case "uploadTotal":
-		if v, ok := value.(float64); ok {
-			current := r.uploadTotal.Load()
-			// 1PB (1024^5 bytes)
-			const maxUpload = 1125899906842624.0
-			if current+v > maxUpload {
-				r.uploadTotal.Store(maxUpload / 2)
-			} else {
-				r.uploadTotal.Add(v)
-			}
-		}
-	case "downloadTotal":
-		if v, ok := value.(float64); ok {
-			current := r.downloadTotal.Load()
-			// 1PB (1024^5 bytes)
-			const maxDownload = 1125899906842624.0
-			if current+v > maxDownload {
-				r.downloadTotal.Store(maxDownload / 2)
-			} else {
-				r.downloadTotal.Add(v)
-			}
-		}
-	case "cumulSent":
-		if v, ok := value.(int64); ok && v > 0 {
-			current := r.cumulSent.Load()
-			if current > math.MaxInt64/2-v {
-				r.cumulSent.Store(current / 2)
-				r.cumulRetrans.Store(r.cumulRetrans.Load() / 2)
-			} else {
-				r.cumulSent.Add(v)
-			}
-		}
-	case "cumulRetrans":
-		if v, ok := value.(int64); ok && v > 0 {
-			current := r.cumulRetrans.Load()
-			if current > math.MaxInt64/2-v {
-				r.cumulSent.Store(r.cumulSent.Load() / 2)
-				r.cumulRetrans.Store(current / 2)
-			} else {
-				r.cumulRetrans.Add(v)
-			}
-		}
+func (r *AtomicStatsRecord) ConnectTime() int64 {
+	return r.connectTime.Load()
+}
+
+func (r *AtomicStatsRecord) SetConnectTime(v int64) {
+	r.connectTime.Store(v)
+}
+
+func (r *AtomicStatsRecord) Latency() int64 {
+	return r.latency.Load()
+}
+
+func (r *AtomicStatsRecord) SetLatency(v int64) {
+	r.latency.Store(v)
+}
+
+func (r *AtomicStatsRecord) LastUsed() int64 {
+	return r.lastUsed.Load()
+}
+
+func (r *AtomicStatsRecord) SetLastUsed(v int64) {
+	r.lastUsed.Store(v)
+}
+
+func (r *AtomicStatsRecord) UploadTotal() float64 {
+	return r.uploadTotal.Load()
+}
+
+// AddUploadTotal caps the counter at 1PB (1024^5 bytes), a wrapped value would poison the model input.
+func (r *AtomicStatsRecord) AddUploadTotal(v float64) {
+	current := r.uploadTotal.Load()
+	const maxUpload = 1125899906842624.0
+	if current+v > maxUpload {
+		r.uploadTotal.Store(maxUpload / 2)
+	} else {
+		r.uploadTotal.Add(v)
+	}
+}
+
+func (r *AtomicStatsRecord) DownloadTotal() float64 {
+	return r.downloadTotal.Load()
+}
+
+// AddDownloadTotal caps the counter at 1PB (1024^5 bytes).
+func (r *AtomicStatsRecord) AddDownloadTotal(v float64) {
+	current := r.downloadTotal.Load()
+	const maxDownload = 1125899906842624.0
+	if current+v > maxDownload {
+		r.downloadTotal.Store(maxDownload / 2)
+	} else {
+		r.downloadTotal.Add(v)
+	}
+}
+
+func (r *AtomicStatsRecord) MaxUploadRate() float64 {
+	return r.maxUploadRate.Load()
+}
+
+func (r *AtomicStatsRecord) SetMaxUploadRate(v float64) {
+	r.maxUploadRate.Store(v)
+}
+
+func (r *AtomicStatsRecord) MaxDownloadRate() float64 {
+	return r.maxDownloadRate.Load()
+}
+
+func (r *AtomicStatsRecord) SetMaxDownloadRate(v float64) {
+	r.maxDownloadRate.Store(v)
+}
+
+func (r *AtomicStatsRecord) Duration() float64 {
+	return r.duration.Load()
+}
+
+func (r *AtomicStatsRecord) SetDuration(v float64) {
+	r.duration.Store(v)
+}
+
+func (r *AtomicStatsRecord) LossRate() float64 {
+	return r.lossRate.Load()
+}
+
+func (r *AtomicStatsRecord) SetLossRate(v float64) {
+	r.lossRate.Store(v)
+}
+
+func (r *AtomicStatsRecord) CumulSent() int64 {
+	return r.cumulSent.Load()
+}
+
+// AddCumulSent halves both loss counters at once, so their ratio stays meaningful after an overflow.
+func (r *AtomicStatsRecord) AddCumulSent(v int64) {
+	if v <= 0 {
+		return
+	}
+	current := r.cumulSent.Load()
+	if current > math.MaxInt64/2-v {
+		r.cumulSent.Store(current / 2)
+		r.cumulRetrans.Store(r.cumulRetrans.Load() / 2)
+	} else {
+		r.cumulSent.Add(v)
+	}
+}
+
+func (r *AtomicStatsRecord) CumulRetrans() int64 {
+	return r.cumulRetrans.Load()
+}
+
+func (r *AtomicStatsRecord) AddCumulRetrans(v int64) {
+	if v <= 0 {
+		return
+	}
+	current := r.cumulRetrans.Load()
+	if current > math.MaxInt64/2-v {
+		r.cumulSent.Store(r.cumulSent.Load() / 2)
+		r.cumulRetrans.Store(current / 2)
+	} else {
+		r.cumulRetrans.Add(v)
 	}
 }
 
@@ -470,7 +418,6 @@ func (r *AtomicStatsRecord) AddASNEvidence(asn string) {
 	r.weights.Set(key, value+1)
 }
 
-// 获取节点权重排名缓存
 func (s *Store) GetNodeWeightRankingCache(group, config string) (NodeRank, error) {
 	pathPrefix := FormatDBKey(KeyTypeRanking, config, group)
 	rawResult, err := s.GetSubBytesByPath(pathPrefix)
@@ -488,7 +435,6 @@ func (s *Store) GetNodeWeightRankingCache(group, config string) (NodeRank, error
 	return NodeRank{}, nil
 }
 
-// 获取节点权重排名
 func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.Proxy) (NodeRank, error) {
 	if len(proxies) == 0 {
 		return NodeRank{}, fmt.Errorf("no proxies provided")
@@ -610,7 +556,6 @@ func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.
 	return NodeRank{}, nil
 }
 
-// 存储节点权重排名
 func (s *Store) StoreNodeWeightRanking(group, config string, ranking NodeRank) {
 	data, err := json.Marshal(ranking)
 	if err != nil {
@@ -625,7 +570,6 @@ func (s *Store) StoreNodeWeightRanking(group, config string, ranking NodeRank) {
 	})
 }
 
-// 获取目标的最佳代理
 func (s *Store) GetBestProxyForTarget(group, config, target string, isUDP bool) ([]string, []float64, error) {
 	if target == "" {
 		return nil, nil, errors.New("empty target")
@@ -701,11 +645,14 @@ func (s *Store) bestProxyForTargetFrom(allStatsMap map[string]map[string][]byte,
 	return bestNodes, bestWeights, nil
 }
 
-// 获取活跃域名
-func (h targetMinHeap) Len() int            { return len(h) }
-func (h targetMinHeap) Less(i, j int) bool  { return h[i].LastUsed < h[j].LastUsed }
-func (h targetMinHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h targetMinHeap) Len() int { return len(h) }
+
+func (h targetMinHeap) Less(i, j int) bool { return h[i].LastUsed < h[j].LastUsed }
+
+func (h targetMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
 func (h *targetMinHeap) Push(x interface{}) { *h = append(*h, x.(ActiveTarget)) }
+
 func (h *targetMinHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
@@ -770,7 +717,6 @@ func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget
 	return sorted
 }
 
-// RunPrefetch 最佳节点预计算
 func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int {
 	log.Debugln("[SmartStore] Executing target pre-calculation for policy group [%s]", group)
 
@@ -848,82 +794,80 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 		var sortedWeights []float64
 		var needUpdate bool
 
-		{
-			if len(oldNodes) == 0 {
-				needUpdate = true
-				sortedNodes = item.bestNodes
-				sortedWeights = item.bestWeights
-			} else {
-				finalNodeMap := make(map[string]float64, len(oldNodes)+len(item.bestNodes))
-				for i, node := range oldNodes {
-					finalNodeMap[node] = oldWeights[i]
-				}
+		if len(oldNodes) == 0 {
+			needUpdate = true
+			sortedNodes = item.bestNodes
+			sortedWeights = item.bestWeights
+		} else {
+			finalNodeMap := make(map[string]float64, len(oldNodes)+len(item.bestNodes))
+			for i, node := range oldNodes {
+				finalNodeMap[node] = oldWeights[i]
+			}
 
-				for i, newNode := range item.bestNodes {
-					newW := item.bestWeights[i]
-					if oldW, exists := finalNodeMap[newNode]; exists {
-						// prevent degrade recovery too fast
-						if oldW <= 0 || math.Abs(newW-oldW)/oldW > 0.1 {
-							finalNodeMap[newNode] = newW
-							needUpdate = true
-						}
-					} else {
+			for i, newNode := range item.bestNodes {
+				newW := item.bestWeights[i]
+				if oldW, exists := finalNodeMap[newNode]; exists {
+					// prevent degrade recovery too fast
+					if oldW <= 0 || math.Abs(newW-oldW)/oldW > 0.1 {
 						finalNodeMap[newNode] = newW
 						needUpdate = true
 					}
-				}
-
-				// Clean up prefetch results if node stats expired, otherwise they may stay in prefetch results even if they are recovered.
-				nodeExistsMap, ok := targetNodeExistsCache[item.target]
-				if !ok {
-					nodeExistsMap = make(map[string]bool)
-					targetNodeExistsCache[item.target] = nodeExistsMap
-				}
-
-				for node := range finalNodeMap {
-					if !proxyMap[node] && finalNodeMap[node] > AllowedWeight {
-						delete(finalNodeMap, node)
-						continue
-					}
-					exists, checked := nodeExistsMap[node]
-					if !checked {
-						if nodeStats, err := s.GetStatsForTarget(group, config, item.target, node); err == nil && len(nodeStats) > 0 {
-							exists = true
-						}
-						nodeExistsMap[node] = exists
-					}
-					if !exists {
-						delete(finalNodeMap, node)
-					}
-				}
-
-				if needUpdate {
-					var nodeList []NodeWithWeight
-					for node, weight := range finalNodeMap {
-						nodeList = append(nodeList, NodeWithWeight{node, weight})
-					}
-					sort.Slice(nodeList, func(i, j int) bool {
-						if nodeList[i].Weight != nodeList[j].Weight {
-							return nodeList[i].Weight > nodeList[j].Weight
-						}
-						return nodeList[i].Node < nodeList[j].Node
-					})
-
-					sortedNodes = make([]string, len(nodeList))
-					sortedWeights = make([]float64, len(nodeList))
-					for i, nw := range nodeList {
-						sortedNodes[i] = nw.Node
-						sortedWeights[i] = nw.Weight
-					}
 				} else {
-					sortedNodes = item.bestNodes
-					sortedWeights = item.bestWeights
+					finalNodeMap[newNode] = newW
+					needUpdate = true
+				}
+			}
+
+			// Clean up prefetch results if node stats expired, otherwise they may stay in prefetch results even if they are recovered.
+			nodeExistsMap, ok := targetNodeExistsCache[item.target]
+			if !ok {
+				nodeExistsMap = make(map[string]bool)
+				targetNodeExistsCache[item.target] = nodeExistsMap
+			}
+
+			for node := range finalNodeMap {
+				if !proxyMap[node] && finalNodeMap[node] > AllowedWeight {
+					delete(finalNodeMap, node)
+					continue
+				}
+				exists, checked := nodeExistsMap[node]
+				if !checked {
+					if nodeStats, err := s.GetStatsForTarget(group, config, item.target, node); err == nil && len(nodeStats) > 0 {
+						exists = true
+					}
+					nodeExistsMap[node] = exists
+				}
+				if !exists {
+					delete(finalNodeMap, node)
 				}
 			}
 
 			if needUpdate {
-				s.StorePrefetchResult(group, config, item.target, item.isUDP, sortedNodes, sortedWeights)
+				var nodeList []NodeWithWeight
+				for node, weight := range finalNodeMap {
+					nodeList = append(nodeList, NodeWithWeight{node, weight})
+				}
+				sort.Slice(nodeList, func(i, j int) bool {
+					if nodeList[i].Weight != nodeList[j].Weight {
+						return nodeList[i].Weight > nodeList[j].Weight
+					}
+					return nodeList[i].Node < nodeList[j].Node
+				})
+
+				sortedNodes = make([]string, len(nodeList))
+				sortedWeights = make([]float64, len(nodeList))
+				for i, nw := range nodeList {
+					sortedNodes[i] = nw.Node
+					sortedWeights[i] = nw.Weight
+				}
+			} else {
+				sortedNodes = item.bestNodes
+				sortedWeights = item.bestWeights
 			}
+		}
+
+		if needUpdate {
+			s.StorePrefetchResult(group, config, item.target, item.isUDP, sortedNodes, sortedWeights)
 		}
 
 		prefetchCount++
@@ -949,27 +893,6 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 	log.Infoln("[SmartStore] Prefetch completed for group [%s]: pre-calculated [%d] targets",
 		group, prefetchCount)
 	return prefetchCount
-}
-
-func asnEvidenceKey(group, config string) string {
-	return config + "|" + group
-}
-
-// invalidateASNEvidence drops the evidence cached for what a flush at level just
-// deleted, so the next TargetASNEvidence scans the store again. Without it the
-// flushed counts would keep backing claims until the next rebuild.
-func invalidateASNEvidence(level, config, group string) {
-	switch level {
-	case "all":
-		asnEvidenceCache.Clear()
-	case "config":
-		prefix := config + "|"
-		asnEvidenceCache.DeleteMatching(func(key string, _ *asnEvidenceEntry) (bool, bool) {
-			return strings.HasPrefix(key, prefix), false
-		})
-	case "group":
-		asnEvidenceCache.Delete(asnEvidenceKey(group, config))
-	}
 }
 
 // RecordASNEvidence counts one more network observation of a target. It is a no-op
@@ -1061,64 +984,6 @@ func (s *Store) scanASNEvidence(group, config string) map[string]map[string]int 
 	return result
 }
 
-func (s *Store) loadBlockedNodes(group, config string) map[string]bool {
-	cacheKey := FormatDBKey(config, group)
-	stateData, err := s.GetNodeStates(group, config)
-	if err != nil {
-		return nil
-	}
-	now := time.Now().Unix()
-	blockedNodes := make(map[string]bool)
-
-	for nodeName, data := range stateData {
-		var state NodeState
-		if json.Unmarshal(data, &state) == nil {
-			if state.BlockedUntil > 0 && state.BlockedUntil > now {
-				blockedNodes[nodeName] = true
-			}
-		}
-	}
-
-	blockedNodesCache.Set(cacheKey, blockedNodes)
-	return blockedNodes
-}
-
-// GetBlockedNodes 获取被屏蔽节点
-func (s *Store) GetBlockedNodes(group, config string) map[string]bool {
-	cacheKey := FormatDBKey(config, group)
-	if cached, expireTime, ok := blockedNodesCache.GetWithExpire(cacheKey); ok {
-		if expireTime.Before(time.Now()) {
-			if _, loading := blockedNodesRefreshFlags.LoadOrStore(cacheKey, true); !loading {
-				go func() {
-					defer blockedNodesRefreshFlags.Delete(cacheKey)
-					s.loadBlockedNodes(group, config)
-				}()
-			}
-		}
-		return cached
-	}
-	return s.loadBlockedNodes(group, config)
-}
-
-// GetNodeStates 获取节点状态
-func (s *Store) GetNodeStates(group, config string) (map[string][]byte, error) {
-	pathPrefix := FormatDBKey(KeyTypeNode, config, group)
-	result := make(map[string][]byte)
-
-	rawResult, err := s.GetSubBytesByPath(pathPrefix)
-	if err != nil {
-		return nil, err
-	}
-
-	for fullPath, data := range rawResult {
-		nodeName := fullPath[strings.LastIndexByte(fullPath, '/')+1:]
-		result[nodeName] = data
-	}
-
-	return result, nil
-}
-
-// 获取域名的统计数据
 func (s *Store) GetStatsForTarget(group, config, target, proxy string) (map[string][]byte, error) {
 	result := make(map[string][]byte)
 
@@ -1148,7 +1013,6 @@ func (s *Store) GetStatsForTarget(group, config, target, proxy string) (map[stri
 	return result, nil
 }
 
-// 获取所有统计数据
 func (s *Store) GetAllStats(group, config string) (map[string]map[string][]byte, error) {
 	pathPrefix := FormatDBKey(KeyTypeStats, config, group)
 
@@ -1177,24 +1041,27 @@ func (s *Store) GetAllStats(group, config string) (map[string]map[string][]byte,
 	return result, nil
 }
 
-// 获取缓存中的所有组名
 func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 	groupsMap := make(map[string]bool)
 
 	statsPath := FormatDBKey(KeyTypeStats, config)
+	collect := func(fullPath string) {
+		rest, found := strings.CutPrefix(fullPath, statsPath+"/")
+		if !found {
+			return
+		}
+		if group, _, _ := strings.Cut(rest, "/"); group != "" {
+			groupsMap[group] = true
+		}
+	}
+
 	raw, err := s.GetSubBytesByPath(statsPath)
 	if err != nil {
 		raw = nil
 	}
 
 	for fullPath := range raw {
-		parts := strings.Split(fullPath, "/")
-		if len(parts) >= 4 {
-			group := parts[3]
-			if group != "" {
-				groupsMap[group] = true
-			}
-		}
+		collect(fullPath)
 	}
 
 	if len(groupsMap) == 0 {
@@ -1203,13 +1070,7 @@ func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 			return nil, err2
 		}
 		for path := range scanResults {
-			parts := strings.Split(path, "/")
-			if len(parts) >= 4 {
-				group := parts[3]
-				if group != "" {
-					groupsMap[group] = true
-				}
-			}
+			collect(path)
 		}
 	}
 
@@ -1221,7 +1082,6 @@ func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 	return result, nil
 }
 
-// 通过缓存数据获取组中的节点
 func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 	nodesMap := make(map[string]bool)
 
@@ -1255,6 +1115,32 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 		result = append(result, node)
 	}
 	return result, nil
+}
+
+func buildHostStatusView(codes map[BlockCode]*CodeNodeSet, now int64, hostFailLimit int) (map[string]BlockCode, bool) {
+	var nodes map[string]BlockCode
+	blockingCount := 0
+
+	for code, codeSet := range codes {
+		if codeSet == nil {
+			continue
+		}
+		for nodeName, nodeEntry := range codeSet.Nodes {
+			if nodeEntry == 0 || nodeEntry > now {
+				if nodes == nil {
+					nodes = make(map[string]BlockCode)
+				}
+				if oldCode, exists := nodes[nodeName]; !exists || code < oldCode {
+					nodes[nodeName] = code
+				}
+			}
+			if code.CountsTowardBlock() && nodeEntry > now {
+				blockingCount++
+			}
+		}
+	}
+
+	return nodes, blockingCount > hostFailLimit
 }
 
 // 域名失败屏蔽
@@ -1317,34 +1203,6 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimi
 	}
 
 	return
-}
-
-// cloneForSaveLocked copies everything the persisted form needs. Callers hold
-// hs.mu; the result is owned by the caller and safe to encode without it.
-func (hs *HostStatus) cloneForSaveLocked() *HostStatus {
-	clone := &HostStatus{
-		LastFailure: hs.LastFailure,
-		LastCheck:   hs.LastCheck,
-		Blocked:     hs.Blocked,
-	}
-	if len(hs.Codes) == 0 {
-		return clone
-	}
-	clone.Codes = make(map[BlockCode]*CodeNodeSet, len(hs.Codes))
-	for code, codeSet := range hs.Codes {
-		if codeSet == nil {
-			continue
-		}
-		// maps.Clone copies a nil map as nil, which costs nothing for the
-		// sets a given code does not use. It is not what keeps them out of the
-		// encoded form -- omitempty drops an empty map just the same.
-		clone.Codes[code] = &CodeNodeSet{
-			Nodes:      maps.Clone(codeSet.Nodes),
-			FailCounts: maps.Clone(codeSet.FailCounts),
-			NodeHosts:  maps.Clone(codeSet.NodeHosts),
-		}
-	}
-	return clone
 }
 
 func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata *C.Metadata, name string, maxFailedTimes int, hostFailLimit int, failure, checked bool, statusCode BlockCode, ttl time.Duration) bool {
@@ -1805,7 +1663,6 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 	return result, nil
 }
 
-// 移除节点数据
 func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes []string) error {
 	if len(nodes) == 0 {
 		return nil
@@ -1820,7 +1677,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 
 	var firstErr error
 
-	// 清理 stats
 	statsPrefix := FormatDBKey(KeyTypeStats, config, group)
 	statsResults, err := s.DBViewPrefixScan(statsPrefix, -1, false)
 	if err != nil {
@@ -1842,7 +1698,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		}
 	}
 
-	// 清理 prefetch
 	prefetchPrefix := FormatDBKey(KeyTypePrefetch, config, group)
 	prefetchResults, err := s.DBViewPrefixScan(prefetchPrefix, -1, false)
 	if err != nil {
@@ -1913,7 +1768,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		}
 	}
 
-	// 清理 ranking
 	rankingPrefix := FormatDBKey(KeyTypeRanking, config, group)
 	rankingResults, err := s.DBViewPrefixScan(rankingPrefix, -1, true)
 	if err != nil {
@@ -2043,7 +1897,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		}
 	}
 
-	// 删除节点状态
 	nodeStateKeys := make([]string, len(nodes))
 	for i, nodeName := range nodes {
 		nodeStateKeys[i] = FormatDBKey(KeyTypeNode, config, group, nodeName)
@@ -2055,7 +1908,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 	return firstErr
 }
 
-// 清理旧的记录
 func (s *Store) CleanupOldRecords(group, config string) {
 	keyTypes := []string{KeyTypeStats, KeyTypePrefetch, KeyTypeHostFailures}
 
@@ -2072,26 +1924,33 @@ func (s *Store) CleanupOldRecords(group, config string) {
 		}
 
 		type targetInfo struct {
-			time   time.Time
-			value  float64
-			target string
+			path  string
+			time  time.Time
+			value float64
 		}
-		targetMap := make(map[string]*targetInfo)
+		var records []targetInfo
 		var toDelete []string
 
 		for path, data := range rawData {
-			parts := strings.Split(path, "/")
-			if len(parts) < 5 {
+			rest, found := strings.CutPrefix(path, pathPrefix+"/")
+			if !found {
 				continue
 			}
-			target := parts[4]
+			target := rest
+			hasNode := false
+			if cut := strings.IndexByte(rest, '/'); cut >= 0 {
+				target = rest[:cut]
+				hasNode = true
+			}
+			if target == "" {
+				continue
+			}
 
-			// 优先保留使用频率高和最近使用的记录
 			var lastTime int64
 			var value float64
 			switch keyType {
 			case KeyTypeStats:
-				if len(parts) < 6 {
+				if !hasNode {
 					continue
 				}
 				var record StatsRecord
@@ -2129,24 +1988,20 @@ func (s *Store) CleanupOldRecords(group, config string) {
 				continue
 			}
 
-			targetMap[path] = &targetInfo{
-				time:   time.Unix(lastTime, 0),
-				value:  value,
-				target: target,
-			}
+			records = append(records, targetInfo{path: path, time: time.Unix(lastTime, 0), value: value})
 		}
 
-		var invalidTargets []string
-		var validTargets []string
-		for path, info := range targetMap {
+		var invalidTargets []targetInfo
+		var validTargets []targetInfo
+		for _, info := range records {
 			if info.time.Unix() <= 0 {
-				invalidTargets = append(invalidTargets, path)
+				invalidTargets = append(invalidTargets, info)
 			} else {
-				validTargets = append(validTargets, path)
+				validTargets = append(validTargets, info)
 			}
 		}
 
-		totalRecords := len(targetMap)
+		totalRecords := len(records)
 		toDeleteCount := totalRecords - maxTargets
 		if toDeleteCount < 0 {
 			toDeleteCount = 0
@@ -2154,26 +2009,22 @@ func (s *Store) CleanupOldRecords(group, config string) {
 		deleted := 0
 
 		sort.Slice(validTargets, func(i, j int) bool {
-			infoI := targetMap[validTargets[i]]
-			infoJ := targetMap[validTargets[j]]
-			if infoI.value != infoJ.value {
-				return infoI.value < infoJ.value
+			if validTargets[i].value != validTargets[j].value {
+				return validTargets[i].value < validTargets[j].value
 			}
-			return infoI.time.Before(infoJ.time)
+			return validTargets[i].time.Before(validTargets[j].time)
 		})
 
-		for i := 0; i < len(validTargets); i++ {
-			path := validTargets[i]
-			info := targetMap[path]
+		for _, info := range validTargets {
 			shouldDeleteByCount := deleted < toDeleteCount && totalRecords > maxTargets*2
 			if shouldDeleteByCount || time.Since(info.time) > RecordExpiredTime {
-				toDelete = append(toDelete, path)
+				toDelete = append(toDelete, info.path)
 				deleted++
 			}
 		}
 
-		for _, path := range invalidTargets {
-			toDelete = append(toDelete, path)
+		for _, info := range invalidTargets {
+			toDelete = append(toDelete, info.path)
 			deleted++
 		}
 		if len(toDelete) > 0 {
@@ -2195,6 +2046,99 @@ func (s *Store) CleanupOldRecords(group, config string) {
 				deleted, keyType, group, totalRecords-deleted)
 		}
 	}
+}
 
-	return
+// BlockCode says why a node is excluded from a target. The values are the keys
+// of HostStatus.Codes and are persisted, so they are an on-disk format: they
+// can be added to, never renumbered.
+//
+// They are ordered by severity, lowest first, and UpdateHostStatus relies on
+// that -- a new verdict that is numerically lower replaces a higher one, and a
+// higher one is discarded while a lower one stands.
+type BlockCode int
+
+const (
+	// BlockNone is not a block. It is what a healthy close reports, and what
+	// tells UpdateHostStatus to clear the node instead of recording anything.
+	BlockNone BlockCode = 0
+	// BlockManual is the dashboard's block. Permanent, never probed, and never
+	// cleared by anything the network does -- it is the user's decision.
+	BlockManual BlockCode = 1
+	// BlockAbnormalStatus is a status test through the node answering badly.
+	// The only code a recovery probe can itself raise.
+	BlockAbnormalStatus BlockCode = 2
+	// BlockDialFailure accumulates: it counts failures and only blocks once
+	// they reach maxFailedTimes.
+	BlockDialFailure BlockCode = 3
+	// BlockNoResponse is a request that went out and got nothing back.
+	BlockNoResponse BlockCode = 4
+	// BlockLowWeight is a computed weight under AllowedWeight.
+	BlockLowWeight BlockCode = 5
+	// BlockPacketLoss is loss over the threshold.
+	BlockPacketLoss BlockCode = 6
+)
+
+// Recoverable reports whether a probe may return this node to service. Only
+// BlockManual is excluded: it is the user's decision, not the network's, and
+// nothing should undo it behind their back.
+func (c BlockCode) Recoverable() bool {
+	return c != BlockNone && c != BlockManual
+}
+
+// CountsTowardBlock reports whether a node blocked with this code counts toward
+// hostFailLimit, past which the whole target is marked Blocked. Neither the
+// user's own blocks nor a site's short-lived answers do: a site that limits
+// traffic would otherwise flip its target in and out of Blocked every few
+// minutes.
+func (c BlockCode) CountsTowardBlock() bool {
+	return c.Recoverable() && c != BlockAbnormalStatus
+}
+
+func asnEvidenceKey(group, config string) string {
+	return config + "|" + group
+}
+
+// invalidateASNEvidence drops the evidence cached for what a flush at level just
+// deleted, so the next TargetASNEvidence scans the store again. Without it the
+// flushed counts would keep backing claims until the next rebuild.
+func invalidateASNEvidence(level, config, group string) {
+	switch level {
+	case "all":
+		asnEvidenceCache.Clear()
+	case "config":
+		prefix := config + "|"
+		asnEvidenceCache.DeleteMatching(func(key string, _ *asnEvidenceEntry) (bool, bool) {
+			return strings.HasPrefix(key, prefix), false
+		})
+	case "group":
+		asnEvidenceCache.Delete(asnEvidenceKey(group, config))
+	}
+}
+
+// cloneForSaveLocked copies everything the persisted form needs. Callers hold
+// hs.mu; the result is owned by the caller and safe to encode without it.
+func (hs *HostStatus) cloneForSaveLocked() *HostStatus {
+	clone := &HostStatus{
+		LastFailure: hs.LastFailure,
+		LastCheck:   hs.LastCheck,
+		Blocked:     hs.Blocked,
+	}
+	if len(hs.Codes) == 0 {
+		return clone
+	}
+	clone.Codes = make(map[BlockCode]*CodeNodeSet, len(hs.Codes))
+	for code, codeSet := range hs.Codes {
+		if codeSet == nil {
+			continue
+		}
+		// maps.Clone copies a nil map as nil, which costs nothing for the
+		// sets a given code does not use. It is not what keeps them out of the
+		// encoded form -- omitempty drops an empty map just the same.
+		clone.Codes[code] = &CodeNodeSet{
+			Nodes:      maps.Clone(codeSet.Nodes),
+			FailCounts: maps.Clone(codeSet.FailCounts),
+			NodeHosts:  maps.Clone(codeSet.NodeHosts),
+		}
+	}
+	return clone
 }

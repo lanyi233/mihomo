@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"fmt"
 	"syscall"
 	"unsafe"
 	_ "unsafe"
@@ -31,9 +32,14 @@ type ProcTaskInfo struct {
 
 func GetMemoryInfo(pid int32) (*MemoryInfoStat, error) {
 	var ti ProcTaskInfo
-	_, _, errno := syscall_syscall6(proc_pidinfo_trampoline_addr, uintptr(pid), PROC_PIDTASKINFO, 0, uintptr(unsafe.Pointer(&ti)), unsafe.Sizeof(ti), 0)
+	size := unsafe.Sizeof(ti)
+	n, _, errno := syscall_syscall6(proc_pidinfo_trampoline_addr, uintptr(pid), PROC_PIDTASKINFO, 0, uintptr(unsafe.Pointer(&ti)), size, 0)
 	if errno != 0 {
 		return nil, errno
+	}
+	// proc_pidinfo returns an int byte count and reports failure with zero.
+	if int32(n) != int32(size) {
+		return nil, fmt.Errorf("proc_pidinfo for pid %d returned %d bytes, want %d", pid, int32(n), size)
 	}
 
 	ret := &MemoryInfoStat{

@@ -3,39 +3,39 @@ package adapter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/metacubex/http"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/convert"
 	"github.com/metacubex/mihomo/common/queue"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/smart"
 	"github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
-
-	"github.com/metacubex/http"
 )
 
 var UnifiedDelay = atomic.NewBool(false)
 
-var (
-	banStatus = map[int]bool{
-		http.StatusForbidden:          true, // 403
-		http.StatusMethodNotAllowed:   true, // 405
-		http.StatusMisdirectedRequest: true, // 421
-		http.StatusNotImplemented:     true, // 501
-		http.StatusServiceUnavailable: true, // 503
-		520:                           true, // Cloudflare 520
-		599:                           true, // timeout
-	}
-)
+var banStatus = map[int]bool{
+	http.StatusForbidden:          true,
+	http.StatusMethodNotAllowed:   true,
+	http.StatusMisdirectedRequest: true,
+	http.StatusNotImplemented:     true,
+	http.StatusServiceUnavailable: true,
+	520:                           true,
+	599:                           true,
+}
 
 const (
 	defaultHistoriesNum = 10
@@ -324,11 +324,22 @@ func urlToMetadata(rawURL string) (addr C.Metadata, err error) {
 	return
 }
 
-// StatusTest requests rawURL through the proxy and reports whether the answer
-// is one banStatus accepts. A timeout is reported as status 599, not an error.
 func (p *Proxy) StatusTest(ctx context.Context, rawURL string) (status uint16, ok bool, err error) {
+	resp, transport, err := p.statusRequest(ctx, rawURL, nil, nil)
+	if transport != nil {
+		defer transport.CloseIdleConnections()
+	}
+
 	var statusCode int
-	err = p.statusRequest(ctx, rawURL, func(resp *http.Response) {
+	if err != nil {
+		if netErr, okNet := err.(net.Error); okNet && netErr.Timeout() {
+			statusCode = 599
+		} else if err == context.Canceled || err == context.DeadlineExceeded {
+			statusCode = 599
+		} else {
+			return 1, false, err
+		}
+	} else {
 		statusCode = resp.StatusCode
 		ok = !banStatus[statusCode]
 		if !ok {
@@ -343,51 +354,154 @@ func (p *Proxy) StatusTest(ctx context.Context, rawURL string) (status uint16, o
 				}
 			}
 		}
-	})
-	if err != nil {
-		if netErr, okNet := err.(net.Error); okNet && netErr.Timeout() {
-			return 599, false, nil
-		} else if err == context.Canceled || err == context.DeadlineExceeded {
-			return 599, false, nil
-		}
-		return 1, false, err
+		_ = resp.Body.Close()
 	}
+
 	return uint16(statusCode), ok, nil
 }
 
-// StatusProbe is StatusTest for the Smart group's response classifier
-// (smart.ClassifyResponse), which reads the status and headers itself: a 403
-// with Retry-After, a challenge page and a 429 all mean different things there.
-// Errors are returned as they are, for smart.ClassifyProbeError.
+// StatusProbe fetches rawURL through the proxy for the smart group's answer checks and,
+// unlike StatusTest, leaves cross-host redirects unfollowed for the caller to classify.
 func (p *Proxy) StatusProbe(ctx context.Context, rawURL string) (*smart.ProbeResult, error) {
-	var result *smart.ProbeResult
-	err := p.statusRequest(ctx, rawURL, func(resp *http.Response) {
-		result = &smart.ProbeResult{StatusCode: resp.StatusCode, Header: resp.Header}
-	})
+	header := http.Header{}
+	header.Set("Accept-Encoding", "identity")
+
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
+		// only an identical host[:port] keeps following; another host would test another site
+		if !sameHostPort(req.URL, via[0].URL) {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+
+	resp, transport, err := p.statusRequest(ctx, rawURL, header, checkRedirect)
+	if transport != nil {
+		defer transport.CloseIdleConnections()
+	}
 	if err != nil {
 		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	return &smart.ProbeResult{
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header,
+		Body:       readBodySnippet(resp.Body, smart.ProbeBodyLimit, smart.ProbeBodyWait),
+	}, nil
+}
+
+// readBodySnippet never drains a streaming body; the caller closing it releases the read.
+func readBodySnippet(body io.Reader, limit int, wait time.Duration) []byte {
+	snippet := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(io.LimitReader(body, int64(limit)))
+		snippet <- data
+	}()
+	select {
+	case data := <-snippet:
+		return data
+	case <-time.After(wait):
+		return nil
+	}
+}
+
+// ExitProbe asks the trace endpoints through this node where its traffic lands, trying
+// the fallbacks until one answers; the address serves the ASN lookup and is never returned.
+func (p *Proxy) ExitProbe(ctx context.Context, wantASN bool) (*smart.ExitProbeResult, error) {
+	var lastErr error
+	for _, rawURL := range smart.ExitTraceURLs {
+		if ctx.Err() != nil {
+			break
+		}
+		result, err := p.exitProbe(ctx, rawURL, wantASN)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: %w", rawURL, err)
+			continue
+		}
+		return result, nil
+	}
+	if lastErr == nil {
+		lastErr = ctx.Err()
+	}
+	return nil, lastErr
+}
+
+func (p *Proxy) exitProbe(ctx context.Context, rawURL string, wantASN bool) (*smart.ExitProbeResult, error) {
+	header := http.Header{}
+	header.Set("Accept-Encoding", "identity")
+
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
+		if !sameHostPort(req.URL, via[0].URL) {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+
+	resp, transport, err := p.statusRequest(ctx, rawURL, header, checkRedirect)
+	if transport != nil {
+		defer transport.CloseIdleConnections()
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("exit trace answered %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, smart.ExitProbeBodyLimit))
+	if err != nil {
+		return nil, err
+	}
+	region, ip := smart.ParseExitAnswer(body)
+	if region == "" {
+		return nil, errors.New("exit trace has no region")
+	}
+
+	result := &smart.ExitProbeResult{Region: region}
+	if ip.IsValid() {
+		result.Key = smart.ExitKey(ip)
+	}
+	if wantASN && ip.IsValid() {
+		// ASNInstance stops the process without a loadable database, so Verify guards it
+		if path := C.Path.ASN(); path != "" && mmdb.Verify(path) {
+			asn, _ := mmdb.ASNInstance().LookupASN(ip.AsSlice())
+			result.ASN = asn
+		}
 	}
 	return result, nil
 }
 
-var _ smart.StatusProber = (*Proxy)(nil)
+// sameHostPort ignores an explicit default port, so a redirect that only spells out :443
+// keeps being followed.
+func sameHostPort(a, b *url.URL) bool {
+	normalize := func(u *url.URL) string {
+		port := u.Port()
+		if port == "" || (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+			return u.Hostname()
+		}
+		return net.JoinHostPort(u.Hostname(), port)
+	}
+	return strings.EqualFold(normalize(a), normalize(b))
+}
 
-// statusRequest sends one browser-like GET for rawURL through the proxy and
-// hands the response to handle before closing it.
-func (p *Proxy) statusRequest(ctx context.Context, rawURL string, handle func(*http.Response)) error {
+// statusRequest sends a GET through the proxy with a browser preset; the transport it
+// returns (nil when the request could not be built) holds connections the caller must close.
+// extraHeader overrides preset headers; checkRedirect runs after the 3-redirect limit.
+func (p *Proxy) statusRequest(ctx context.Context, rawURL string, extraHeader http.Header, checkRedirect func(req *http.Request, via []*http.Request) error) (*http.Response, *http.Transport, error) {
 	if _, err := urlToMetadata(rawURL); err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	tlsConfig, err := ca.GetTLSConfig(ca.Option{})
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	preset := convert.RandBrowserPreset()
 	fingerprint, ok2 := tls.GetFingerprint(preset.FingerprintName)
 	if !ok2 {
-		return fmt.Errorf("failed to get TLS fingerprint: %s", preset.FingerprintName)
+		return nil, nil, fmt.Errorf("failed to get TLS fingerprint: %s", preset.FingerprintName)
 	}
 
 	// Resolve the target per hop instead of pinning the one from rawURL: redirects
@@ -445,23 +559,25 @@ func (p *Proxy) statusRequest(ctx context.Context, rawURL string, handle func(*h
 			if len(via) >= 3 {
 				return http.ErrUseLastResponse
 			}
+			if checkRedirect != nil {
+				return checkRedirect(req, via)
+			}
 			return nil
 		},
 	}
-	defer client.CloseIdleConnections()
 
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
-		return err
+		return nil, transport, err
 	}
 	req = req.WithContext(ctx)
 	req.Header = preset.Headers.Clone()
+	for key, values := range extraHeader {
+		req.Header[key] = values
+	}
 
 	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	handle(resp)
-	_ = resp.Body.Close()
-	return nil
+	return resp, transport, err
 }
+
+var _ smart.StatusProber = (*Proxy)(nil)

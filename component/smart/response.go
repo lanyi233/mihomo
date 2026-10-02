@@ -1,6 +1,7 @@
 package smart
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"errors"
@@ -16,28 +17,44 @@ import (
 )
 
 const (
-	probeDefaultBlockTTL   = 10 * time.Minute
-	probeTransientBlockTTL = 5 * time.Minute
-	probeRegionalBlockTTL  = 30 * time.Minute
-	probeMinBlockTTL       = 60 * time.Second
-
 	responseProbeDownloadThresholdMB = 0.03
 
-	ProbeTimeout                 = 8 * time.Second
-	probeMinIntervalPerNode      = 120 * time.Second
-	probeMinIntervalAfterFailure = 30 * time.Second
-	probeRecentFailureWindow     = 10 * time.Minute
-	probePerTargetPerMinute      = 6
+	ProbeTimeout = 8 * time.Second
+
+	probePerTargetPerMinute = 6
 
 	probeGlobalPerMinute = 120
 	probeGlobalBurst     = 10
 	probeMaxInflight     = 4
 
 	probeHostBlindThreshold = 6
-	probeHostBlindWindow    = 30 * time.Minute
 
 	probeMaxEntries = 4096
 	probePath       = "/robots.txt"
+
+	ProbeBodyLimit = 4096
+
+	// a refusal page is usually sent at once, waiting longer is not worth the probe
+	ProbeBodyWait = time.Second
+
+	probeMaxBlockTTL = 30 * time.Minute
+
+	ReasonForbidden   = "forbidden"
+	ReasonOriginError = "origin error"
+	ReasonEdgeError   = "edge error"
+)
+
+// The intervals are variables so a test can shrink them instead of waiting them out.
+var (
+	probeDefaultBlockTTL   = 10 * time.Minute
+	probeTransientBlockTTL = 5 * time.Minute
+	probeRegionalBlockTTL  = 30 * time.Minute
+	probeMinBlockTTL       = 60 * time.Second
+
+	probeMinIntervalPerNode      = 120 * time.Second
+	probeMinIntervalAfterFailure = 30 * time.Second
+	probeRecentFailureWindow     = 10 * time.Minute
+	probeHostBlindWindow         = 30 * time.Minute
 )
 
 var (
@@ -60,14 +77,16 @@ const (
 
 type (
 	Verdict struct {
-		Action VerdictAction
-		TTL    time.Duration
-		Reason string
+		Action         VerdictAction
+		TTL            time.Duration
+		Reason         string
+		ControlSuccess bool
 	}
 
 	ProbeResult struct {
 		StatusCode int
 		Header     http.Header
+		Body       []byte
 	}
 
 	StatusProber interface {
@@ -77,6 +96,11 @@ type (
 	probeNodeState struct {
 		lastProbe   time.Time
 		lastFailure time.Time
+	}
+
+	probeNodeKey struct {
+		target string
+		node   string
 	}
 
 	probeWindow struct {
@@ -93,7 +117,7 @@ type (
 
 	ProbeThrottle struct {
 		mu      sync.Mutex
-		nodes   map[string]*probeNodeState
+		nodes   map[probeNodeKey]*probeNodeState
 		targets map[string]*probeWindow
 		hosts   map[string]*probeHostState
 	}
@@ -101,7 +125,7 @@ type (
 
 // ClassifyResponse turns the answer of a node into a verdict: only what identifies the node
 // itself may record a block, a redirect that leaves the host must neither record nor clear.
-func ClassifyResponse(status int, header http.Header, now time.Time) Verdict {
+func ClassifyResponse(status int, header http.Header, body []byte, now time.Time) Verdict {
 	switch {
 	case isChallenge(header):
 		return record(probeDefaultBlockTTL, "challenge")
@@ -111,13 +135,18 @@ func ClassifyResponse(status int, header http.Header, now time.Time) Verdict {
 		return record(rateLimitTTL(header, now), "rate limited")
 	case status == http.StatusOK && strings.TrimSpace(header.Get("X-Ratelimit-Remaining")) == "0":
 		return record(rateLimitTTL(header, now), "quota exhausted")
+	case IsRegionUnavailableText(body):
+		return record(probeRegionalBlockTTL, ReasonRegionUnavailable)
 	case status == http.StatusForbidden:
-		return record(probeDefaultBlockTTL, "forbidden")
+		return record(probeDefaultBlockTTL, ReasonForbidden)
 	case status == http.StatusUnavailableForLegalReasons:
 		return record(probeRegionalBlockTTL, "unavailable for legal reasons")
 	case status == http.StatusMisdirectedRequest:
 		return ignore("misdirected request")
 	case status >= 300 && status < 400:
+		if IsRegionUnavailableLocation(header.Get("Location")) {
+			return record(probeRegionalBlockTTL, ReasonRegionUnavailable)
+		}
 		return ignore("redirect")
 	case status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented:
 		return ignore("method not allowed")
@@ -125,12 +154,25 @@ func ClassifyResponse(status int, header http.Header, now time.Time) Verdict {
 		if _, ok := parseRetryAfter(header.Get("Retry-After"), now); ok {
 			return record(rateLimitTTL(header, now), "overloaded")
 		}
-		return record(probeTransientBlockTTL, "origin error")
+		if isEdgeAnswer(body) {
+			return record(probeTransientBlockTTL, ReasonEdgeError)
+		}
+		return record(probeTransientBlockTTL, ReasonOriginError)
 	case status >= 200:
-		return reachable("answered")
+		return reachable("answered", status >= 200 && status < 300)
 	default:
 		return ignore("unknown status")
 	}
+}
+
+// RegionEvidence reports whether a refusal may be pooled per region: an answer that blames
+// the region, or a refusal only a cross region comparison can tell apart from an outage.
+func RegionEvidence(reason string) bool {
+	switch reason {
+	case ReasonRegionUnavailable, ReasonForbidden, ReasonOriginError:
+		return true
+	}
+	return false
 }
 
 func ClassifyProbeError(err error) Verdict {
@@ -151,7 +193,7 @@ func ClassifyProbeError(err error) Verdict {
 	return ignore("probe failed")
 }
 
-// A cancelled probe is not a timeout, it comes from the group shutting down instead of the node.
+// A cancelled probe means the group is shutting down, not that the node timed out.
 func isTimeout(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
@@ -169,6 +211,9 @@ func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
 		if seconds <= 0 {
 			return 0, false
 		}
+		if seconds > int64(probeMaxBlockTTL/time.Second) {
+			return probeMaxBlockTTL, true
+		}
 		return time.Duration(seconds) * time.Second, true
 	}
 	if t, err := http.ParseTime(value); err == nil && t.After(now) {
@@ -182,9 +227,21 @@ func rateLimitTTL(header http.Header, now time.Time) time.Duration {
 		return d
 	}
 	if epoch, err := strconv.ParseInt(strings.TrimSpace(header.Get("X-Ratelimit-Reset")), 10, 64); err == nil && epoch > now.Unix() {
-		return time.Duration(epoch-now.Unix()) * time.Second
+		seconds := epoch - now.Unix()
+		if seconds > int64(probeMaxBlockTTL/time.Second) {
+			return probeMaxBlockTTL
+		}
+		return time.Duration(seconds) * time.Second
 	}
 	return probeDefaultBlockTTL
+}
+
+// A CDN answers a broken origin with its own error page that every node gets: the refusal
+// says nothing about a node or a region even though it is recorded as one.
+func isEdgeAnswer(body []byte) bool {
+	return bytes.Contains(body, []byte("cf-error-details")) ||
+		bytes.Contains(body, []byte("cf-error-overview")) ||
+		bytes.Contains(body, []byte("cf.errors.css"))
 }
 
 func isChallenge(header http.Header) bool {
@@ -210,8 +267,8 @@ func ignore(reason string) Verdict {
 	return Verdict{Action: VerdictIgnore, Reason: reason}
 }
 
-func reachable(reason string) Verdict {
-	return Verdict{Action: VerdictReachable, Reason: reason}
+func reachable(reason string, controlSuccess bool) Verdict {
+	return Verdict{Action: VerdictReachable, Reason: reason, ControlSuccess: controlSuccess}
 }
 
 func record(ttl time.Duration, reason string) Verdict {
@@ -226,7 +283,7 @@ func record(ttl time.Duration, reason string) Verdict {
 
 func (t *ProbeThrottle) ensureMaps() {
 	if t.nodes == nil {
-		t.nodes = make(map[string]*probeNodeState)
+		t.nodes = make(map[probeNodeKey]*probeNodeState)
 		t.targets = make(map[string]*probeWindow)
 		t.hosts = make(map[string]*probeHostState)
 	}
@@ -239,7 +296,7 @@ func (t *ProbeThrottle) AllowNode(target, node string, now time.Time) bool {
 	t.ensureMaps()
 	t.trim(now)
 
-	key := probeKey(target, node)
+	key := probeNodeKey{target: target, node: node}
 	state := t.nodes[key]
 	if state != nil {
 		interval := probeMinIntervalPerNode
@@ -307,13 +364,25 @@ func (t *ProbeThrottle) AllowHostRecord(host string, verdict Verdict, now time.T
 	return true
 }
 
+// Blind reports a host that refuses every node without ever answering: probing it further
+// only spends the probe budget, so the caller may wait for the blind window to pass.
+func (t *ProbeThrottle) Blind(host string, now time.Time) bool {
+	if host == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state := t.hosts[host]
+	return state != nil && now.Before(state.blindUntil)
+}
+
 func (t *ProbeThrottle) NoteFailure(target, node string, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	t.ensureMaps()
 
-	key := probeKey(target, node)
+	key := probeNodeKey{target: target, node: node}
 	state := t.nodes[key]
 	if state == nil {
 		state = &probeNodeState{lastProbe: now}
@@ -344,10 +413,6 @@ func (t *ProbeThrottle) trim(now time.Time) {
 			}
 		}
 	}
-}
-
-func probeKey(target, node string) string {
-	return target + "\x00" + node
 }
 
 func AllowGlobalProbe(now time.Time) bool {

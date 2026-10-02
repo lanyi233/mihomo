@@ -3,6 +3,8 @@ package smart
 import (
 	"encoding/json"
 	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,48 +14,56 @@ import (
 	"github.com/metacubex/mihomo/log"
 )
 
-var (
-	targetCache *lru.LruCache[string, string]
-
-	unwrapCache *lru.LruCache[string, UnwrapMap]
-
-	recordCache *lru.LruCache[string, *AtomicStatsRecord]
-
-	dbResultCache *lru.LruCache[string, map[string][]byte]
-
-	blockedNodesCache *lru.LruCache[string, map[string]bool]
-
-	hostStatusCache *lru.LruCache[string, *HostStatus]
+const (
+	MaxTargetsLimit     = 5000
+	MinTargetsLimit     = 500
+	MaxBatchThreshLimit = 300
+	MinBatchThreshLimit = 50
 )
 
-var (
-	dbResultRefreshFlags     xsync.Map[string, bool]
-	blockedNodesRefreshFlags xsync.Map[string, bool]
-	cacheAdjustMutex         sync.Mutex
-)
+var targetCache *lru.LruCache[string, string]
 
-type (
-	UnwrapMap struct {
-		Proxies []string `json:"proxies,omitempty"`
-		Ref     string   `json:"ref,omitempty"`
-	}
+var unwrapCache *lru.LruCache[string, UnwrapMap]
 
-	NodesWithWeights struct {
-		Nodes   []string  `json:"nodes"`
-		Weights []float64 `json:"weights"`
-	}
+var recordCache *lru.LruCache[string, *AtomicStatsRecord]
 
-	NodeWithWeight struct {
-		Node   string
-		Weight float64
-	}
+var dbResultCache *lru.LruCache[string, map[string][]byte]
 
-	PrefetchMap struct {
-		TCP         NodesWithWeights `json:"tcp,omitempty"`
-		UDP         NodesWithWeights `json:"udp,omitempty"`
-		UpdatedTime int64            `json:"updated_time,omitempty"`
-	}
-)
+var blockedNodesCache *lru.LruCache[string, map[string]bool]
+
+var hostStatusCache *lru.LruCache[string, *HostStatus]
+
+var globalCacheParams struct {
+	BatchSaveThreshold int
+	MaxTargets         int
+	LastMemoryUsage    float64
+	mutex              sync.RWMutex
+}
+
+var dbResultRefreshFlags xsync.Map[string, bool]
+
+var blockedNodesRefreshFlags xsync.Map[string, bool]
+
+type UnwrapMap struct {
+	Proxies []string `json:"proxies,omitempty"`
+	Ref     string   `json:"ref,omitempty"`
+}
+
+type NodesWithWeights struct {
+	Nodes   []string  `json:"nodes"`
+	Weights []float64 `json:"weights"`
+}
+
+type NodeWithWeight struct {
+	Node   string
+	Weight float64
+}
+
+type PrefetchMap struct {
+	TCP         NodesWithWeights `json:"tcp,omitempty"`
+	UDP         NodesWithWeights `json:"udp,omitempty"`
+	UpdatedTime int64            `json:"updated_time,omitempty"`
+}
 
 func InitCache() {
 	globalCacheParams.mutex.Lock()
@@ -67,43 +77,42 @@ func InitCache() {
 	globalCacheParams.MaxTargets = MinTargetsLimit
 
 	targetCache = lru.New[string, string](
-		lru.WithSize[string, string](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, string](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, string](300),
 		lru.WithStale[string, string](true),
 	)
 
 	unwrapCache = lru.New[string, UnwrapMap](
-		lru.WithSize[string, UnwrapMap](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, UnwrapMap](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, UnwrapMap](600),
 		lru.WithStale[string, UnwrapMap](true),
 	)
 
 	recordCache = lru.New[string, *AtomicStatsRecord](
-		lru.WithSize[string, *AtomicStatsRecord](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, *AtomicStatsRecord](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, *AtomicStatsRecord](300),
 		lru.WithStale[string, *AtomicStatsRecord](true),
 	)
 
 	dbResultCache = lru.New[string, map[string][]byte](
-		lru.WithSize[string, map[string][]byte](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, map[string][]byte](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, map[string][]byte](300),
 		lru.WithStale[string, map[string][]byte](true),
 	)
 
 	blockedNodesCache = lru.New[string, map[string]bool](
-		lru.WithSize[string, map[string]bool](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, map[string]bool](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, map[string]bool](300),
 		lru.WithStale[string, map[string]bool](true),
 	)
 
 	hostStatusCache = lru.New[string, *HostStatus](
-		lru.WithSize[string, *HostStatus](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, *HostStatus](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, *HostStatus](300),
 		lru.WithStale[string, *HostStatus](true),
 	)
 }
 
-// 存储预取结果
 func (s *Store) StorePrefetchResult(group, config string, target string, isUDP bool, proxyNames []string, weights []float64) {
 	if target == "" || len(proxyNames) == 0 {
 		return
@@ -133,7 +142,6 @@ func (s *Store) StorePrefetchResult(group, config string, target string, isUDP b
 	})
 }
 
-// 获取预取结果
 func (s *Store) GetPrefetchResult(group, config string, target string, isUDP bool) ([]string, []float64) {
 	if target == "" {
 		return nil, nil
@@ -238,7 +246,44 @@ func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string
 	blockedNodesCache.Set(cacheKey, newBlocked)
 }
 
-// 调整缓存参数
+func (s *Store) loadBlockedNodes(group, config string) map[string]bool {
+	cacheKey := FormatDBKey(config, group)
+	stateData, err := s.GetNodeStates(group, config)
+	if err != nil {
+		return nil
+	}
+	now := time.Now().Unix()
+	blockedNodes := make(map[string]bool)
+
+	for nodeName, data := range stateData {
+		var state NodeState
+		if json.Unmarshal(data, &state) == nil {
+			if state.BlockedUntil > 0 && state.BlockedUntil > now {
+				blockedNodes[nodeName] = true
+			}
+		}
+	}
+
+	blockedNodesCache.Set(cacheKey, blockedNodes)
+	return blockedNodes
+}
+
+func (s *Store) GetBlockedNodes(group, config string) map[string]bool {
+	cacheKey := FormatDBKey(config, group)
+	if cached, expireTime, ok := blockedNodesCache.GetWithExpire(cacheKey); ok {
+		if expireTime.Before(time.Now()) {
+			if _, loading := blockedNodesRefreshFlags.LoadOrStore(cacheKey, true); !loading {
+				go func() {
+					defer blockedNodesRefreshFlags.Delete(cacheKey)
+					s.loadBlockedNodes(group, config)
+				}()
+			}
+		}
+		return cached
+	}
+	return s.loadBlockedNodes(group, config)
+}
+
 func (s *Store) AdjustCacheParameters() {
 	cacheAdjustMutex.Lock()
 	defer cacheAdjustMutex.Unlock()
@@ -251,7 +296,7 @@ func (s *Store) AdjustCacheParameters() {
 	needAdjust := isFirstRun
 
 	if !isFirstRun {
-		memoryChanged := math.Abs(memoryUsage - globalCacheParams.LastMemoryUsage) > 0.05
+		memoryChanged := math.Abs(memoryUsage-globalCacheParams.LastMemoryUsage) > 0.05
 		needAdjust = memoryChanged
 	}
 
@@ -288,7 +333,6 @@ func (s *Store) AdjustCacheParameters() {
 	go s.FlushQueue(true)
 }
 
-// 按级别清理内存缓存
 func (s *Store) clearCache(level string, config string, group string) {
 	s.FlushQueue(true)
 	invalidateASNEvidence(level, config, group)
@@ -324,3 +368,66 @@ func (s *Store) clearCache(level string, config string, group string) {
 		hostStatusCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeHostFailures, config, group) + "/")
 	}
 }
+
+func GetBatchSaveThreshold() int {
+	globalCacheParams.mutex.RLock()
+	defer globalCacheParams.mutex.RUnlock()
+
+	if globalCacheParams.BatchSaveThreshold <= 0 {
+		return MinBatchThreshLimit
+	}
+
+	return globalCacheParams.BatchSaveThreshold
+}
+
+// 获取系统内存使用情况
+//
+// systemMemoryUsage is provided per platform; when it cannot read the system
+// figures we fall back to a neutral 0.5 so cache sizing stays in its mid range.
+func GetSystemMemoryUsage() float64 {
+	if usage, ok := systemMemoryUsage(); ok {
+		return usage
+	}
+	return 0.5
+}
+
+func readProcMemoryUsage(readFile func(string) ([]byte, error)) (float64, bool) {
+	data, err := readFile("/proc/meminfo")
+	if err != nil {
+		return 0, false
+	}
+
+	var totalKB, availableKB uint64
+	var foundTotal, foundAvailable bool
+	for _, line := range strings.Split(string(data), "\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok || (name != "MemTotal" && name != "MemAvailable") {
+			continue
+		}
+		fields := strings.Fields(value)
+		if len(fields) == 0 {
+			continue
+		}
+		memoryKB, parseErr := strconv.ParseUint(fields[0], 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		if name == "MemTotal" {
+			totalKB = memoryKB
+			foundTotal = true
+		} else {
+			availableKB = memoryKB
+			foundAvailable = true
+		}
+	}
+
+	if !foundTotal || !foundAvailable || totalKB == 0 {
+		return 0, false
+	}
+	if availableKB >= totalKB {
+		return 0, true
+	}
+	return float64(totalKB-availableKB) / float64(totalKB), true
+}
+
+var cacheAdjustMutex sync.Mutex

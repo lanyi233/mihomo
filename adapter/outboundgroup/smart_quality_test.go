@@ -45,9 +45,7 @@ func TestNoResponseVerdictNeedsTheClientToHaveSentSomething(t *testing.T) {
 				WildcardTarget: wildcardTarget, SmartBlock: "normal",
 				NetWork: C.TCP, DstPort: 443,
 			}
-			_, isDegraded, _, blockCode := s.checkNodeQuality(
-				nil, metadata, nil, wildcardTarget, "example.com:443", node,
-				0.9, 0.9, 1_000, testCase.uploadTotal, 0, "tcp", false, 0, 0)
+			_, isDegraded, _, blockCode := s.checkNodeQuality(s.readTargetState(metadata, node), metadata, blameTestProxy{name: node}, connQuality{err: nil, address: "example.com:443", weight: 0.9, oldWeight: 0.9, duration: 1_000, uploadMB: testCase.uploadTotal, downloadMB: 0})
 
 			if isDegraded != testCase.wantDegraded || blockCode != testCase.wantCode {
 				t.Fatalf("degraded=%v code=%d, want %v and %d",
