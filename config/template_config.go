@@ -140,33 +140,21 @@ func templateFuncMap() template.FuncMap {
 		return expanded, nil
 	}
 	funcs["cmd"] = runTemplateCommand
-	funcs["cat"] = templateCat
-	funcs["include"] = templateCat
+	funcs["include"] = templateInclude
 	funcs["fromJson"] = templateFromJSON
 	funcs["fromYaml"] = templateFromYAML
 	funcs["fromToml"] = templateFromTOML
 	return funcs
 }
 
-// templateCat implements the cat template function. It returns the contents of
-// the requested files concatenated together, so a template can inline other
-// documents, for example {{ cat "subconfig/*.yaml" }}.
-//
-// Relative paths resolve against the directory of the configuration file
-// instead of the process working directory, which keeps templates independent
-// from where mihomo was started. Glob patterns keep shell semantics, plus a
-// ** segment matches zero or more directory levels like GitHub Actions
-// workflow path rules do. Directories are skipped, and a missing file or an
-// empty match is an error so a broken include never renders a partial
-// configuration.
-func templateCat(paths ...string) (string, error) {
+func templateInclude(paths ...string) (string, error) {
 	if len(paths) == 0 {
-		return "", fmt.Errorf("cat requires at least one file path")
+		return "", fmt.Errorf("include requires at least one file path")
 	}
 	var out strings.Builder
 	endsWithNewline := true
 	for _, path := range paths {
-		matches, err := expandTemplateCatPath(path)
+		matches, err := expandTemplateIncludePath(path)
 		if err != nil {
 			return "", err
 		}
@@ -182,7 +170,7 @@ func templateCat(paths ...string) (string, error) {
 				endsWithNewline = true
 			}
 			if out.Len()+len(content) > maxTemplateOutput {
-				return "", fmt.Errorf("cat output exceeds 8 MiB")
+				return "", fmt.Errorf("include output exceeds 8 MiB")
 			}
 			out.WriteString(content)
 			if content != "" {
@@ -193,13 +181,9 @@ func templateCat(paths ...string) (string, error) {
 	return out.String(), nil
 }
 
-// expandTemplateCatPath resolves one cat argument to a list of readable files.
-// Relative paths are anchored at the configuration file directory, plain shell
-// globs are expanded by filepath.Glob and a pattern containing ** recurses into
-// subdirectories. Directories are dropped: cat only reads files.
-func expandTemplateCatPath(path string) ([]string, error) {
+func expandTemplateIncludePath(path string) ([]string, error) {
 	if strings.TrimSpace(path) == "" {
-		return nil, fmt.Errorf("cat file path is empty")
+		return nil, fmt.Errorf("include file path is empty")
 	}
 	pattern := path
 	if filepath.IsAbs(pattern) {
@@ -215,17 +199,17 @@ func expandTemplateCatPath(path string) ([]string, error) {
 		matches, err = filepath.Glob(pattern)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("cat %q: %w", path, err)
+		return nil, fmt.Errorf("include %q: %w", path, err)
 	}
 	files := filterTemplateFiles(matches)
 	if len(files) == 0 {
 		if strings.ContainsAny(path, "*?[") {
-			return nil, fmt.Errorf("cat: no file matched %q", path)
+			return nil, fmt.Errorf("include: no file matched %q", path)
 		}
 		if info, statErr := os.Stat(pattern); statErr == nil && info.IsDir() {
-			return nil, fmt.Errorf("cat: %q is a directory", path)
+			return nil, fmt.Errorf("include: %q is a directory", path)
 		}
-		return nil, fmt.Errorf("cat: file %q not found", path)
+		return nil, fmt.Errorf("include: file %q not found", path)
 	}
 	return files, nil
 }
@@ -359,15 +343,15 @@ func expandTemplateMetaSegment(candidates []string, segment string) ([]string, e
 func readTemplateFile(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("cat %q: %w", path, err)
+		return "", fmt.Errorf("include %q: %w", path, err)
 	}
 	defer func() { _ = file.Close() }()
 	data, err := io.ReadAll(io.LimitReader(file, maxTemplateOutput+1))
 	if err != nil {
-		return "", fmt.Errorf("cat %q: %w", path, err)
+		return "", fmt.Errorf("include %q: %w", path, err)
 	}
 	if len(data) > maxTemplateOutput {
-		return "", fmt.Errorf("cat %q exceeds 8 MiB", path)
+		return "", fmt.Errorf("include %q exceeds 8 MiB", path)
 	}
 	return string(data), nil
 }

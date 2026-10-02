@@ -146,7 +146,7 @@ func setTemplateConfigFile(t *testing.T, path string) {
 	t.Cleanup(func() { C.SetConfig(previous) })
 }
 
-func TestRenderTemplateCat(t *testing.T) {
+func TestRenderTemplateInclude(t *testing.T) {
 	dir := t.TempDir()
 	subconfig := filepath.Join(dir, "subconfig")
 	require.NoError(t, os.Mkdir(subconfig, 0o755))
@@ -158,28 +158,28 @@ func TestRenderTemplateCat(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "single.yaml"), []byte("port-s: 3\n"), 0o600))
 	setTemplateConfigFile(t, filepath.Join(dir, "config.yaml"))
 
-	buf, err := renderTemplate([]byte(`{{ cat "subconfig/*.yaml" }}`))
+	buf, err := renderTemplate([]byte(`{{ include "subconfig/*.yaml" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "port-a: 1\nport-b: 2\n", string(buf))
 
-	buf, err = renderTemplate([]byte(`{{ cat "subconfig/a.yaml" "subconfig/empty.yaml" "subconfig/b.yaml" }}`))
+	buf, err = renderTemplate([]byte(`{{ include "subconfig/a.yaml" "subconfig/empty.yaml" "subconfig/b.yaml" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "port-a: 1\nport-b: 2\n", string(buf))
 
-	buf, err = renderTemplate([]byte(`{{ cat "single.yaml" }}`))
+	buf, err = renderTemplate([]byte(`{{ include "single.yaml" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "port-s: 3\n", string(buf))
 
-	buf, err = renderTemplate([]byte(`{{ cat "subconfig/a.yaml" "subconfig/b.yaml" }}`))
+	buf, err = renderTemplate([]byte(`{{ include "subconfig/a.yaml" "subconfig/b.yaml" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "port-a: 1\nport-b: 2\n", string(buf))
 
-	buf, err = renderTemplate([]byte(fmt.Sprintf(`{{ cat %q }}`, filepath.Join(dir, "single.yaml"))))
+	buf, err = renderTemplate([]byte(fmt.Sprintf(`{{ include %q }}`, filepath.Join(dir, "single.yaml"))))
 	require.NoError(t, err)
 	require.Equal(t, "port-s: 3\n", string(buf))
 }
 
-func TestRenderTemplateCatRecursive(t *testing.T) {
+func TestRenderTemplateIncludeRecursive(t *testing.T) {
 	dir := t.TempDir()
 	subconfig := filepath.Join(dir, "subconfig")
 	require.NoError(t, os.MkdirAll(filepath.Join(subconfig, "nested"), 0o755))
@@ -191,72 +191,72 @@ func TestRenderTemplateCatRecursive(t *testing.T) {
 
 	// A ** segment matches the directory itself and every level below it,
 	// and matched directories are skipped instead of failing the read.
-	buf, err := renderTemplate([]byte(`{{ cat "subconfig/**" }}`))
+	buf, err := renderTemplate([]byte(`{{ include "subconfig/**" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "hidden: c\nroot: a\ndeep: b\n", string(buf))
 
 	// Other segments keep shell behaviour: * stays inside one directory.
-	buf, err = renderTemplate([]byte(`{{ cat "subconfig/*" }}`))
+	buf, err = renderTemplate([]byte(`{{ include "subconfig/*" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "hidden: c\nroot: a\n", string(buf))
 
 	// A ** segment in the middle matches any number of directory levels.
-	buf, err = renderTemplate([]byte(`{{ cat "subconfig/**/deep.yaml" }}`))
+	buf, err = renderTemplate([]byte(`{{ include "subconfig/**/deep.yaml" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "deep: b\n", string(buf))
 
 	// The pattern may also start with ** from the configuration directory.
-	buf, err = renderTemplate([]byte(`{{ cat "**/top.yaml" }}`))
+	buf, err = renderTemplate([]byte(`{{ include "**/top.yaml" }}`))
 	require.NoError(t, err)
 	require.Equal(t, "top: d\n", string(buf))
 
 	// A literal directory is reported instead of being read.
-	_, err = renderTemplate([]byte(`{{ cat "subconfig/nested" }}`))
+	_, err = renderTemplate([]byte(`{{ include "subconfig/nested" }}`))
 	require.ErrorContains(t, err, "is a directory")
-	_, err = renderTemplate([]byte(`{{ cat "subconfig/**/*.json" }}`))
-	require.ErrorContains(t, err, `cat: no file matched "subconfig/**/*.json"`)
+	_, err = renderTemplate([]byte(`{{ include "subconfig/**/*.json" }}`))
+	require.ErrorContains(t, err, `include: no file matched "subconfig/**/*.json"`)
 }
 
-func TestRenderTemplateCatJSON(t *testing.T) {
+func TestRenderTemplateIncludeJSON(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "tpl.json"), []byte(`{"success":"true","value":7}`), 0o600))
 	setTemplateConfigFile(t, filepath.Join(dir, "config.yaml"))
 
-	buf, err := renderTemplate([]byte(`{{ $anytest := fromJson (cat "tpl.json") }}
+	buf, err := renderTemplate([]byte(`{{ $anytest := fromJson (include "tpl.json") }}
 {{ if eq $anytest.success "true" }}
 cfg: hello world
 {{ end }}`))
 	require.NoError(t, err)
 	require.Contains(t, string(buf), "cfg: hello world")
 
-	buf, err = renderTemplate([]byte(`{{ $anytest := fromJson (cat "tpl.json") }}{{ $anytest.value }}`))
+	buf, err = renderTemplate([]byte(`{{ $anytest := fromJson (include "tpl.json") }}{{ $anytest.value }}`))
 	require.NoError(t, err)
 	require.Equal(t, "7", string(buf))
 
-	buf, err = renderTemplate([]byte(`{{ $anytest := fromJson (cat "tpl.json") }}{{ if eq $anytest.success "false" }}cfg: hello world{{ end }}`))
+	buf, err = renderTemplate([]byte(`{{ $anytest := fromJson (include "tpl.json") }}{{ if eq $anytest.success "false" }}cfg: hello world{{ end }}`))
 	require.NoError(t, err)
 	require.NotContains(t, string(buf), "cfg: hello world")
 }
 
-func TestRenderTemplateCatErrors(t *testing.T) {
+func TestRenderTemplateIncludeErrors(t *testing.T) {
 	dir := t.TempDir()
 	setTemplateConfigFile(t, filepath.Join(dir, "config.yaml"))
 
-	_, err := renderTemplate([]byte(`{{ cat "missing.yaml" }}`))
-	require.ErrorContains(t, err, `cat: file "missing.yaml" not found`)
-	_, err = renderTemplate([]byte(`{{ cat "subconfig/*.yaml" }}`))
-	require.ErrorContains(t, err, `cat: no file matched "subconfig/*.yaml"`)
-	_, err = renderTemplate([]byte(`{{ cat "" }}`))
-	require.ErrorContains(t, err, "cat file path is empty")
-	_, err = renderTemplate([]byte(`{{ cat }}`))
-	require.ErrorContains(t, err, "cat requires at least one file path")
+	_, err := renderTemplate([]byte(`{{ include "missing.yaml" }}`))
+	require.ErrorContains(t, err, `include: file "missing.yaml" not found`)
+	_, err = renderTemplate([]byte(`{{ include "subconfig/*.yaml" }}`))
+	require.ErrorContains(t, err, `include: no file matched "subconfig/*.yaml"`)
+	_, err = renderTemplate([]byte(`{{ include "" }}`))
+	require.ErrorContains(t, err, "include file path is empty")
+	_, err = renderTemplate([]byte(`{{ include }}`))
+	require.ErrorContains(t, err, "include requires at least one file path")
 
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "tpl.json"), []byte(`{"success":`), 0o600))
-	_, err = renderTemplate([]byte(`{{ fromJson (cat "tpl.json") }}`))
+	_, err = renderTemplate([]byte(`{{ fromJson (include "tpl.json") }}`))
 	require.ErrorContains(t, err, "invalid JSON")
 }
 
-func TestRenderTemplateCatLimit(t *testing.T) {
+func TestRenderTemplateIncludeLimit(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "large.yaml")
 	file, err := os.Create(path)
@@ -266,7 +266,7 @@ func TestRenderTemplateCatLimit(t *testing.T) {
 	require.NoError(t, file.Close())
 	setTemplateConfigFile(t, filepath.Join(dir, "config.yaml"))
 
-	_, err = renderTemplate([]byte(`{{ cat "large.yaml" }}`))
+	_, err = renderTemplate([]byte(`{{ include "large.yaml" }}`))
 	require.ErrorContains(t, err, "exceeds 8 MiB")
 }
 
