@@ -141,6 +141,7 @@ func templateFuncMap() template.FuncMap {
 	}
 	funcs["cmd"] = runTemplateCommand
 	funcs["cat"] = templateCat
+	funcs["include"] = templateCat
 	funcs["fromJson"] = templateFromJSON
 	funcs["fromYaml"] = templateFromYAML
 	funcs["fromToml"] = templateFromTOML
