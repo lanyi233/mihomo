@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -489,6 +490,7 @@ func templateCommandEnv() []string {
 		"MIHOMO_VERSION="+C.Version,
 		"MIHOMO_CFG_DIR="+filepath.Dir(configFile),
 		"MIHOMO_CFG_FILE="+configFile,
+		"MIHOMO_CORE_PID="+strconv.Itoa(os.Getpid()),
 	)
 }
 
