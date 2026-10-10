@@ -44,7 +44,7 @@ require (
 	github.com/metacubex/sing-shadowsocks2 v0.2.8
 	github.com/metacubex/sing-tun v0.4.27
 	github.com/metacubex/sing-vmess v0.2.5
-	github.com/metacubex/sing-wireguard v0.0.0-20260826105301-c3ae17d19f9e
+	github.com/metacubex/sing-wireguard v0.0.0-20261002050126-e5fa1a607406
 	github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141
 	github.com/metacubex/ssh v0.1.0
 	github.com/metacubex/tailscale v0.0.0-20260821153257-ff0ecd818181
@@ -163,3 +163,6 @@ require (
 
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
+
+// Keep queued SMUX frames alive after a write is cancelled; see third_party/smux/README.mihomo.md.
+replace github.com/metacubex/smux => ./third_party/smux
