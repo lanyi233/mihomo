@@ -24,10 +24,10 @@ import (
 )
 
 const (
-	MaxFeatureSize = 30
+	MaxFeatureSize = 32
 )
 
-type domainKeywordEntry struct {
+type keywordEntry struct {
 	keyword  string
 	category int
 }
@@ -47,173 +47,266 @@ var (
 
 	domainRegex = regexp.MustCompile(`([a-zA-Z0-9-]+)(\.[a-zA-Z0-9-]+)+$`)
 
-	// common ASN provider categories
-	asnCategories = map[string]int{
+	// provider keywords; enums start at 100, the 1-99 block is reserved for computed codes
+	asnCategories = []keywordEntry{
 		// global tech
-		"google":     1,
-		"amazon":     2,
-		"microsoft":  3,
-		"facebook":   4,
-		"apple":      5,
-		"cloudflare": 6,
-		"akamai":     7,
-		"fastly":     8,
-		"netflix":    9,
-		"alibaba":    10,
-		"tencent":    11,
-		"baidu":      12,
+		{"google", 100},
+		{"amazon", 101},
+		{"microsoft", 102},
+		{"facebook", 103},
+		{"apple", 104},
+		{"cloudflare", 105},
+		{"akamai", 106},
+		{"fastly", 107},
+		{"netflix", 108},
+		{"alibaba", 109},
+		{"tencent", 110},
+		{"baidu", 111},
+		{"huawei", 112},
+		{"bytedance", 113},
+		{"tiktok", 113},
+		{"xiaomi", 114},
+		{"salesforce", 115},
+		{"adobe", 116},
+		{"nvidia", 117},
 		// china carriers
-		"chinatelecom": 13,
-		"chinaunicom":  14,
-		"chinamobile":  15,
-		"chinaedu":     16,
-		"cstnet":       17,
-		// global CDN and cloud
-		"cdn77":        20,
-		"limelight":    21,
-		"edgecast":     22,
-		"stackpath":    23,
-		"imperva":      24,
-		"oracle":       25,
-		"ibm":          26,
-		"digitalocean": 27,
-		"linode":       28,
-		"ovh":          29,
-		"hetzner":      30,
-		"vultr":        31,
-		"cogent":       32,
-		"leaseweb":     33,
-		"upyun":        34,
-		"qingcloud":    35,
-		"ucloud":       36,
+		{"chinatelecom", 120},
+		{"china telecom", 120},
+		{"chinanet", 120},
+		{"chinaunicom", 121},
+		{"china unicom", 121},
+		{"chinamobile", 122},
+		{"china mobile", 122},
+		{"cmnet", 122},
+		{"chinaedu", 123},
+		{"china education", 123},
+		{"cernet", 123},
+		{"cstnet", 124},
 		// international carriers
-		"verizon":  40,
-		"comcast":  41,
-		"att":      42,
-		"sprint":   43,
-		"tmobile":  44,
-		"level3":   45,
-		"ntt":      46,
-		"kddi":     47,
-		"softbank": 48,
-		"telstra":  49,
-		"singtel":  50,
-		"starhub":  51,
-		"m1":       52,
-		"pccw":     53,
-		"hkbn":     54,
-		"smartone": 55,
-		"hgc":      56,
-		"cht":      57,
-		"fetnet":   58,
-		"twm":      59,
+		{"verizon", 140},
+		{"comcast", 141},
+		{"at&t", 142},
+		{"sprint", 143},
+		{"t-mobile", 144},
+		{"tmobile", 144},
+		{"level3", 145},
+		{"level 3", 145},
+		{"lumen", 145},
+		{"centurylink", 145},
+		{"ntt", 146},
+		{"kddi", 147},
+		{"softbank", 148},
+		{"telstra", 149},
+		{"singtel", 150},
+		{"starhub", 151},
+		{"m1", 152},
+		{"pccw", 153},
+		{"hkbn", 154},
+		{"smartone", 155},
+		{"hgc", 156},
+		{"cht", 157},
+		{"chunghwa", 157},
+		{"hinet", 157},
+		{"fetnet", 158},
+		{"far eastone", 158},
+		{"twm", 159},
+		{"taiwan mobile", 159},
+		{"hkt", 160},
+		{"deutsche telekom", 161},
+		{"vodafone", 162},
+		{"telefonica", 163},
+		{"optus", 164},
+		{"bell canada", 165},
+		{"rogers communications", 166},
+		{"telus", 167},
+		{"rakuten", 168},
+		{"korea telecom", 169},
+		{"viettel", 170},
+		{"pldt", 171},
+		{"sk broadband", 172},
+		{"charter communications", 173},
+		// global CDN and cloud
+		{"cdn77", 180},
+		{"limelight", 181},
+		{"edgecast", 182},
+		{"edgio", 182},
+		{"stackpath", 183},
+		{"imperva", 184},
+		{"oracle", 185},
+		{"ibm", 186},
+		{"digitalocean", 187},
+		{"linode", 188},
+		{"ovh", 189},
+		{"hetzner", 190},
+		{"vultr", 191},
+		{"cogent", 192},
+		{"leaseweb", 193},
+		{"upyun", 194},
+		{"qingcloud", 195},
+		{"ucloud", 196},
+		{"contabo", 197},
+		{"rackspace", 198},
+		{"bunnyway", 199},
+		{"bunnycdn", 199},
+		{"netactuate", 200},
+		{"wangsu", 201},
+		{"kingsoft", 202},
+		{"scaleway", 203},
+		{"ionos", 204},
 		// content providers
-		"twitter":    70,
-		"twitch":     71,
-		"discord":    72,
-		"spotify":    73,
-		"github":     74,
-		"steam":      75,
-		"blizzard":   76,
-		"riotgames":  77,
-		"epicgames":  78,
-		"ea":         79,
-		"bytedance":  80,
-		"bilibili":   81,
-		"netactuate": 82,
-		// internet exchanges
-		"hkix":    90,
-		"linx":    91,
-		"jpix":    92,
-		"equinix": 93,
-		"sgix":    94,
-		"de-cix":  95,
-		"ams-ix":  96,
+		{"twitter", 220},
+		{"twitch", 221},
+		{"discord", 222},
+		{"spotify", 223},
+		{"github", 224},
+		{"steam", 225},
+		{"blizzard", 226},
+		{"riotgames", 227},
+		{"riot games", 227},
+		{"epicgames", 228},
+		{"electronic arts", 229},
+		{"valve", 230},
+		{"mozilla", 231},
+		{"reddit", 232},
+		{"openai", 233},
+		{"bilibili", 234},
 		// education and research
-		"cern":     100,
-		"mit":      101,
-		"stanford": 102,
-		"tsinghua": 103,
-		"pku":      104,
+		{"cern", 240},
+		{"stanford", 241},
+		{"tsinghua", 242},
+		{"pku", 243},
 		// finance
-		"visa":       110,
-		"mastercard": 111,
-		"paypal":     112,
-		"stripe":     113,
-		"alipay":     114,
-		"wechatpay":  115,
+		{"visa", 250},
+		{"mastercard", 251},
+		{"paypal", 252},
+		{"stripe", 253},
+		{"alipay", 254},
+		{"wechatpay", 255},
+		{"unionpay", 256},
+		// internet exchanges
+		{"hkix", 260},
+		{"linx", 261},
+		{"jpix", 262},
+		{"equinix", 263},
+		{"sgix", 264},
+		{"de-cix", 265},
+		{"ams-ix", 266},
 	}
 
+	// region enums start at 100, the 1-99 block is reserved for the computed hash fallback
 	geoCategories = map[string]int{
-		"CN": 1,
-		"HK": 2,
-		"TW": 3,
-		"JP": 4,
-		"KR": 5,
-		"SG": 6,
-		"US": 7,
-		"CA": 8,
-		"GB": 9,
-		"DE": 10,
-		"FR": 11,
-		"RU": 12,
-		"AU": 13,
-		"IN": 14,
-		"BR": 15,
-		"IT": 16,
-		"ES": 17,
-		"NL": 18,
-		"SE": 19,
-		"CH": 20,
-		"PL": 21,
-		"TR": 22,
-		"MX": 23,
-		"ZA": 24,
-		"AR": 25,
-		"ID": 26,
-		"TH": 27,
-		"VN": 28,
-		"PH": 29,
-		"MY": 30,
-		"MO": 31,
+		"CN": 100,
+		"HK": 101,
+		"TW": 102,
+		"JP": 103,
+		"KR": 104,
+		"SG": 105,
+		"US": 106,
+		"CA": 107,
+		"GB": 108,
+		"DE": 109,
+		"FR": 110,
+		"RU": 111,
+		"AU": 112,
+		"IN": 113,
+		"BR": 114,
+		"IT": 115,
+		"ES": 116,
+		"NL": 117,
+		"SE": 118,
+		"CH": 119,
+		"PL": 120,
+		"TR": 121,
+		"MX": 122,
+		"ZA": 123,
+		"AR": 124,
+		"ID": 125,
+		"TH": 126,
+		"VN": 127,
+		"PH": 128,
+		"MY": 129,
+		"MO": 130,
+		"AE": 131,
+		"AT": 132,
+		"BD": 133,
+		"BE": 134,
+		"CL": 135,
+		"CO": 136,
+		"CZ": 137,
+		"DK": 138,
+		"EG": 139,
+		"FI": 140,
+		"GR": 141,
+		"IE": 142,
+		"IL": 143,
+		"IS": 144,
+		"KE": 145,
+		"KH": 146,
+		"KZ": 147,
+		"LK": 148,
+		"LU": 149,
+		"MA": 150,
+		"MM": 151,
+		"NG": 152,
+		"NO": 153,
+		"NZ": 154,
+		"PE": 155,
+		"PK": 156,
+		"PT": 157,
+		"RO": 158,
+		"SA": 159,
+		"UA": 160,
 	}
 
 	// well known ports
 	wellKnownPorts = map[uint16]int{
-		22:    1,  // SSH
-		25:    2,  // SMTP
-		53:    3,  // DNS
-		80:    4,  // HTTP
-		110:   5,  // POP3
-		143:   6,  // IMAP
-		443:   7,  // HTTPS
-		465:   8,  // SMTPS
-		784:   3,  // DNS over QUIC (DoQ)
-		853:   3,  // DNS over TLS (DoT)
-		993:   9,  // IMAPS
-		995:   10, // POP3S
-		1194:  11, // OpenVPN
-		1812:  12, // RADIUS
-		3306:  13, // MySQL
-		5053:  3,  // DNS backup port
-		5353:  3,  // mDNS
-		5355:  3,  // LLMNR
-		5432:  14, // PostgreSQL
-		6379:  15, // Redis
-		8853:  3,  // DoT backup port
-		9953:  3,  // DNS management port
-		27017: 16, // MongoDB
-		6660:  17, // IRC
-		6665:  17, // IRC
-		6666:  17, // IRC
-		6667:  17, // IRC
-		6668:  17, // IRC
-		6669:  17, // IRC
-		8000:  18, // common alternative HTTP port
-		8008:  18, // common alternative HTTP port
-		8080:  18, // common alternative HTTP port
-		8443:  19, // common alternative HTTPS port
-		8883:  20, // MQTT over TLS
+		22:    100, // SSH
+		25:    101, // SMTP
+		53:    102, // DNS
+		80:    103, // HTTP
+		110:   104, // POP3
+		123:   120, // NTP
+		143:   105, // IMAP
+		389:   130, // LDAP
+		443:   106, // HTTPS
+		445:   122, // SMB
+		465:   107, // SMTPS
+		587:   121, // SMTP submission
+		636:   131, // LDAPS
+		784:   102, // DNS over QUIC (early draft port, final is 853)
+		853:   102, // DNS over TLS / QUIC
+		993:   108, // IMAPS
+		995:   109, // POP3S
+		1194:  110, // OpenVPN
+		1433:  124, // MSSQL
+		1521:  125, // Oracle DB
+		1812:  111, // RADIUS
+		2049:  126, // NFS
+		3306:  112, // MySQL
+		3389:  123, // RDP
+		5053:  102, // DNS backup port
+		5353:  102, // mDNS
+		5355:  102, // LLMNR
+		5432:  113, // PostgreSQL
+		5672:  128, // AMQP
+		5900:  127, // VNC
+		6379:  114, // Redis
+		6660:  116, // IRC
+		6665:  116, // IRC
+		6666:  116, // IRC
+		6667:  116, // IRC
+		6668:  116, // IRC
+		6669:  116, // IRC
+		8000:  117, // common alternative HTTP port
+		8008:  117, // common alternative HTTP port
+		8080:  117, // common alternative HTTP port
+		8443:  118, // common alternative HTTPS port
+		8853:  102, // DoT backup port
+		8883:  119, // MQTT over TLS
+		9200:  129, // Elasticsearch
+		9953:  102, // DNS management port
+		11211: 132, // memcached
+		27017: 115, // MongoDB
 	}
 
 	// port ranges
@@ -221,9 +314,9 @@ var (
 		min, max uint16
 		category int
 	}{
-		{0, 1023, 20},      // system ports
-		{1024, 49151, 21},  // registered ports
-		{49152, 65535, 22}, // dynamic ports
+		{0, 1023, 8},       // system ports
+		{1024, 49151, 9},   // registered ports
+		{49152, 65535, 10}, // dynamic ports
 	}
 
 	apiServicePorts = map[uint16]bool{
@@ -235,8 +328,8 @@ var (
 
 	dnsServicePorts = map[uint16]bool{
 		53:   true, // classic DNS (UDP/TCP)
-		853:  true, // DNS over TLS (DoT)
-		784:  true, // DNS over QUIC (DoQ), the IANA assigned port
+		853:  true, // DNS over TLS (DoT) / QUIC (DoQ)
+		784:  true, // DNS over QUIC (early draft port)
 		5053: true, // backup port of some DNS services
 		5353: true, // mDNS (Multicast DNS)
 		5355: true, // LLMNR (Link-Local Multicast Name Resolution)
@@ -320,11 +413,12 @@ var (
 		"bilibili", "twitch", "hbo", "disney", "vimeo", "vod", "stream", "video",
 		"media", "movie", "tv", "music", "audio", "cdm", "cdn", "content",
 		"live", "livestream", "replay", "shorts", "kuaishou", "huya", "douyu",
+		"googlevideo", "ytimg", "primevideo", "hotstar", "wetv", "kugou", "acfun",
 	}
 
 	gameKeywords = []string{
-		"game", "play", "steam", "xbox", "playstation", "nintendo", "ea.com", "riot",
-		"blizzard", "ubisoft", "epic", "cod", "minecraft", "roblox", "pubg", "fortnite",
+		"game", "play.google", "steam", "xbox", "playstation", "nintendo", "ea.com", "riotcdn",
+		"blizzard", "ubisoft", "epic", "cod.", "callofduty", "minecraft", "roblox", "pubg", "fortnite",
 		"valorant", "riotgames", "leagueoflegends", "warzone",
 		"apex", "apexlegends", "overwatch", "dota", "csgo",
 		"counterstrike", "hearthstone", "battlenet", "battle.net",
@@ -336,14 +430,14 @@ var (
 		"discord", "slack", "telegram", "signal", "whatsapp", "skype", "wechat",
 		"voicechat", "videocall", "rtc", "webrtc", "jitsi",
 		"mumble", "ventrilo", "teamspeak", "discord.gg",
-		"meeting", "conference", "huddle", "gather",
-		"qq", "msn", "icq", "line", "kakao", "viber", "imo", "element",
+		"meeting", "huddle", "gather",
+		"qq", "msn", "icq", "line.me", "linecorp", "line-apps", "line-scdn", "kakao", "viber", "imo.im", "element.io",
 	}
 
 	apiServiceKeywords = []string{
 		"api.cloudflare.com", "api.amazonaws.com", "api.azure.com", "googleapis.com",
 		"api.fastly.com", "api.maxcdn.com", "api.keycdn.com", "api.bunnycdn.com",
-		"api.digitalocean.com", "api.vultr.com", "api.linode.com", "api.hetzner.com",
+		"api.digitalocean.com", "api.vultr.com", "api.linode.com", "api.hetzner.com", "amazonaws.com",
 
 		"api.vercel.com", "api.netlify.com", "api.heroku.com", "api.railway.app",
 		"api.render.com", "api.fly.io", "registry.npmjs.org", "pypi.org",
@@ -370,7 +464,7 @@ var (
 		"one.one.one.one", "family.cloudflare-dns.com", "security.cloudflare-dns.com",
 		"dns.quad9.net", "dns9.quad9.net", "dns10.quad9.net", "dns11.quad9.net",
 		"doh.opendns.com", "doh.familyshield.opendns.com", "doh.sandbox.opendns.com",
-		"mozilla.cloudflare-dns.com", "firefox.dns.nextdns.io",
+		"mozilla.cloudflare-dns.com", "firefox.dns.nextdns.io", "nextdns.io",
 		"dns.adguard.com", "dns-family.adguard.com", "dns-unfiltered.adguard.com",
 		"doh.cleanbrowsing.org", "family-filter-dns.cleanbrowsing.org",
 
@@ -392,40 +486,50 @@ var (
 		category int
 	}{
 		// IPv4 private ranges
-		{netip.MustParsePrefix("10.0.0.0/8"), 1},
-		{netip.MustParsePrefix("172.16.0.0/12"), 1},
-		{netip.MustParsePrefix("192.168.0.0/16"), 1},
-		{netip.MustParsePrefix("127.0.0.0/8"), 2},
-		{netip.MustParsePrefix("169.254.0.0/16"), 3},
+		{netip.MustParsePrefix("10.0.0.0/8"), 10},
+		{netip.MustParsePrefix("172.16.0.0/12"), 10},
+		{netip.MustParsePrefix("192.168.0.0/16"), 10},
+		{netip.MustParsePrefix("127.0.0.0/8"), 11},
+		{netip.MustParsePrefix("169.254.0.0/16"), 12},
+
+		// IPv4 special ranges
+		{netip.MustParsePrefix("100.64.0.0/10"), 13},
+		{netip.MustParsePrefix("192.0.2.0/24"), 13},
+		{netip.MustParsePrefix("198.51.100.0/24"), 13},
+		{netip.MustParsePrefix("203.0.113.0/24"), 13},
+		{netip.MustParsePrefix("240.0.0.0/4"), 13},
 
 		// IPv6 private ranges
-		{netip.MustParsePrefix("::1/128"), 2},
-		{netip.MustParsePrefix("fe80::/10"), 3},
-		{netip.MustParsePrefix("fc00::/7"), 1},
-		{netip.MustParsePrefix("2001:db8::/32"), 4},
+		{netip.MustParsePrefix("::1/128"), 11},
+		{netip.MustParsePrefix("fe80::/10"), 12},
+		{netip.MustParsePrefix("fc00::/7"), 10},
+		{netip.MustParsePrefix("2001:db8::/32"), 13},
+
+		// IPv6 special ranges
+		{netip.MustParsePrefix("ff00::/8"), 13},
 	}
 )
 
-var allDomainKeywords []domainKeywordEntry
+var allDomainKeywords []keywordEntry
 
 func init() {
 	total := len(dnsServiceKeywords) + len(apiServiceKeywords) + len(gameKeywords) +
 		len(communicationKeywords) + len(streamingKeywords)
-	allDomainKeywords = make([]domainKeywordEntry, 0, total)
+	allDomainKeywords = make([]keywordEntry, 0, total)
 	for _, kw := range dnsServiceKeywords {
-		allDomainKeywords = append(allDomainKeywords, domainKeywordEntry{kw, 6})
+		allDomainKeywords = append(allDomainKeywords, keywordEntry{kw, 104})
 	}
 	for _, kw := range apiServiceKeywords {
-		allDomainKeywords = append(allDomainKeywords, domainKeywordEntry{kw, 5})
+		allDomainKeywords = append(allDomainKeywords, keywordEntry{kw, 103})
 	}
 	for _, kw := range gameKeywords {
-		allDomainKeywords = append(allDomainKeywords, domainKeywordEntry{kw, 3})
+		allDomainKeywords = append(allDomainKeywords, keywordEntry{kw, 101})
 	}
 	for _, kw := range communicationKeywords {
-		allDomainKeywords = append(allDomainKeywords, domainKeywordEntry{kw, 4})
+		allDomainKeywords = append(allDomainKeywords, keywordEntry{kw, 102})
 	}
 	for _, kw := range streamingKeywords {
-		allDomainKeywords = append(allDomainKeywords, domainKeywordEntry{kw, 2})
+		allDomainKeywords = append(allDomainKeywords, keywordEntry{kw, 100})
 	}
 }
 
@@ -486,19 +590,21 @@ func (m *WeightModel) loadModel(path string) error {
 		return fmt.Errorf("failed to load binary model: %v", err)
 	}
 
+	featureCount := model.NFeatures()
+	if featureCount != legacyFeatureSize && featureCount != MaxFeatureSize {
+		log.Warnln("[Smart] Unsupported model feature schema [%d], using traditional weights", featureCount)
+	}
+
 	transforms, err := LoadTransformsFromModel(path)
 	if err != nil {
-		log.Warnln("[Smart] Failed to load transforms parameters: %v, using default config", err)
-		transforms = &FeatureTransforms{
-			TransformsEnabled: false,
-			FeatureOrder:      defaultFeatureOrder,
-			Transforms:        []TransformParams{},
-		}
+		return fmt.Errorf("load feature transforms: %w", err)
 	} else {
 		if transforms.TransformsEnabled {
-			if err := transforms.ValidateTransforms(MaxFeatureSize); err != nil {
-				log.Warnln("[Smart] ValidateTransforms failed: %v", err)
-				transforms.TransformsEnabled = false
+			if !transforms.compatibleWith(featureCount) {
+				return fmt.Errorf("model feature order does not match its %d-slot schema", featureCount)
+			}
+			if err := transforms.ValidateTransforms(featureCount); err != nil {
+				return fmt.Errorf("validate feature transforms: %w", err)
 			} else {
 				transforms.DebugTransforms()
 			}
@@ -570,7 +676,7 @@ func GetModelDownloadURL() string {
 	return "https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin"
 }
 
-func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor float64) (float64, bool) {
+func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor float64) (weight float64, modelPredicted bool) {
 	if m == nil {
 		return smart.CalculateWeight(input, priorityFactor)
 	}
@@ -589,12 +695,12 @@ func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor floa
 		return smart.CalculateWeight(input, priorityFactor)
 	}
 
-	features := prepareFeatures(input)
+	features := prepareModelFeatures(input, model.NFeatures())
 	if len(features) == 0 {
 		return smart.CalculateWeight(input, priorityFactor)
 	}
 
-	if transforms != nil && !transforms.IsCompatible() {
+	if transforms != nil && !transforms.compatibleWith(model.NFeatures()) {
 		return smart.CalculateWeight(input, priorityFactor)
 	}
 
@@ -607,7 +713,7 @@ func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor floa
 	defer func() {
 		if r := recover(); r != nil {
 			log.Errorln("[Smart] Model prediction panic: %v", r)
-			prediction, _ = smart.CalculateWeight(input, priorityFactor)
+			weight, modelPredicted = smart.CalculateWeight(input, priorityFactor)
 		}
 	}()
 
@@ -720,6 +826,10 @@ func prepareFeatures(input *smart.ModelInput) []float64 {
 	}
 	features = append(features, geoHash)
 
+	// the trailing slots are ignored by a model trained before they existed
+	features = append(features, float64(extractExitRegionFeature(input.ExitRegion)))
+	features = append(features, hashStringToFloat(input.ExitASN, 500))
+
 	// the model was trained with MaxFeatureSize slots
 	if len(features) > MaxFeatureSize {
 		features = features[:MaxFeatureSize]
@@ -735,9 +845,10 @@ func extractASNFeature(asnInfo string) int {
 
 	asnInfo = strings.ToLower(asnInfo)
 
-	for keyword, category := range asnCategories {
-		if strings.Contains(asnInfo, keyword) {
-			return category
+	// the entry order decides the priority, list a longer keyword before its substrings
+	for _, entry := range asnCategories {
+		if strings.Contains(asnInfo, entry.keyword) {
+			return entry.category
 		}
 	}
 
@@ -750,18 +861,19 @@ func extractASNFeature(asnInfo string) int {
 		j++
 	}
 	if j > 0 {
-		if asnNum, err := strconv.Atoi(s[:j]); err == nil {
+		// ParseUint keeps 32 bit builds from erroring on the upper ASN range
+		if asnNum, err := strconv.ParseUint(s[:j], 10, 64); err == nil {
 			switch {
 			case asnNum < 1000:
-				return 50 // early allocation era
+				return 1 // early allocation era
 			case asnNum < 10000:
-				return 51 // older allocation era
+				return 2 // older allocation era
 			case asnNum < 50000:
-				return 52 // mid allocation era
+				return 3 // mid allocation era
 			case asnNum < 150000:
-				return 53 // newer allocation era
+				return 4 // newer allocation era
 			default:
-				return 54 // latest allocation era
+				return 5 // latest allocation era
 			}
 		}
 	}
@@ -788,12 +900,32 @@ func extractGeoIPFeature(geoIPInfo []string) int {
 		for _, r := range countryCode {
 			hashValue = hashValue*31 + int(r)
 		}
-		return 30 + (hashValue % 20)
+		// unlisted regions hash into the reserved 1-99 block
+		return 1 + (hashValue % 20)
 	}
 
 	return 0
 }
 
+// extractExitRegionFeature maps the landing region, an empty answer stays 0 (unknown).
+func extractExitRegionFeature(region string) int {
+	if region == "" {
+		return 0
+	}
+	region = strings.ToUpper(region)
+	if category, exists := geoCategories[region]; exists {
+		return category
+	}
+	hashValue := 0
+	for _, r := range region {
+		hashValue = hashValue*31 + int(r)
+	}
+	// unlisted regions hash into the reserved 1-99 block
+	return 1 + (hashValue % 20)
+}
+
+// extractDomainTypeFeature returns the domain feature code of the model: 1 IP literal,
+// 2-3 generic domains, 100-104 service kinds, 110-115 TLD kinds.
 func extractDomainTypeFeature(host string) int {
 	if host == "" {
 		return 0
@@ -816,24 +948,24 @@ func extractDomainTypeFeature(host string) int {
 	}
 
 	if strings.HasSuffix(host, ".gov") {
-		return 14
+		return 114
 	} else if strings.HasSuffix(host, ".edu") {
-		return 15
+		return 115
 	} else if strings.HasSuffix(host, ".cn") {
-		return 10
+		return 110
 	} else if strings.HasSuffix(host, ".com") {
-		return 11
+		return 111
 	} else if strings.HasSuffix(host, ".net") {
-		return 12
+		return 112
 	} else if strings.HasSuffix(host, ".org") {
-		return 13
+		return 113
 	}
 
 	if domainRegex.MatchString(host) {
 		if strings.Count(host, ".") >= 2 {
-			return 30
+			return 2
 		}
-		return 31
+		return 3
 	}
 
 	return 0
@@ -851,34 +983,35 @@ func extractIPFeature(ipAddr string) int {
 
 	for _, network := range privateIPNetworks {
 		if network.prefix.Contains(addr) {
-			return network.category + 100 // 101-104 are the private IP kinds
+			return network.category
 		}
 	}
 
 	if addr.Is4() {
-		return 110 // public IPv4
+		return 14 // public IPv4
 	} else {
-		return 111 // public IPv6
+		return 15 // public IPv6
 	}
 }
 
-// extractPortFeature returns the port feature code of the model: 30 game, 31 communication,
-// 32-34 game or communication ranges, 35 API, 36 DNS, otherwise the well known port category.
+// extractPortFeature returns the port feature code of the model: 1 game, 2 communication,
+// 3-5 game or communication ranges, 6 API, 7 DNS, 8-10 port ranges, otherwise 100+ enum;
+// the special tables win over the enum in the order DNS, API, game, communication.
 func extractPortFeature(port uint16) int {
 	if _, isDNS := dnsServicePorts[port]; isDNS {
-		return 36
+		return 7
 	}
 
 	if _, isAPI := apiServicePorts[port]; isAPI {
-		return 35
+		return 6
 	}
 
 	if _, isGame := gameSpecificPorts[port]; isGame {
-		return 30
+		return 1
 	}
 
 	if _, isComm := communicationPorts[port]; isComm {
-		return 31
+		return 2
 	}
 
 	if category, exists := wellKnownPorts[port]; exists {
@@ -889,11 +1022,11 @@ func extractPortFeature(port uint16) int {
 		if port >= r.min && port <= r.max {
 			switch r.category {
 			case 1:
-				return 32
+				return 3
 			case 2:
-				return 33
+				return 4
 			case 3:
-				return 34
+				return 5
 			}
 		}
 	}
@@ -910,21 +1043,21 @@ func extractPortFeature(port uint16) int {
 // deriveConnectionType returns the connection type code of the model: 1 web, 2 streaming,
 // 3 realtime, 4 database, 5 file transfer, 6 API, 7 DNS.
 func deriveConnectionType(port uint16, addressFeature, portFeature int) int {
-	if addressFeature == 6 || portFeature == 36 {
+	if addressFeature == 104 || portFeature == 7 {
 		return 7
 	}
 	if _, isDNS := dnsServicePorts[port]; isDNS {
 		return 7
 	}
 
-	if addressFeature == 5 || portFeature == 35 {
+	if addressFeature == 103 || portFeature == 6 {
 		return 6
 	}
 	if _, isAPI := apiServicePorts[port]; isAPI {
 		return 6
 	}
 
-	if addressFeature == 3 || addressFeature == 4 {
+	if addressFeature == 101 || addressFeature == 102 {
 		return 3
 	}
 	if _, isGamePort := gameSpecificPorts[port]; isGamePort {
@@ -934,15 +1067,15 @@ func deriveConnectionType(port uint16, addressFeature, portFeature int) int {
 		return 3
 	}
 
-	if addressFeature == 2 {
+	if addressFeature == 100 {
 		return 2
 	}
 
-	if port == 80 || port == 443 || portFeature == 4 || portFeature == 7 {
+	if port == 80 || port == 443 || portFeature == 103 || portFeature == 106 {
 		return 1
 	}
 
-	if portFeature == 13 || portFeature == 14 || portFeature == 15 || portFeature == 16 {
+	if portFeature == 112 || portFeature == 113 || portFeature == 114 || portFeature == 115 {
 		return 4
 	}
 
@@ -1007,6 +1140,8 @@ func CreateModelInputFromStatsRecord(atomicRecord *smart.AtomicStatsRecord, meta
 
 	input.DestPort = metadata.DstPort
 	input.DestGeoIP = metadata.DstGeoIP
+	input.ExitRegion = metadata.ExitGeoIP
+	input.ExitASN = metadata.ExitIPASN
 
 	return input
 }

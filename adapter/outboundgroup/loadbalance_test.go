@@ -551,10 +551,10 @@ func TestFilterProxiesPutsSuspectedBehindUnrankedCandidates(t *testing.T) {
 		}
 		names = append(names, name)
 		weights = append(weights, 1)
-		watcher.Store(name, smart.ExitInfo{Region: "hk", Key: name}, now)
+		watcher.StoreTarget("*.example.test", name, smart.ExitInfo{Region: "hk", Key: name}, now)
 		watcher.Note("*.example.test", name)
 		if i == 0 {
-			watcher.Store("control", smart.ExitInfo{Region: "us", Key: "control-exit"}, now)
+			watcher.StoreTarget("*.example.test", "control", smart.ExitInfo{Region: "us", Key: "control-exit"}, now)
 			watcher.NoteSuccess("*.example.test", "control")
 		}
 	}
@@ -566,7 +566,7 @@ func TestFilterProxiesPutsSuspectedBehindUnrankedCandidates(t *testing.T) {
 		testUrl:    testUrl,
 		configName: "test",
 	}
-	selected := s.filterProxies(request("user", "example.test"), "*.example.test", names, weights, all, 10, false)
+	selected, _ := s.filterProxies(request("user", "example.test"), "*.example.test", names, weights, all, 10, false)
 	if len(selected) != 3 {
 		t.Fatalf("selected %d candidates, want 2 healthy alternatives and 1 half-open fallback", len(selected))
 	}
@@ -590,10 +590,10 @@ func TestFilterProxiesDefersCachedSuspectedNodes(t *testing.T) {
 	now := time.Now()
 	target := "*.onejav.com"
 	for _, node := range []string{"jp-suspected", "jp-second"} {
-		watcher.Store(node, smart.ExitInfo{Region: "jp", Key: node}, now)
+		watcher.StoreTarget(target, node, smart.ExitInfo{Region: "jp", Key: node}, now)
 		watcher.Note(target, node)
 	}
-	watcher.Store("hk-control", smart.ExitInfo{Region: "hk", Key: "hk-control"}, now)
+	watcher.StoreTarget(target, "hk-control", smart.ExitInfo{Region: "hk", Key: "hk-control"}, now)
 	watcher.NoteSuccess(target, "hk-control")
 
 	all := []C.Proxy{
@@ -609,7 +609,7 @@ func TestFilterProxiesDefersCachedSuspectedNodes(t *testing.T) {
 		testUrl:    testUrl,
 		configName: "test",
 	}
-	selected := group.filterProxies(request("user", "onejav.com"), target,
+	selected, _ := group.filterProxies(request("user", "onejav.com"), target,
 		[]string{"jp-suspected", "hk-cached"}, nil, all, 3, false)
 	if len(selected) != 1 || selected[0].Name() != "hk-cached" {
 		t.Fatalf("cached selection should keep only its healthy entry, got %v", selected)
@@ -632,10 +632,10 @@ func TestFilterProxiesFailsOpenWhenAllCandidatesSuspected(t *testing.T) {
 	watcher := smart.NewExitWatcher(smart.ExitWatcherOptions{Name: "exit-fail-open-test", Config: "test"})
 	now := time.Now()
 	for _, node := range []string{"jp-01", "jp-02"} {
-		watcher.Store(node, smart.ExitInfo{Region: "jp", Key: node}, now)
+		watcher.StoreTarget("*.onejav.com", node, smart.ExitInfo{Region: "jp", Key: node}, now)
 		watcher.Note("*.onejav.com", node)
 	}
-	watcher.Store("hk-control", smart.ExitInfo{Region: "hk", Key: "hk-control"}, now)
+	watcher.StoreTarget("*.onejav.com", "hk-control", smart.ExitInfo{Region: "hk", Key: "hk-control"}, now)
 	watcher.NoteSuccess("*.onejav.com", "hk-control")
 	proxies := []C.Proxy{
 		&filterOrderProxy{Proxy: adapter.NewProxy(outbound.NewDirect()), name: "jp-01"},
@@ -648,7 +648,7 @@ func TestFilterProxiesFailsOpenWhenAllCandidatesSuspected(t *testing.T) {
 		testUrl:    testUrl,
 		configName: "test",
 	}
-	selected := group.filterProxies(request("user", "onejav.com"), "*.onejav.com", []string{"jp-01", "jp-02"}, []float64{1, 1}, proxies, 2, false)
+	selected, _ := group.filterProxies(request("user", "onejav.com"), "*.onejav.com", []string{"jp-01", "jp-02"}, []float64{1, 1}, proxies, 2, false)
 	if len(selected) != 1 || selected[0].Name() != "jp-01" {
 		t.Fatalf("all-suspected target should allow only one half-open node, got %v", selected)
 	}
@@ -657,18 +657,18 @@ func TestFilterProxiesFailsOpenWhenAllCandidatesSuspected(t *testing.T) {
 func TestPeriodicOriginRefusalsRaiseExitSuspicion(t *testing.T) {
 	watcher := smart.NewExitWatcher(smart.ExitWatcherOptions{Name: "exit-evidence-test"})
 	now := time.Now()
-	watcher.Store("jp-01", smart.ExitInfo{Region: "jp", Key: "exit-jp-01"}, now)
-	watcher.Store("jp-02", smart.ExitInfo{Region: "jp", Key: "exit-jp-02"}, now)
+	watcher.StoreTarget("*.onejav.com", "jp-01", smart.ExitInfo{Region: "jp", Key: "exit-jp-01"}, now)
+	watcher.StoreTarget("*.onejav.com", "jp-02", smart.ExitInfo{Region: "jp", Key: "exit-jp-02"}, now)
 	group := &Smart{exitWatch: watcher}
 	target := "*.onejav.com"
 
-	group.noteExitEvidence(target, "jp-01", smart.ReasonOriginError)
+	group.noteExitEvidence(blameTestProxy{name: "jp-01"}, "onejav.com", target, "jp-01", smart.ReasonOriginError)
 	if watcher.Suspected(target, "jp-01") {
 		t.Fatal("one JP exit must not raise a suspicion")
 	}
-	watcher.Store("hk-control", smart.ExitInfo{Region: "hk", Key: "exit-hk"}, now)
-	group.noteExitSuccess(target, "hk-control", smart.ClassifyResponse(http.StatusOK, nil, nil, now))
-	group.noteExitEvidence(target, "jp-02", smart.ReasonOriginError)
+	watcher.StoreTarget(target, "hk-control", smart.ExitInfo{Region: "hk", Key: "exit-hk"}, now)
+	group.noteExitSuccess(blameTestProxy{name: "hk-control"}, "onejav.com", target, "hk-control", smart.ClassifyResponse(http.StatusOK, nil, nil, now))
+	group.noteExitEvidence(blameTestProxy{name: "jp-02"}, "onejav.com", target, "jp-02", smart.ReasonOriginError)
 	if !watcher.Suspected(target, "jp-01") {
 		t.Fatal("independent JP origin refusals must raise a suspicion")
 	}

@@ -12,7 +12,7 @@ import (
 // stays above what a real service spans once shared networks are excluded (github 1,
 // apple and netflix around 2), a promoted service would be split into several exits.
 const (
-	BroadRuleCount    = 10000
+	BroadRuleCount    = 10000 // entries a rule set or geosite needs to count as a collection
 	BroadASNDiversity = 6
 
 	// asnEvidencePrefix marks the per target network counters kept in StatsRecord.Weights,
@@ -124,6 +124,8 @@ func ClassifyTargetName(target string) TargetKind {
 	}
 
 	name, _, _ := strings.Cut(strings.ToLower(payload), "@")
+	// a negated list is a collection whenever the list it negates is one
+	name = strings.TrimPrefix(name, "!")
 
 	switch kind {
 	case "GeoIP", "SrcGeoIP":
@@ -165,18 +167,17 @@ func NeedsASNKey(target string, ruleCount, asnDiversity int) bool {
 	return asnDiversity >= BroadASNDiversity
 }
 
-// RuleSetPayload returns the provider payload of a rule set target, the name its
-// entry count is looked up with.
-func RuleSetPayload(target string) (string, bool) {
-	kind, payload, ok := splitTarget(target)
+// RulePayload returns the rule type and payload whose entry count is looked up.
+func RulePayload(target string) (ruleType, payload string, ok bool) {
+	ruleType, payload, ok = splitTarget(target)
 	if !ok {
-		return "", false
+		return "", "", false
 	}
-	switch kind {
+	switch ruleType {
 	case "RuleSet", "GeoSite":
-		return payload, true
+		return ruleType, payload, true
 	}
-	return "", false
+	return "", "", false
 }
 
 func splitTarget(target string) (kind, payload string, ok bool) {

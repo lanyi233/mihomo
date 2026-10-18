@@ -67,6 +67,57 @@ func TestClosingOwnerRejectsExitProbe(t *testing.T) {
 	require.False(t, inflight, "rejected work must release its node slot")
 }
 
+type lifecycleTargetExitProxy struct {
+	C.Proxy
+	probe func(context.Context, string) (*ExitProbeResult, error)
+}
+
+func (p lifecycleTargetExitProxy) TargetExitProbe(ctx context.Context, host string, _ bool) (*ExitProbeResult, error) {
+	return p.probe(ctx, host)
+}
+
+func TestTargetExitProbeParticipatesInOwnerShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan string, 1)
+	finished := make(chan struct{})
+	watcher := NewExitWatcher(ExitWatcherOptions{
+		BeginProbe: func() (func(), bool) { return func() { close(finished) }, true },
+	})
+	watcher.MaybeProbeTarget(ctx, lifecycleTargetExitProxy{probe: func(ctx context.Context, host string) (*ExitProbeResult, error) {
+		started <- host
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}, "rule", "node", "example.com")
+	select {
+	case host := <-started:
+		require.Equal(t, "example.com", host)
+	case <-time.After(3 * time.Second):
+		t.Fatal("target exit probe did not start")
+	}
+	select {
+	case <-finished:
+		t.Fatal("owner barrier released before target probe finished")
+	default:
+	}
+	cancel()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("target exit probe did not release owner barrier")
+	}
+	require.True(t, watcher.targetDue("rule", "node", exitRegionTTL, exitProbeRetryGap, time.Now()), "cancellation must not mark target failed")
+}
+
+func TestClosingOwnerRejectsTargetExitProbe(t *testing.T) {
+	watcher := NewExitWatcher(ExitWatcherOptions{BeginProbe: func() (func(), bool) { return nil, false }})
+	watcher.MaybeProbeTarget(context.Background(), lifecycleTargetExitProxy{probe: func(context.Context, string) (*ExitProbeResult, error) {
+		panic("closing owner started a target exit probe")
+	}}, "rule", "node", "example.com")
+	_, inflight := watcher.targetInflight.Load(targetNodeKey{"rule", "node"})
+	require.False(t, inflight, "rejected target work must release its slot")
+}
+
 func TestQueuedNodeStatePreservesHealthAndExitUpdates(t *testing.T) {
 	openScanTestDB(t, 0)
 	InitQueue()

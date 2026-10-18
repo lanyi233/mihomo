@@ -27,6 +27,7 @@ const (
 	suspectThreshold          = 2
 	suspectMaxControlExitKeys = 16
 	suspectMaxTargets         = 4096
+	targetLabelMaxEntries     = 4096
 
 	// exit probes keep their own slots; a slow trace cannot hold back the status probes
 	exitProbeMaxInflight = 2
@@ -37,16 +38,24 @@ var (
 	suspectConfirmWindow = 10 * time.Minute
 	exitRegionTTL        = 6 * time.Hour
 	exitProbeRetryGap    = 15 * time.Minute
+	backfillInterval     = 2 * time.Second
+	traceWitnessNodes    = 2
+	noTraceTTL           = 6 * time.Hour
 )
 
 var exitProbeInflight = make(chan struct{}, exitProbeMaxInflight)
 
-// ExitTraceURLs are tried in order, so a blocked endpoint costs a fallback instead of the
-// answer; the first answers with `key=value` lines, the others with JSON.
+// ExitTraceURLs are tried in order, so a blocked endpoint costs a fallback, not the answer.
 var ExitTraceURLs = []string{
 	"https://www.cloudflare.com/cdn-cgi/trace",
 	"https://api.ip.sb/geoip",
 	"https://ipwho.is/",
+}
+
+// TraceUnanswerableError marks a trace endpoint that answered without an exit answer,
+// which is a property of the asked host rather than of the node that carried the probe.
+type TraceUnanswerableError struct {
+	Reason string
 }
 
 type ExitProbeResult struct {
@@ -61,6 +70,10 @@ type ExitProber interface {
 	ExitProbe(ctx context.Context, wantASN bool) (*ExitProbeResult, error)
 }
 
+type TargetExitProber interface {
+	TargetExitProbe(ctx context.Context, host string, wantASN bool) (*ExitProbeResult, error)
+}
+
 type ExitInfo struct {
 	Region  string `json:"region,omitempty"`
 	ASN     string `json:"asn,omitempty"`
@@ -73,6 +86,16 @@ type exitRecord struct {
 	failed int64
 }
 
+type targetNodeKey struct {
+	target string
+	node   string
+}
+
+type targetRecord struct {
+	info   ExitInfo
+	failed int64
+}
+
 type suspectHalfOpen struct {
 	owner   string
 	until   int64
@@ -80,18 +103,18 @@ type suspectHalfOpen struct {
 }
 
 type ExitState struct {
-	mu       sync.RWMutex
-	nodes    map[string]*exitRecord
-	refusals exitHold
-	controls exitHold
+	mu        sync.RWMutex
+	nodes     map[string]*exitRecord
+	targets   map[targetNodeKey]*targetRecord
+	refusals  exitHold
+	controls  exitHold
+	noTrace   map[string]int64
+	witnesses map[string]map[string]bool
 }
 
 // exitHold keeps one target per node, dropped once the confirm window passes.
 type exitHold map[string]map[string]int64
 
-// SuspectTracker raises a suspicion for one key domain, such as a region or a network:
-// the other nodes of that key are only moved behind the rest until the suspicion expires.
-// One exit machine counts once, however many nodes run on it.
 type SuspectTracker struct {
 	mu         sync.RWMutex
 	pending    map[string]map[string]map[string]int64
@@ -105,15 +128,21 @@ type SuspectTracker struct {
 type ExitWatcher struct {
 	ExitState
 
-	name       string
-	config     string
-	store      *Store
-	wantASN    func() bool
-	beginProbe func() (func(), bool)
-	inflight   xsync.Map[string, struct{}]
-	seeded     xsync.Map[string, struct{}]
-	regions    SuspectTracker
-	asns       SuspectTracker
+	name           string
+	config         string
+	store          *Store
+	wantASN        func() bool
+	beginProbe     func() (func(), bool)
+	inflight       xsync.Map[string, struct{}]
+	targetInflight xsync.Map[targetNodeKey, struct{}]
+	seeded         xsync.Map[string, struct{}]
+	regions        SuspectTracker
+	asns           SuspectTracker
+
+	hostMu sync.Mutex
+	hosts  map[string]string
+
+	backfillAt map[string]int64
 }
 
 type ExitWatcherOptions struct {
@@ -123,6 +152,13 @@ type ExitWatcherOptions struct {
 	WantASN func() bool
 	// BeginProbe registers asynchronous work with the owner's shutdown barrier.
 	BeginProbe func() (done func(), accepted bool)
+}
+
+func (e *TraceUnanswerableError) Error() string { return e.Reason }
+
+func IsTraceUnanswerable(err error) bool {
+	var target *TraceUnanswerableError
+	return errors.As(err, &target)
 }
 
 func (h *exitHold) add(target, node string, at int64) {
@@ -209,6 +245,122 @@ func (s *ExitState) Info(node string) ExitInfo {
 		return rec.info
 	}
 	return ExitInfo{}
+}
+
+func (s *ExitState) targetDue(target, node string, ttl, retry time.Duration, now time.Time) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if until, marked := s.noTrace[target]; marked && now.Unix() < until {
+		return false
+	}
+	rec, ok := s.targets[targetNodeKey{target, node}]
+	if !ok {
+		return true
+	}
+	if rec.info.Updated != 0 && now.Unix()-rec.info.Updated < int64(ttl.Seconds()) {
+		return false
+	}
+	return rec.failed == 0 || now.Unix()-rec.failed >= int64(retry.Seconds())
+}
+
+func (s *ExitState) TargetInfo(target, node string) ExitInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if rec, ok := s.targets[targetNodeKey{target, node}]; ok {
+		return rec.info
+	}
+	return ExitInfo{}
+}
+
+func (s *ExitState) StoreTarget(target, node string, info ExitInfo, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.noTrace, target)
+	delete(s.witnesses, target)
+	key := targetNodeKey{target, node}
+	rec, ok := s.targets[key]
+	if !ok {
+		if len(s.targets) >= targetLabelMaxEntries {
+			s.pruneTargetsLocked(now)
+			if len(s.targets) >= targetLabelMaxEntries {
+				return
+			}
+		}
+		if s.targets == nil {
+			s.targets = make(map[targetNodeKey]*targetRecord)
+		}
+		rec = &targetRecord{}
+		s.targets[key] = rec
+	}
+	info.Updated = now.Unix()
+	rec.info = info
+	rec.failed = 0
+}
+
+func (s *ExitState) pruneTargetsLocked(now time.Time) {
+	for key, rec := range s.targets {
+		if rec.info.Updated != 0 {
+			if now.Unix()-rec.info.Updated > int64(exitRegionTTL.Seconds()) {
+				delete(s.targets, key)
+			}
+			continue
+		}
+		if rec.failed != 0 && now.Unix()-rec.failed > int64(exitProbeRetryGap.Seconds()) {
+			delete(s.targets, key)
+		}
+	}
+	for target, until := range s.noTrace {
+		if now.Unix() >= until {
+			delete(s.noTrace, target)
+			delete(s.witnesses, target)
+		}
+	}
+}
+
+func (s *ExitState) NoteTargetFailure(target, node string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := targetNodeKey{target, node}
+	rec, ok := s.targets[key]
+	if !ok {
+		if len(s.targets) >= targetLabelMaxEntries {
+			s.pruneTargetsLocked(now)
+			if len(s.targets) >= targetLabelMaxEntries {
+				return
+			}
+		}
+		if s.targets == nil {
+			s.targets = make(map[targetNodeKey]*targetRecord)
+		}
+		rec = &targetRecord{}
+		s.targets[key] = rec
+	}
+	rec.failed = now.Unix()
+}
+
+// NoteTargetUnanswerable: enough distinct witnesses drop the target from probing.
+func (s *ExitState) NoteTargetUnanswerable(target, node string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.witnesses == nil {
+		s.witnesses = make(map[string]map[string]bool)
+	}
+	nodes := s.witnesses[target]
+	if nodes == nil {
+		if len(s.witnesses) >= targetLabelMaxEntries {
+			return
+		}
+		nodes = make(map[string]bool)
+		s.witnesses[target] = nodes
+	}
+	nodes[node] = true
+	if len(nodes) < traceWitnessNodes {
+		return
+	}
+	if s.noTrace == nil {
+		s.noTrace = make(map[string]int64)
+	}
+	s.noTrace[target] = now.Add(noTraceTTL).Unix()
 }
 
 // Withhold holds a refusal until its node's exit answer arrives; Release completes it.
@@ -678,30 +830,18 @@ func (w *ExitWatcher) MaybeProbe(parent context.Context, proxy C.Proxy) {
 	if _, loaded := w.inflight.LoadOrStore(node, struct{}{}); loaded {
 		return
 	}
-	var finish func()
-	if w.beginProbe != nil {
-		var accepted bool
-		finish, accepted = w.beginProbe()
-		if !accepted {
-			w.inflight.Delete(node)
-			return
-		}
+	w.startProbe(parent, prober, node)
+}
+
+func (w *ExitWatcher) startProbe(parent context.Context, prober ExitProber, node string) {
+	done, accepted := w.beginExitWork()
+	if !accepted {
+		w.inflight.Delete(node)
+		return
 	}
-
 	go func() {
-		if finish != nil {
-			defer finish()
-		}
-		defer w.inflight.Delete(node)
-
-		done, ok := TryStartExitProbe()
-		if !ok {
-			return
-		}
 		defer done()
-		if !AllowGlobalProbe(time.Now()) {
-			return
-		}
+		defer w.inflight.Delete(node)
 
 		if parent == nil {
 			parent = context.Background()
@@ -723,26 +863,193 @@ func (w *ExitWatcher) MaybeProbe(parent context.Context, proxy C.Proxy) {
 		}
 
 		w.Store(node, ExitInfo{Region: result.Region, ASN: result.ASN, Key: result.Key}, time.Now())
-		if result.ASN != "" {
-			log.Debugln("[Smart] Exit probe [%s] node [%s] -> region [%s] asn [%s]", w.name, node, result.Region, result.ASN)
-		} else {
-			log.Debugln("[Smart] Exit probe [%s] node [%s] -> region [%s]", w.name, node, result.Region)
-		}
+		log.Debugln("[Smart] Exit probe [%s] node [%s] -> [%s]", w.name, node, describeExit(result.Region, result.ASN))
 		w.storeExitState(node, w.Info(node))
 		for _, target := range w.Release(node) {
-			log.Debugln("[Smart] Exit refusal released [%s] target [%s] node [%s] after its exit answer", w.name, target, node)
+			log.Debugln("[Smart] Exit refusal released [%s] target [%s] node [%s]", w.name, target, node)
 			w.confirm(target, node)
 		}
 		for _, target := range w.ReleaseSuccess(node) {
-			log.Debugln("[Smart] Exit control released [%s] target [%s] node [%s] after its exit answer", w.name, target, node)
+			log.Debugln("[Smart] Exit control released [%s] target [%s] node [%s]", w.name, target, node)
 			w.NoteSuccess(target, node)
 		}
 	}()
 }
 
-// EnsureLoaded reads the stored answer of a node once per run, so a connection arriving
-// before any probe already reports what an earlier run learned; a failed probe keeps its
-// retry gap. A connection racing the first load may still see the node as unknown.
+func (w *ExitWatcher) MaybeProbeTarget(parent context.Context, proxy C.Proxy, target, node, host string) {
+	if target == "" || node == "" || host == "" {
+		return
+	}
+	w.rememberHost(target, host)
+	now := time.Now()
+	if !w.targetDue(target, node, exitRegionTTL, exitProbeRetryGap, now) {
+		return
+	}
+	prober, ok := proxy.(TargetExitProber)
+	if !ok {
+		return
+	}
+	w.startTargetProbe(parent, prober, target, node, host)
+}
+
+func (w *ExitWatcher) startTargetProbe(parent context.Context, prober TargetExitProber, target, node, host string) {
+	key := targetNodeKey{target, node}
+	if _, loaded := w.targetInflight.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	done, ok := w.beginExitWork()
+	if !ok {
+		w.targetInflight.Delete(key)
+		return
+	}
+
+	go func() {
+		defer w.targetInflight.Delete(key)
+		defer done()
+
+		if parent == nil {
+			parent = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parent, ProbeTimeout)
+		defer cancel()
+
+		wantASN := w.wantASN != nil && w.wantASN()
+		result, err := prober.TargetExitProbe(ctx, host, wantASN)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+				return
+			}
+			w.NoteTargetFailure(target, node, time.Now())
+			if IsTraceUnanswerable(err) {
+				w.NoteTargetUnanswerable(target, node, time.Now())
+			}
+			log.Debugln("[Smart] Target exit probe [%s] target [%s] node [%s] failed: %s", w.name, target, node, err.Error())
+		} else {
+			w.StoreTarget(target, node, ExitInfo{Region: result.Region, ASN: result.ASN, Key: result.Key}, time.Now())
+			log.Debugln("[Smart] Target exit probe [%s] target [%s] node [%s] -> [%s]", w.name, target, node, describeExit(result.Region, result.ASN))
+		}
+		w.replayHeld(node)
+	}()
+}
+
+// Register with the owner before launching work, including target probes and
+// backfills. Closing a group rejects new work and waits for every accepted probe.
+func (w *ExitWatcher) beginExitWork() (func(), bool) {
+	var finish func()
+	if w.beginProbe != nil {
+		var accepted bool
+		finish, accepted = w.beginProbe()
+		if !accepted {
+			return nil, false
+		}
+	}
+	release, accepted := TryStartExitProbe()
+	if !accepted {
+		if finish != nil {
+			finish()
+		}
+		return nil, false
+	}
+	return func() {
+		release()
+		if finish != nil {
+			finish()
+		}
+	}, true
+}
+
+func (w *ExitWatcher) replayHeld(node string) {
+	for _, t := range w.Release(node) {
+		if region, asn, _ := w.exitLabel(t, node); region == "" && asn == "" {
+			w.Withhold(t, node)
+			continue
+		}
+		log.Debugln("[Smart] Exit refusal released [%s] target [%s] node [%s]", w.name, t, node)
+		w.confirm(t, node)
+	}
+	for _, t := range w.ReleaseSuccess(node) {
+		if region, asn, _ := w.exitLabel(t, node); region == "" && asn == "" {
+			w.WithholdSuccess(t, node)
+			continue
+		}
+		log.Debugln("[Smart] Exit control released [%s] target [%s] node [%s]", w.name, t, node)
+		w.NoteSuccess(t, node)
+	}
+}
+
+func (w *ExitWatcher) Backfill(ctx context.Context, target string, proxies []C.Proxy) {
+	if target == "" || len(proxies) == 0 {
+		return
+	}
+	if !w.regions.Active() && !w.asns.Active() {
+		return
+	}
+	host, ok := w.backfillDue(target)
+	if !ok {
+		return
+	}
+	if HostBackedOff(w.config, w.name, host) {
+		return
+	}
+	for _, p := range proxies {
+		if _, ok := p.(TargetExitProber); !ok {
+			continue
+		}
+		w.MaybeProbeTarget(ctx, p, target, p.Name(), host)
+	}
+}
+
+func (w *ExitWatcher) backfillDue(target string) (string, bool) {
+	now := time.Now().Unix()
+	w.hostMu.Lock()
+	defer w.hostMu.Unlock()
+
+	host, ok := w.hosts[target]
+	if !ok || host == "" {
+		return "", false
+	}
+	if until, ok := w.backfillAt[target]; ok && until > now {
+		return "", false
+	}
+	if w.backfillAt == nil {
+		w.backfillAt = make(map[string]int64)
+	}
+	if _, seen := w.backfillAt[target]; !seen && len(w.backfillAt) >= suspectMaxTargets {
+		return host, true
+	}
+	w.backfillAt[target] = now + int64(backfillInterval.Seconds())
+	return host, true
+}
+
+func (w *ExitWatcher) rememberHost(target, host string) {
+	w.hostMu.Lock()
+	defer w.hostMu.Unlock()
+	if w.hosts == nil {
+		w.hosts = make(map[string]string)
+	}
+	if _, ok := w.hosts[target]; !ok && len(w.hosts) >= suspectMaxTargets {
+		return
+	}
+	w.hosts[target] = host
+}
+
+func (w *ExitWatcher) exitLabel(target, node string) (region, asn, key string) {
+	if info := w.TargetInfo(target, node); info.Region != "" || info.ASN != "" {
+		return info.Region, info.ASN, info.Key
+	}
+	info := w.Info(node)
+	return info.Region, info.ASN, info.Key
+}
+
+// Label is exitLabel for callers that only annotate a connection: a node re-forwards one
+// target to a different landing than the rest of its traffic.
+func (w *ExitWatcher) Label(target, node string) (region, asn string) {
+	region, asn, _ = w.exitLabel(target, node)
+	return
+}
+
+// EnsureLoaded reads a node's stored answer once per run, so a connection arriving before
+// any probe still reports it; a failed probe keeps its retry gap.
 func (w *ExitWatcher) EnsureLoaded(node string) {
 	if _, loaded := w.seeded.LoadOrStore(node, struct{}{}); loaded {
 		return
@@ -806,41 +1113,42 @@ func (w *ExitWatcher) loadExitState(node string) (ExitInfo, int64, bool) {
 // Note blames a refusal on the node's own answer; while that answer is unknown the
 // suspicion waits for it instead of being dropped. It reports whether a suspicion was raised.
 func (w *ExitWatcher) Note(target, node string) bool {
-	if w.Info(node).Region == "" && w.asnOf(node) == "" {
-		w.Withhold(target, node)
-		log.Debugln("[Smart] Exit refusal [%s] target [%s] node [%s] held until its exit answer arrives", w.name, target, node)
-		return false
+	now := time.Now()
+	if info := w.TargetInfo(target, node); info.Region == "" && info.ASN == "" {
+		if w.targetDue(target, node, exitRegionTTL, exitProbeRetryGap, now) {
+			w.Withhold(target, node)
+			log.Debugln("[Smart] Exit refusal held [%s] target [%s] node [%s]", w.name, target, node)
+			return false
+		}
 	}
 	return w.confirm(target, node)
 }
 
-// NoteSuccess records a 2xx control answer of the target and reports whether it raised a
-// suspicion for another key; an answer that arrives before the node's exit is held and later
-// replayed by ReleaseSuccess.
+// NoteSuccess records a 2xx control answer and reports whether it raised a suspicion for
+// another key; a control arriving before the node's exit is held and replayed later.
 func (w *ExitWatcher) NoteSuccess(target, node string) bool {
-	info := w.Info(node)
-	asn := w.asnOf(node)
-	if info.Region == "" && asn == "" {
-		w.WithholdSuccess(target, node)
-		log.Debugln("[Smart] Exit control [%s] target [%s] node [%s] held until its exit answer arrives", w.name, target, node)
-		return false
-	}
-	identity := w.identity(node)
 	now := time.Now()
-	raised := false
-	if info.Region != "" {
-		for _, failedRegion := range w.regions.NoteSuccess(target, info.Region, identity, now) {
-			raised = true
-			log.Debugln("[Smart] Exit suspect [%s] target [%s] region [%s] raised after a successful control from [%s]",
-				w.name, target, failedRegion, node)
+	if info := w.TargetInfo(target, node); info.Region == "" && info.ASN == "" {
+		if w.targetDue(target, node, exitRegionTTL, exitProbeRetryGap, now) {
+			w.WithholdSuccess(target, node)
+			log.Debugln("[Smart] Exit control held [%s] target [%s] node [%s]", w.name, target, node)
+			return false
 		}
 	}
-	if asn != "" {
-		for _, failedASN := range w.asns.NoteSuccess(target, asn, identity, now) {
+	region, asn, key := w.exitLabel(target, node)
+	identity := w.identity(key, node)
+	raised := false
+	raise := func(kind string, failed []string) {
+		for _, failedKey := range failed {
 			raised = true
-			log.Debugln("[Smart] Exit suspect [%s] target [%s] asn [%s] raised after a successful control from [%s]",
-				w.name, target, failedASN, node)
+			log.Debugln("[Smart] Exit suspect [%s] target [%s] %s [%s] raised by a control from node [%s]", w.name, target, kind, failedKey, node)
 		}
+	}
+	if region != "" {
+		raise("region", w.regions.NoteSuccess(target, region, identity, now))
+	}
+	if w.wantASN != nil && w.wantASN() && asn != "" {
+		raise("asn", w.asns.NoteSuccess(target, asn, identity, now))
 	}
 	if raised {
 		w.dropUnwrapResult(target)
@@ -850,21 +1158,21 @@ func (w *ExitWatcher) NoteSuccess(target, node string) bool {
 
 func (w *ExitWatcher) confirm(target, node string) bool {
 	now := time.Now()
-	identity := w.identity(node)
+	region, asn, key := w.exitLabel(target, node)
+	identity := w.identity(key, node)
 	raised := false
-	if region := w.Info(node).Region; region != "" {
-		if w.regions.Note(target, region, identity, now) {
-			raised = true
-			log.Debugln("[Smart] Exit suspect [%s] target [%s] region [%s] raised by node [%s]",
-				w.name, target, region, node)
+	raise := func(kind, hitKey string, hit bool) {
+		if !hit {
+			return
 		}
+		raised = true
+		log.Debugln("[Smart] Exit suspect [%s] target [%s] %s [%s] raised by node [%s]", w.name, target, kind, hitKey, node)
 	}
-	if asn := w.asnOf(node); asn != "" {
-		if w.asns.Note(target, asn, identity, now) {
-			raised = true
-			log.Debugln("[Smart] Exit suspect [%s] target [%s] asn [%s] raised by node [%s]",
-				w.name, target, asn, node)
-		}
+	if region != "" {
+		raise("region", region, w.regions.Note(target, region, identity, now))
+	}
+	if w.wantASN != nil && w.wantASN() && asn != "" {
+		raise("asn", asn, w.asns.Note(target, asn, identity, now))
 	}
 	if raised {
 		w.dropUnwrapResult(target)
@@ -879,38 +1187,35 @@ func (w *ExitWatcher) dropUnwrapResult(target string) {
 		return
 	}
 	w.store.DeleteUnwrapResult(w.name, w.config, target)
+	w.store.DeleteUnwrapResult(w.name, w.config, NetScopedTarget(target, true))
 	log.Debugln("[Smart] Exit suspect [%s] target [%s] unwrap pin cleared", w.name, target)
 }
 
 // identity tells the exit machines of two nodes apart, falling back to the node name.
-func (w *ExitWatcher) identity(node string) string {
-	if key := w.Info(node).Key; key != "" {
+func (w *ExitWatcher) identity(key, node string) string {
+	if key != "" {
 		return key
 	}
 	return node
 }
 
-// asnOf reports the network of a node only while the group works with networks.
-func (w *ExitWatcher) asnOf(node string) string {
-	if w.wantASN == nil || !w.wantASN() {
-		return ""
+func describeExit(region, asn string) string {
+	if asn == "" {
+		return "GeoIP [" + region + "]"
 	}
-	return w.Info(node).ASN
+	return "GeoIP [" + region + "] -> ASN [" + asn + "]"
 }
 
-// Suspected reports whether the region the node lands in, or the network it runs on, is
-// under suspicion for the target; a suspicion only reorders candidates, callers must
-// never drop one.
 func (w *ExitWatcher) Suspected(target, node string) bool {
 	if !w.regions.Active() && !w.asns.Active() {
 		return false
 	}
 	now := time.Now()
-	info := w.Info(node)
-	if info.Region != "" && w.regions.Suspected(target, info.Region, now) {
+	region, asn, _ := w.exitLabel(target, node)
+	if region != "" && w.regions.Suspected(target, region, now) {
 		return true
 	}
-	if w.wantASN != nil && w.wantASN() && info.ASN != "" && w.asns.Suspected(target, info.ASN, now) {
+	if w.wantASN != nil && w.wantASN() && asn != "" && w.asns.Suspected(target, asn, now) {
 		return true
 	}
 	return false
@@ -920,45 +1225,53 @@ func (w *ExitWatcher) Defer(target, node string, now time.Time, lease time.Durat
 	if !w.regions.Active() && !w.asns.Active() {
 		return false
 	}
-	info := w.Info(node)
-	if w.wantASN != nil && w.wantASN() && info.ASN != "" && w.asns.Defer(target, info.ASN, node, now, lease) {
+	region, asn, _ := w.exitLabel(target, node)
+	if w.wantASN != nil && w.wantASN() && asn != "" && w.asns.Defer(target, asn, node, now, lease) {
 		return true
 	}
-	if info.Region == "" {
+	if region == "" {
 		return false
 	}
-	return w.regions.Defer(target, info.Region, node, now, lease)
+	return w.regions.Defer(target, region, node, now, lease)
 }
 
 func (w *ExitWatcher) AllowFallback(target, node string, now time.Time, lease time.Duration) bool {
-	info := w.Info(node)
-	regionSuspected := info.Region != "" && w.regions.Suspected(target, info.Region, now)
-	asnSuspected := w.wantASN != nil && w.wantASN() && info.ASN != "" && w.asns.Suspected(target, info.ASN, now)
+	region, asn, _ := w.exitLabel(target, node)
+	regionSuspected := region != "" && w.regions.Suspected(target, region, now)
+	asnSuspected := w.wantASN != nil && w.wantASN() && asn != "" && w.asns.Suspected(target, asn, now)
 	if !regionSuspected && !asnSuspected {
 		return true
 	}
 	claimedASN := false
 	if asnSuspected {
-		if !w.asns.TryHalfOpen(target, info.ASN, node, now, lease) {
+		if !w.asns.TryHalfOpen(target, asn, node, now, lease) {
 			return false
 		}
 		claimedASN = true
 	}
-	if regionSuspected && !w.regions.TryHalfOpen(target, info.Region, node, now, lease) {
+	if regionSuspected && !w.regions.TryHalfOpen(target, region, node, now, lease) {
 		if claimedASN {
-			w.asns.ReleaseHalfOpen(target, info.ASN, node)
+			w.asns.ReleaseHalfOpen(target, asn, node)
 		}
 		return false
 	}
 	return true
 }
 
-// Clear drops the suspicions an answered node has disproved.
 func (w *ExitWatcher) Clear(target, node string) {
-	if region := w.Info(node).Region; region != "" {
+	info := w.TargetInfo(target, node)
+	region, asn := info.Region, info.ASN
+	if region == "" && asn == "" {
+		if w.targetDue(target, node, exitRegionTTL, exitProbeRetryGap, time.Now()) {
+			return
+		}
+		fallback := w.Info(node)
+		region, asn = fallback.Region, fallback.ASN
+	}
+	if region != "" {
 		w.regions.Clear(target, region)
 	}
-	if asn := w.asnOf(node); asn != "" {
+	if w.wantASN != nil && w.wantASN() && asn != "" {
 		w.asns.Clear(target, asn)
 	}
 }
@@ -1011,9 +1324,7 @@ func ParseExitTrace(body []byte) (region string, ip netip.Addr) {
 	return region, ip
 }
 
-// IsRegionUnavailableLocation tells a page that blames the region from an ordinary
-// relocation: only the former may record a block for the whole region. A region word next
-// to a refusal word counts as one; either word alone is an ordinary page.
+// IsRegionUnavailableLocation tells a region refusal apart from an ordinary relocation.
 func IsRegionUnavailableLocation(location string) bool {
 	if location == "" {
 		return false

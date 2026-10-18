@@ -128,12 +128,15 @@ func TestUpdateHostStatusRecordsTheHostForEveryBlockingCode(t *testing.T) {
 		wildcardTarget = "example.com"
 		node           = "node-a"
 	)
-	for _, blockCode := range []BlockCode{BlockAbnormalStatus, BlockNoResponse, BlockLowWeight, BlockPacketLoss} {
+	for _, blockCode := range []BlockCode{BlockAbnormalStatus, BlockNoResponse, BlockLowWeight, BlockPacketLoss, BlockStalled} {
 		seedHostStatus(t, group, config, wildcardTarget, &HostStatus{})
 
 		store := &Store{}
 		metadata := &C.Metadata{Host: "probe.example.com"}
 		store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, true, true, blockCode, 0)
+		if blockCode == BlockPacketLoss {
+			store.UpdateHostStatus(group, config, wildcardTarget, metadata, node, 3, 1_000, true, true, blockCode, 0)
+		}
 
 		cached, ok := hostStatusCache.Get(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
 		require.True(t, ok)

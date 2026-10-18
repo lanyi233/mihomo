@@ -6,7 +6,46 @@ import (
 
 	"github.com/metacubex/mihomo/component/smart"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/stretchr/testify/require"
 )
+
+func TestUDPFailuresDoNotBlockTCP(t *testing.T) {
+	smart.InitCache()
+	smart.InitQueue()
+	s := sweepGroup("udp-isolation")
+	s.configName = "config"
+	s.store = &smart.Store{}
+	s.maxFailedTimes = 1
+	s.hostFailLimit.Store(100)
+	metadata := &C.Metadata{NetWork: C.UDP, Host: "udp.example.com", WildcardTarget: "*.example.com", SmartTarget: "service"}
+	s.markNodeFailure(metadata, "node", true, true, smart.BlockDialFailure, 0)
+	for _, target := range []string{metadata.WildcardTarget, metadata.SmartTarget} {
+		tcp, _, _, _ := s.store.GetHostStatus(s.Name(), s.configName, target, 100)
+		require.NotContains(t, tcp, "node", "UDP failure contaminated TCP selection")
+		udp, _, _, _ := s.store.GetHostStatus(s.Name(), s.configName, smart.NetScopedTarget(target, true), 100)
+		require.Equal(t, smart.BlockDialFailure, udp["node"])
+	}
+	// A TCP success cannot erase evidence about a UDP-only failure.
+	metadata.NetWork = C.TCP
+	s.markNodeFailure(metadata, "node", false, true, smart.BlockNone, 0)
+	udp, _, _, _ := s.store.GetHostStatus(s.Name(), s.configName, smart.NetScopedTarget(metadata.SmartTarget, true), 100)
+	require.Equal(t, smart.BlockDialFailure, udp["node"])
+}
+
+func TestStalledHostDoesNotExcludeWholeRule(t *testing.T) {
+	smart.InitCache()
+	smart.InitQueue()
+	s := sweepGroup("stall-scope")
+	s.configName = "config"
+	s.store = &smart.Store{}
+	s.hostFailLimit.Store(100)
+	metadata := &C.Metadata{NetWork: C.TCP, WildcardTarget: "*.example.com", SmartTarget: "service"}
+	s.markNodeFailure(metadata, "node", true, true, smart.BlockStalled, stalledProbeTTL)
+	host, _, _, _ := s.store.GetHostStatus(s.Name(), s.configName, metadata.WildcardTarget, 100)
+	require.Equal(t, smart.BlockStalled, host["node"])
+	rule, _, _, _ := s.store.GetHostStatus(s.Name(), s.configName, metadata.SmartTarget, 100)
+	require.NotContains(t, rule, "node", "one stalled host excluded every host in the rule")
+}
 
 // The rule is meant to catch a node that accepts a flow and then swallows it.
 // Requiring zero upload inverted the attribution: if the client never sent a
@@ -30,7 +69,7 @@ func TestNoResponseVerdictNeedsTheClientToHaveSentSomething(t *testing.T) {
 		wantCode     smart.BlockCode
 	}{
 		{name: "client sent nothing", uploadTotal: 0, wantDegraded: false, wantCode: smart.BlockNone},
-		{name: "client sent a request and got nothing back", uploadTotal: 1, wantDegraded: true, wantCode: smart.BlockNoResponse},
+		{name: "client sent a request and got nothing back", uploadTotal: 1, wantDegraded: true, wantCode: smart.BlockStalled},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			s := sweepGroup(group + testCase.name)
@@ -45,7 +84,7 @@ func TestNoResponseVerdictNeedsTheClientToHaveSentSomething(t *testing.T) {
 				WildcardTarget: wildcardTarget, SmartBlock: "normal",
 				NetWork: C.TCP, DstPort: 443,
 			}
-			_, isDegraded, _, blockCode := s.checkNodeQuality(s.readTargetState(metadata, node), metadata, blameTestProxy{name: node}, connQuality{err: nil, address: "example.com:443", weight: 0.9, oldWeight: 0.9, duration: 1_000, uploadMB: testCase.uploadTotal, downloadMB: 0})
+			_, isDegraded, _, blockCode := s.checkNodeQuality(s.readTargetState(metadata, node), metadata, blameTestProxy{name: node}, connQuality{err: nil, address: "example.com:443", weight: 0.9, oldWeight: 0.9, duration: 5_000, uploadMB: testCase.uploadTotal, downloadMB: 0})
 
 			if isDegraded != testCase.wantDegraded || blockCode != testCase.wantCode {
 				t.Fatalf("degraded=%v code=%d, want %v and %d",
@@ -98,7 +137,7 @@ func TestASweptConnectionIsNotBlamedForItsCloseError(t *testing.T) {
 				SmartBlock: testCase.smartBlock, NetWork: C.TCP,
 			}
 			if !s.submitConnectionStats(metadata, blameTestProxy{name: node},
-				0, 0, 0, 0, 0, 0, 1_000, nil, errors.New("connection reset"), true) {
+				0, 0, 0, 0, 0, 0, 1_000, nil, nil, errors.New("connection reset"), true) {
 				t.Fatal("submission was refused")
 			}
 			s.workWG.Wait()

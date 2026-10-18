@@ -60,7 +60,7 @@ type ModelInput struct {
 	IsUDP            bool    // UDP connection
 	IsTCP            bool    // TCP connection
 	ConnectionFailed bool    // this connection failed, a reuse counts as success
-	LossRate         float64 // this connection loss rate 0.0-1.0, 0=no loss / unsupported / UDP
+	LossRate         float64 // judged window loss 0.0-1.0, 0 = no window / unsupported / UDP
 	CumulLossRate    float64 // cumulative loss rate cumulRetrans/cumulSent
 	EmaLossRate      float64 // EMA loss rate, decays and reflects the recent trend
 
@@ -69,6 +69,9 @@ type ModelInput struct {
 	DestIP    string   // target IP
 	DestPort  uint16   // target port
 	DestGeoIP []string // geolocation of the target IP
+
+	ExitRegion string // region the node really lands in for this target
+	ExitASN    string // network the node runs on for this target
 
 	GroupName string // group name
 	NodeName  string // node name
@@ -196,7 +199,7 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 
 	qualityBonus = math.Min(0.3, qualityBonus)
 
-	// currentPenalty: this connection loss, sensitive but noisy
+	// currentPenalty: judged window loss, sensitive but floor gated
 	// cumulPenalty:   cumulative loss, stable but never decays
 	// emaPenalty:     EMA loss, decays and reflects the recent trend
 	// improvementFactor: EMA < cumulative means the quality is recovering

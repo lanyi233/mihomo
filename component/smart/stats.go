@@ -30,6 +30,9 @@ const (
 	hostStatusRetryAfter     = 4 * time.Hour
 	hostStatusViewTTLSeconds = 30
 
+	hostStrikeWindow = 5 * time.Minute
+	hostStrikeLimit  = 2
+
 	RecordExpiredTime = 7 * 24 * time.Hour
 
 	asnEvidenceRebuildInterval = 30 * time.Minute
@@ -96,9 +99,10 @@ type AtomicStatsRecord struct {
 }
 
 type CodeNodeSet struct {
-	Nodes      map[string]int64  `json:"nodes"`
-	FailCounts map[string]int    `json:"fail_counts,omitempty"`
-	NodeHosts  map[string]string `json:"node_hosts,omitempty"`
+	Nodes         map[string]int64  `json:"nodes"`
+	FailCounts    map[string]int    `json:"fail_counts,omitempty"`
+	Confirmations map[string]int    `json:"confirmations,omitempty"` // confirmed packet-loss blocks
+	NodeHosts     map[string]string `json:"node_hosts,omitempty"`
 }
 
 type HostStatus struct {
@@ -303,7 +307,7 @@ func (r *AtomicStatsRecord) UploadTotal() float64 {
 	return r.uploadTotal.Load()
 }
 
-// AddUploadTotal caps the counter at 1PB (1024^5 bytes), a wrapped value would poison the model input.
+// AddUploadTotal caps the counter; a wrapped value would poison the model input.
 func (r *AtomicStatsRecord) AddUploadTotal(v float64) {
 	current := r.uploadTotal.Load()
 	const maxUpload = 1125899906842624.0
@@ -318,7 +322,7 @@ func (r *AtomicStatsRecord) DownloadTotal() float64 {
 	return r.downloadTotal.Load()
 }
 
-// AddDownloadTotal caps the counter at 1PB (1024^5 bytes).
+// AddDownloadTotal caps the counter like AddUploadTotal.
 func (r *AtomicStatsRecord) AddDownloadTotal(v float64) {
 	current := r.downloadTotal.Load()
 	const maxDownload = 1125899906842624.0
@@ -818,7 +822,7 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 				}
 			}
 
-			// Clean up prefetch results if node stats expired, otherwise they may stay in prefetch results even if they are recovered.
+			// drop prefetch entries without stats, otherwise stale names stay listed.
 			nodeExistsMap, ok := targetNodeExistsCache[item.target]
 			if !ok {
 				nodeExistsMap = make(map[string]bool)
@@ -1300,7 +1304,11 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 				delete(codeSet.NodeHosts, nodeName)
 			}
 		}
-		if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 {
+		// the ladder memory drops once the record stays quiet for the retry window
+		if code == BlockPacketLoss && now-hs.LastFailure > int64(hostStatusRetryAfter.Seconds()) {
+			codeSet.Confirmations = nil
+		}
+		if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.Confirmations) == 0 {
 			delete(hs.Codes, code)
 		}
 	}
@@ -1332,7 +1340,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		// not a verdict still standing against the node, and counting it would
 		// keep every later dial failure or loss verdict from being recorded
 		// until the host had been quiet for hostStatusRetryAfter.
-		if codeSet.FailCounts != nil && code != BlockAbnormalStatus {
+		if codeSet.FailCounts != nil && code != BlockAbnormalStatus && code != BlockPacketLoss {
 			if _, ok := codeSet.FailCounts[name]; ok {
 				if currentCode == -1 || code < currentCode {
 					currentCode = code
@@ -1350,11 +1358,33 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			if codeSet.FailCounts != nil {
 				delete(codeSet.FailCounts, name)
 			}
+			delete(codeSet.Confirmations, name)
 			if codeSet.NodeHosts != nil {
 				delete(codeSet.NodeHosts, name)
 			}
 		}
 		goto saveAndReturn
+	}
+
+	// Small reads of the same socket cannot confirm a loss verdict: the caller
+	// supplies distinct, floor-gated windows and the store requires two strikes.
+	if failure && newCode == BlockPacketLoss && !(currentCode == BlockPacketLoss && currentExpiry > 0) {
+		if hs.Codes[newCode] == nil {
+			hs.Codes[newCode] = &CodeNodeSet{Nodes: make(map[string]int64)}
+		}
+		codeSet := hs.Codes[newCode]
+		count := 1
+		if oldLastFailure != 0 && now-oldLastFailure <= int64(hostStrikeWindow.Seconds()) {
+			count += codeSet.FailCounts[name]
+		}
+		if count < hostStrikeLimit {
+			if codeSet.FailCounts == nil {
+				codeSet.FailCounts = make(map[string]int)
+			}
+			codeSet.FailCounts[name] = count
+			hs.LastFailure = now
+			goto saveAndReturn
+		}
 	}
 
 	if currentCode != -1 && currentCode != newCode {
@@ -1372,6 +1402,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			if codeSet.NodeHosts != nil {
 				delete(codeSet.NodeHosts, name)
 			}
+			delete(codeSet.Confirmations, name)
 		}
 	}
 
@@ -1474,6 +1505,29 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			} else {
 				codeSet.FailCounts[name] = count
 			}
+		case BlockPacketLoss:
+			delete(codeSet.FailCounts, name)
+			if expiry, exists := codeSet.Nodes[name]; exists && expiry > now {
+				break
+			}
+			if codeSet.Confirmations == nil {
+				codeSet.Confirmations = make(map[string]int)
+			}
+			codeSet.Confirmations[name]++
+			if ttl <= 0 {
+				switch codeSet.Confirmations[name] {
+				case 1:
+					blockTTL = 15 * time.Minute
+				case 2:
+					blockTTL = time.Hour
+				case 3:
+					blockTTL = 4 * time.Hour
+				default:
+					blockTTL = HostFailureNodeTTL
+				}
+			}
+			blockNode()
+			failedBlock = true
 		default:
 			blockNode()
 		}
@@ -1496,7 +1550,7 @@ saveAndReturn:
 	}
 
 	for code, codeSet := range hs.Codes {
-		if codeSet == nil || (len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0) {
+		if codeSet == nil || (len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.Confirmations) == 0) {
 			delete(hs.Codes, code)
 		}
 	}
@@ -1559,6 +1613,9 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 			continue
 		}
 		wildcardTarget := fullPath[lastSlash+1:]
+		if isNetScopedTarget(wildcardTarget) {
+			continue
+		}
 
 		cachePath := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
 		cacheHS, _ := hostStatusCache.GetOrStore(cachePath, func() *HostStatus { return &HostStatus{} })
@@ -1857,7 +1914,15 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 						}
 					}
 				}
-				if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 {
+				if codeSet.Confirmations != nil {
+					for nodeName := range codeSet.Confirmations {
+						if _, toRemove := nodeSet[nodeName]; toRemove {
+							delete(codeSet.Confirmations, nodeName)
+							changed = true
+						}
+					}
+				}
+				if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.Confirmations) == 0 {
 					delete(hs.Codes, code)
 				}
 			}
@@ -2076,6 +2141,9 @@ const (
 	BlockLowWeight BlockCode = 5
 	// BlockPacketLoss is loss over the threshold.
 	BlockPacketLoss BlockCode = 6
+	// BlockStalled is short-lived evidence about one host. Existing codes keep
+	// their on-disk meanings; the new reason is appended rather than renumbered.
+	BlockStalled BlockCode = 7
 )
 
 // Recoverable reports whether a probe may return this node to service. Only
@@ -2091,7 +2159,7 @@ func (c BlockCode) Recoverable() bool {
 // traffic would otherwise flip its target in and out of Blocked every few
 // minutes.
 func (c BlockCode) CountsTowardBlock() bool {
-	return c.Recoverable() && c != BlockAbnormalStatus
+	return c.Recoverable() && c != BlockAbnormalStatus && c != BlockStalled
 }
 
 func asnEvidenceKey(group, config string) string {
@@ -2135,9 +2203,10 @@ func (hs *HostStatus) cloneForSaveLocked() *HostStatus {
 		// sets a given code does not use. It is not what keeps them out of the
 		// encoded form -- omitempty drops an empty map just the same.
 		clone.Codes[code] = &CodeNodeSet{
-			Nodes:      maps.Clone(codeSet.Nodes),
-			FailCounts: maps.Clone(codeSet.FailCounts),
-			NodeHosts:  maps.Clone(codeSet.NodeHosts),
+			Nodes:         maps.Clone(codeSet.Nodes),
+			FailCounts:    maps.Clone(codeSet.FailCounts),
+			Confirmations: maps.Clone(codeSet.Confirmations),
+			NodeHosts:     maps.Clone(codeSet.NodeHosts),
 		}
 	}
 	return clone

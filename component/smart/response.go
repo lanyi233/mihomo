@@ -12,6 +12,7 @@ import (
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 
 	"github.com/metacubex/http"
 )
@@ -27,8 +28,6 @@ const (
 	probeGlobalBurst     = 10
 	probeMaxInflight     = 4
 
-	probeHostBlindThreshold = 6
-
 	probeMaxEntries = 4096
 	probePath       = "/robots.txt"
 
@@ -39,9 +38,18 @@ const (
 
 	probeMaxBlockTTL = 30 * time.Minute
 
-	ReasonForbidden   = "forbidden"
-	ReasonOriginError = "origin error"
-	ReasonEdgeError   = "edge error"
+	ReasonForbidden     = "forbidden"
+	ReasonOriginError   = "origin error"
+	ReasonEdgeError     = "edge error"
+	ReasonCertAuthority = "unknown certificate authority"
+	ReasonCertHostname  = "certificate hostname mismatch"
+)
+
+// A host that several independent nodes refuse, and that no node has answered since its
+// last success, is held until the ttl; one probation refusal then arms the next hold.
+const (
+	hostBackoffMinNodes   = 3
+	hostBackoffMaxEntries = 4096
 )
 
 // The intervals are variables so a test can shrink them instead of waiting them out.
@@ -54,7 +62,10 @@ var (
 	probeMinIntervalPerNode      = 120 * time.Second
 	probeMinIntervalAfterFailure = 30 * time.Second
 	probeRecentFailureWindow     = 10 * time.Minute
-	probeHostBlindWindow         = 30 * time.Minute
+	probeTrimInterval            = time.Minute
+
+	hostBackoffWindow = time.Hour
+	hostBackoffTTL    = 30 * time.Minute
 )
 
 var (
@@ -65,6 +76,8 @@ var (
 	}
 
 	probeInflight = make(chan struct{}, probeMaxInflight)
+
+	hostBackoffTable hostBackoff
 )
 
 type VerdictAction uint8
@@ -81,6 +94,7 @@ type (
 		TTL            time.Duration
 		Reason         string
 		ControlSuccess bool
+		Unproven       bool
 	}
 
 	ProbeResult struct {
@@ -94,8 +108,10 @@ type (
 	}
 
 	probeNodeState struct {
-		lastProbe   time.Time
-		lastFailure time.Time
+		lastProbe     time.Time
+		lastFailure   time.Time
+		pendingSince  time.Time
+		unprovenSince time.Time
 	}
 
 	probeNodeKey struct {
@@ -108,18 +124,29 @@ type (
 		count int
 	}
 
-	probeHostState struct {
-		windowStart time.Time
-		answers     int
-		refusals    int
-		blindUntil  time.Time
+	ProbeThrottle struct {
+		mu       sync.Mutex
+		nodes    map[probeNodeKey]*probeNodeState
+		targets  map[string]*probeWindow
+		lastTrim time.Time
 	}
 
-	ProbeThrottle struct {
-		mu      sync.Mutex
-		nodes   map[probeNodeKey]*probeNodeState
-		targets map[string]*probeWindow
-		hosts   map[string]*probeHostState
+	hostBackoffKey struct {
+		config string
+		group  string
+		host   string
+	}
+
+	hostBackoffState struct {
+		nodes     map[string]int64
+		updated   int64
+		until     int64
+		probation bool
+	}
+
+	hostBackoff struct {
+		mu      sync.RWMutex
+		entries map[hostBackoffKey]hostBackoffState
 	}
 )
 
@@ -181,16 +208,16 @@ func ClassifyProbeError(err error) Verdict {
 	}
 	var hostnameErr x509.HostnameError
 	if errors.As(err, &hostnameErr) {
-		return record(probeDefaultBlockTTL, "certificate hostname mismatch")
+		return record(probeDefaultBlockTTL, ReasonCertHostname)
 	}
 	var authorityErr x509.UnknownAuthorityError
 	if errors.As(err, &authorityErr) {
-		return record(probeDefaultBlockTTL, "unknown certificate authority")
+		return record(probeDefaultBlockTTL, ReasonCertAuthority)
 	}
 	if isTimeout(err) {
 		return record(probeTransientBlockTTL, "probe timed out")
 	}
-	return ignore("probe failed")
+	return unproven("probe failed")
 }
 
 // A cancelled probe means the group is shutting down, not that the node timed out.
@@ -267,6 +294,10 @@ func ignore(reason string) Verdict {
 	return Verdict{Action: VerdictIgnore, Reason: reason}
 }
 
+func unproven(reason string) Verdict {
+	return Verdict{Action: VerdictIgnore, Reason: reason, Unproven: true}
+}
+
 func reachable(reason string, controlSuccess bool) Verdict {
 	return Verdict{Action: VerdictReachable, Reason: reason, ControlSuccess: controlSuccess}
 }
@@ -285,8 +316,21 @@ func (t *ProbeThrottle) ensureMaps() {
 	if t.nodes == nil {
 		t.nodes = make(map[probeNodeKey]*probeNodeState)
 		t.targets = make(map[string]*probeWindow)
-		t.hosts = make(map[string]*probeHostState)
 	}
+}
+
+func (t *ProbeThrottle) nodeState(target, node string) *probeNodeState {
+	return t.nodes[probeNodeKey{target: target, node: node}]
+}
+
+func (t *ProbeThrottle) ensureNodeState(target, node string, now time.Time) *probeNodeState {
+	key := probeNodeKey{target: target, node: node}
+	state := t.nodes[key]
+	if state == nil {
+		state = &probeNodeState{lastProbe: now}
+		t.nodes[key] = state
+	}
+	return state
 }
 
 func (t *ProbeThrottle) AllowNode(target, node string, now time.Time) bool {
@@ -294,7 +338,11 @@ func (t *ProbeThrottle) AllowNode(target, node string, now time.Time) bool {
 	defer t.mu.Unlock()
 
 	t.ensureMaps()
-	t.trim(now)
+	if (len(t.nodes) > probeMaxEntries || len(t.targets) > probeMaxEntries) &&
+		(t.lastTrim.IsZero() || now.Sub(t.lastTrim) >= probeTrimInterval) {
+		t.trim(now)
+		t.lastTrim = now
+	}
 
 	key := probeNodeKey{target: target, node: node}
 	state := t.nodes[key]
@@ -326,54 +374,101 @@ func (t *ProbeThrottle) AllowNode(target, node string, now time.Time) bool {
 	return true
 }
 
-// A host that refuses every node without ever answering says nothing about a single node, so its
-// records are dropped while it stays blind; this keeps probe hostile hosts from draining the pool.
-func (t *ProbeThrottle) AllowHostRecord(host string, verdict Verdict, now time.Time) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.ensureMaps()
-	state := t.hosts[host]
-	if state == nil {
-		state = &probeHostState{windowStart: now}
-		t.hosts[host] = state
-	}
-	if now.Sub(state.windowStart) >= probeHostBlindWindow {
-		state.windowStart = now
-		state.answers = 0
-		state.refusals = 0
-	}
-
-	if verdict.Action == VerdictReachable {
-		state.answers++
-		state.refusals = 0
-		state.blindUntil = time.Time{}
+// hostRefusalEvidence: refusals that blame the host itself, not a per node quota.
+func hostRefusalEvidence(reason string) bool {
+	switch reason {
+	case ReasonRegionUnavailable, ReasonForbidden, ReasonOriginError, ReasonCertAuthority, ReasonCertHostname:
 		return true
 	}
-	if now.Before(state.blindUntil) {
+	return false
+}
+
+// NoteHostRefusal records a refusal, true while the host is held back.
+func NoteHostRefusal(config, group, host, node, reason string) bool {
+	if host == "" || node == "" || !hostRefusalEvidence(reason) {
 		return false
 	}
-	if state.answers > 0 {
+	now := time.Now()
+	nowNano := now.UnixNano()
+
+	hostBackoffTable.mu.Lock()
+	defer hostBackoffTable.mu.Unlock()
+
+	if hostBackoffTable.entries == nil {
+		hostBackoffTable.entries = make(map[hostBackoffKey]hostBackoffState)
+	}
+	key := hostBackoffKey{config: config, group: group, host: host}
+	state, exists := hostBackoffTable.entries[key]
+	if state.until > nowNano {
+		log.Debugln("[Smart] Host backoff [%s] node [%s] dropped (%s)", host, node, reason)
 		return true
 	}
-	state.refusals++
-	if state.refusals >= probeHostBlindThreshold {
-		state.blindUntil = now.Add(probeHostBlindWindow)
+	if state.probation {
+		state.probation = false
+		state.nodes = nil
+		state.updated = nowNano
+		state.until = now.Add(hostBackoffTTL).UnixNano()
+		hostBackoffTable.entries[key] = state
+		log.Debugln("[Smart] Host backoff [%s] node [%s] re-armed (%s)", host, node, reason)
+		return true
+	}
+	if !exists && len(hostBackoffTable.entries) >= hostBackoffMaxEntries {
+		hostBackoffTable.pruneLocked(nowNano)
+		if len(hostBackoffTable.entries) >= hostBackoffMaxEntries {
+			return false
+		}
+	}
+	if state.nodes == nil {
+		state.nodes = make(map[string]int64)
+	}
+	state.nodes[node] = nowNano
+	for seen, at := range state.nodes {
+		if nowNano-at > int64(hostBackoffWindow) {
+			delete(state.nodes, seen)
+		}
+	}
+	state.updated = nowNano
+	if len(state.nodes) < hostBackoffMinNodes {
+		hostBackoffTable.entries[key] = state
 		return false
 	}
+	state.nodes = nil
+	state.probation = true
+	state.until = now.Add(hostBackoffTTL).UnixNano()
+	hostBackoffTable.entries[key] = state
+	log.Debugln("[Smart] Host backoff [%s] node [%s] raised (%s)", host, node, reason)
 	return true
 }
 
-// Blind reports a host that refuses every node without ever answering: probing it further
-// only spends the probe budget, so the caller may wait for the blind window to pass.
-func (t *ProbeThrottle) Blind(host string, now time.Time) bool {
+// HostBackedOff reports a held host; an answer drops its evidence and the ttl expires it.
+func HostBackedOff(config, group, host string) bool {
 	if host == "" {
 		return false
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	state := t.hosts[host]
-	return state != nil && now.Before(state.blindUntil)
+	nowNano := time.Now().UnixNano()
+	hostBackoffTable.mu.RLock()
+	defer hostBackoffTable.mu.RUnlock()
+	return hostBackoffTable.entries[hostBackoffKey{config: config, group: group, host: host}].until > nowNano
+}
+
+// NoteHostAnswer drops the evidence once a node serves the host, failures start fresh.
+func NoteHostAnswer(config, group, host string) {
+	if host == "" {
+		return
+	}
+	hostBackoffTable.mu.Lock()
+	defer hostBackoffTable.mu.Unlock()
+	if hostBackoffTable.entries != nil {
+		delete(hostBackoffTable.entries, hostBackoffKey{config: config, group: group, host: host})
+	}
+}
+
+func (t *hostBackoff) pruneLocked(nowNano int64) {
+	for key, state := range t.entries {
+		if nowNano-state.updated > int64(hostBackoffWindow) {
+			delete(t.entries, key)
+		}
+	}
 }
 
 func (t *ProbeThrottle) NoteFailure(target, node string, now time.Time) {
@@ -391,6 +486,63 @@ func (t *ProbeThrottle) NoteFailure(target, node string, now time.Time) {
 	state.lastFailure = now
 }
 
+func (t *ProbeThrottle) MarkPending(target, node string, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.ensureMaps()
+
+	state := t.ensureNodeState(target, node, now)
+	state.pendingSince = now
+	state.unprovenSince = time.Time{}
+}
+
+func (t *ProbeThrottle) ClearPending(target, node string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if state := t.nodeState(target, node); state != nil {
+		state.pendingSince = time.Time{}
+	}
+}
+
+func (t *ProbeThrottle) PendingFor(target, node string, now time.Time) time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	state := t.nodeState(target, node)
+	if state == nil || state.pendingSince.IsZero() {
+		return 0
+	}
+	return now.Sub(state.pendingSince)
+}
+
+func (t *ProbeThrottle) MarkUnproven(target, node string, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.ensureMaps()
+
+	t.ensureNodeState(target, node, now).unprovenSince = now
+}
+
+func (t *ProbeThrottle) ClearUnproven(target, node string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if state := t.nodeState(target, node); state != nil {
+		state.unprovenSince = time.Time{}
+	}
+}
+
+func (t *ProbeThrottle) Unproven(target, node string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	state := t.nodeState(target, node)
+	return state != nil && !state.unprovenSince.IsZero()
+}
+
 func (t *ProbeThrottle) trim(now time.Time) {
 	if len(t.nodes) > probeMaxEntries {
 		for key, state := range t.nodes {
@@ -403,13 +555,6 @@ func (t *ProbeThrottle) trim(now time.Time) {
 		for target, window := range t.targets {
 			if now.Sub(window.start) >= time.Minute {
 				delete(t.targets, target)
-			}
-		}
-	}
-	if len(t.hosts) > probeMaxEntries {
-		for host, state := range t.hosts {
-			if now.Sub(state.windowStart) >= probeHostBlindWindow {
-				delete(t.hosts, host)
 			}
 		}
 	}

@@ -112,9 +112,10 @@ func TestHostStatusSaveCopySharesNothingWithTheLiveRecord(t *testing.T) {
 		Blocked:   true,
 		Codes: map[BlockCode]*CodeNodeSet{
 			BlockNoResponse: {
-				Nodes:      map[string]int64{"node-a": 100},
-				FailCounts: map[string]int{"node-a": 2},
-				NodeHosts:  map[string]string{"node-a": "probe.example.com"},
+				Nodes:         map[string]int64{"node-a": 100},
+				FailCounts:    map[string]int{"node-a": 2},
+				Confirmations: map[string]int{"node-a": 3},
+				NodeHosts:     map[string]string{"node-a": "probe.example.com"},
 			},
 			BlockManual: nil,
 		},
@@ -130,11 +131,14 @@ func TestHostStatusSaveCopySharesNothingWithTheLiveRecord(t *testing.T) {
 
 	live.Codes[BlockNoResponse].Nodes["node-a"] = 999
 	live.Codes[BlockNoResponse].FailCounts["node-a"] = 99
+	live.Codes[BlockNoResponse].Confirmations["node-a"] = 99
 	live.Codes[BlockNoResponse].NodeHosts["node-a"] = "elsewhere"
 	require.Equal(t, int64(100), saved.Codes[BlockNoResponse].Nodes["node-a"],
 		"the copy shares its Nodes map with the live record")
 	require.Equal(t, 2, saved.Codes[BlockNoResponse].FailCounts["node-a"],
 		"the copy shares its FailCounts map with the live record")
+	require.Equal(t, 3, saved.Codes[BlockNoResponse].Confirmations["node-a"],
+		"the copy shares its Confirmations map with the live record")
 	require.Equal(t, "probe.example.com", saved.Codes[BlockNoResponse].NodeHosts["node-a"],
 		"the copy shares its NodeHosts map with the live record")
 }

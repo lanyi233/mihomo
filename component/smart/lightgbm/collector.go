@@ -3,6 +3,7 @@ package lightgbm
 import (
 	"encoding/csv"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -198,18 +199,22 @@ func (c *DataCollector) initializeWriter() error {
 	if fileExists {
 		f, err := os.Open(c.dataPath)
 		if err == nil {
-			defer f.Close()
 			reader := csv.NewReader(f)
 			headers, err := reader.Read()
+			f.Close()
 			if err == nil {
-				hasMax := false
+				hasRate, hasExit, hasExitASN := false, false, false
 				for _, h := range headers {
-					if h == "cumul_loss_rate" {
-						hasMax = true
-						break
+					switch h {
+					case "cumul_loss_rate":
+						hasRate = true
+					case "exit_region":
+						hasExit = true
+					case "exit_asn_hash":
+						hasExitASN = true
 					}
 				}
-				if !hasMax {
+				if !hasRate || !hasExit || !hasExitASN {
 					needUpgrade = true
 				}
 			}
@@ -218,8 +223,10 @@ func (c *DataCollector) initializeWriter() error {
 
 	if needUpgrade {
 		backupPath := c.dataPath + ".bak." + time.Now().Format("20060102150405")
-		os.Rename(c.dataPath, backupPath)
-		log.Infoln("[Smart] Old CSV file does not contain hash columns, backup to %s and create new file", backupPath)
+		if err := os.Rename(c.dataPath, backupPath); err != nil {
+			return fmt.Errorf("back up CSV before feature schema upgrade: %w", err)
+		}
+		log.Infoln("[Smart] Old CSV file does not match the feature schema, backup to %s and create new file", backupPath)
 		fileExists = false
 	}
 
@@ -276,6 +283,7 @@ func (c *DataCollector) initializeWriter() error {
 			"port_feature",
 			"traffic_ratio", "traffic_density", "connection_type_feature",
 			"asn_hash", "host_hash", "ip_hash", "geoip_hash",
+			"exit_region", "exit_asn_hash",
 			"group_name", "node_name",
 			"asn_raw", "host_raw", "ip_raw", "port_raw", "geoip_raw",
 			"weight", "weight_source", "timestamp",

@@ -290,6 +290,11 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 
 	satisfied = resp != nil && (expectedStatus == nil || expectedStatus.Check(uint16(resp.StatusCode)))
 	t = uint16(time.Since(start) / time.Millisecond)
+	if t == 0 {
+		// a zero delay means a failed test to callers, so report a test
+		// that completed in under a millisecond as 1 ms
+		t = 1
+	}
 	return
 }
 
@@ -413,7 +418,7 @@ func (p *Proxy) ExitProbe(ctx context.Context, wantASN bool) (*smart.ExitProbeRe
 		if ctx.Err() != nil {
 			break
 		}
-		result, err := p.exitProbe(ctx, rawURL, wantASN)
+		result, err := p.exitProbe(ctx, rawURL, wantASN, false)
 		if err != nil {
 			lastErr = fmt.Errorf("%s: %w", rawURL, err)
 			continue
@@ -426,15 +431,25 @@ func (p *Proxy) ExitProbe(ctx context.Context, wantASN bool) (*smart.ExitProbeRe
 	return nil, lastErr
 }
 
-func (p *Proxy) exitProbe(ctx context.Context, rawURL string, wantASN bool) (*smart.ExitProbeResult, error) {
+func (p *Proxy) TargetExitProbe(ctx context.Context, host string, wantASN bool) (*smart.ExitProbeResult, error) {
+	if host == "" {
+		return nil, errors.New("empty target host")
+	}
+	return p.exitProbe(ctx, "https://"+host+"/cdn-cgi/trace", wantASN, true)
+}
+
+func (p *Proxy) exitProbe(ctx context.Context, rawURL string, wantASN bool, followOffHost bool) (*smart.ExitProbeResult, error) {
 	header := http.Header{}
 	header.Set("Accept-Encoding", "identity")
 
 	checkRedirect := func(req *http.Request, via []*http.Request) error {
-		if !sameHostPort(req.URL, via[0].URL) {
-			return http.ErrUseLastResponse
+		if sameHostPort(req.URL, via[len(via)-1].URL) {
+			return nil
 		}
-		return nil
+		if followOffHost && len(via) == 1 {
+			return nil
+		}
+		return http.ErrUseLastResponse
 	}
 
 	resp, transport, err := p.statusRequest(ctx, rawURL, header, checkRedirect)
@@ -447,7 +462,7 @@ func (p *Proxy) exitProbe(ctx context.Context, rawURL string, wantASN bool) (*sm
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("exit trace answered %d", resp.StatusCode)
+		return nil, &smart.TraceUnanswerableError{Reason: fmt.Sprintf("exit trace answered %d", resp.StatusCode)}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, smart.ExitProbeBodyLimit))
 	if err != nil {
@@ -455,9 +470,8 @@ func (p *Proxy) exitProbe(ctx context.Context, rawURL string, wantASN bool) (*sm
 	}
 	region, ip := smart.ParseExitAnswer(body)
 	if region == "" {
-		return nil, errors.New("exit trace has no region")
+		return nil, &smart.TraceUnanswerableError{Reason: "exit trace has no region"}
 	}
-
 	result := &smart.ExitProbeResult{Region: region}
 	if ip.IsValid() {
 		result.Key = smart.ExitKey(ip)

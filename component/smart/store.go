@@ -33,6 +33,9 @@ const (
 
 	WeightTypeTCP = "tcp"
 	WeightTypeUDP = "udp"
+
+	// netScopePrefix marks a target key that stores a network scoped record.
+	netScopePrefix = "udp|"
 )
 
 const (
@@ -113,6 +116,17 @@ func FormatDBKey(parts ...string) string {
 		}
 	}
 	return b.String()
+}
+
+func NetScopedTarget(target string, udp bool) string {
+	if !udp || target == "" {
+		return target
+	}
+	return netScopePrefix + target
+}
+
+func isNetScopedTarget(target string) bool {
+	return strings.HasPrefix(target, netScopePrefix)
 }
 
 func formatOperationKey(op *StoreOperation) string {
