@@ -37,7 +37,7 @@ var _ dnsClient = (*dhcpClient)(nil)
 // Address implements dnsClient
 func (d *dhcpClient) Address() string {
 	addrs := make([]string, 0)
-	for _, c := range d.clients {
+	for _, c := range d.currentClients() {
 		addrs = append(addrs, c.Address())
 	}
 	return strings.Join(addrs, ",")
@@ -54,9 +54,17 @@ func (d *dhcpClient) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg,
 }
 
 func (d *dhcpClient) ResetConnection() {
-	for _, client := range d.clients {
+	for _, client := range d.currentClients() {
 		client.ResetConnection()
 	}
+}
+
+func (d *dhcpClient) currentClients() []dnsClient {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	// Published slices are immutable; take the snapshot under the same lock
+	// used when a DHCP refresh replaces it, then call clients without it.
+	return d.clients
 }
 
 func (d *dhcpClient) resolve(ctx context.Context) ([]dnsClient, error) {
@@ -97,6 +105,11 @@ func (d *dhcpClient) resolve(ctx context.Context) ([]dnsClient, error) {
 			d.done = nil
 			d.clients = res
 			d.err = err
+			if err != nil {
+				// Retry after the interface check interval, rather than caching
+				// a transient DHCP failure for the full one-hour lease.
+				d.dnsInvalidate = time.Time{}
+			}
 		}()
 	}
 
@@ -125,6 +138,11 @@ func (d *dhcpClient) resolve(ctx context.Context) ([]dnsClient, error) {
 }
 
 func (d *dhcpClient) invalidate() (bool, error) {
+	if d.done != nil {
+		// An in-flight refresh owns the lease deadline until it publishes
+		// its result. Concurrent queries must not extend that deadline.
+		return false, nil
+	}
 	if time.Now().Before(d.ifaceInvalidate) {
 		return false, nil
 	}
@@ -148,7 +166,7 @@ func (d *dhcpClient) invalidate() (bool, error) {
 	d.dnsInvalidate = time.Now().Add(DHCPTTL)
 	d.ifaceAddr = addr
 
-	return d.done == nil, nil
+	return true, nil
 }
 
 func newDHCPClient(ifaceName string) *dhcpClient {

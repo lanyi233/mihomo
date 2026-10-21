@@ -11,13 +11,16 @@ import E "github.com/metacubex/sing/common/exceptions"
 // contract between them. Adding a key means adding it in both places --
 // abi.h's _Static_assert pins the C side to itself, and TCStats checks this
 // count against the map the kernel actually created.
-const tcStatCount = 4
+const tcStatCount = 7
 
 const (
 	tcStatListenerSocketMissing uint32 = iota
 	tcStatSKAssignFailed
 	tcStatAssignmentUpdateFailed
 	tcStatDeliveryRewriteFailed
+	tcStatReturnUpdateFailed
+	tcStatReturnConflict
+	tcStatReturnLookupFailed
 )
 
 // TCStats is one reading of every tc_stats counter. The counters are lifetime
@@ -31,6 +34,9 @@ type TCStats struct {
 	ListenerSocketMissing  uint64
 	SKAssignFailed         uint64
 	AssignmentUpdateFailed uint64
+	ReturnUpdateFailed     uint64
+	ReturnConflict         uint64
+	ReturnLookupFailed     uint64
 	DeliveryRewriteFailed  uint64
 }
 
@@ -75,5 +81,8 @@ func (b *TCBackend) TCStats() (TCStats, error) {
 		SKAssignFailed:         totals[tcStatSKAssignFailed],
 		AssignmentUpdateFailed: totals[tcStatAssignmentUpdateFailed],
 		DeliveryRewriteFailed:  totals[tcStatDeliveryRewriteFailed],
+		ReturnUpdateFailed:     totals[tcStatReturnUpdateFailed],
+		ReturnConflict:         totals[tcStatReturnConflict],
+		ReturnLookupFailed:     totals[tcStatReturnLookupFailed],
 	}, nil
 }

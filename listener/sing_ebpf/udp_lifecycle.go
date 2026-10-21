@@ -139,7 +139,7 @@ func (t *sharedUDPClientTable) expireBatch(cutoff int64, all bool, progress *udp
 		t.deleteShared)
 }
 func (i *Inbound) startUDPJanitor() {
-	if !i.enableUDP {
+	if !i.enableUDP && i.tcBackend() == nil {
 		return
 	}
 	parent := i.ctx
@@ -232,7 +232,18 @@ func (i *Inbound) expireUDP(cutoff int64, round *udpSweepRound) bool {
 	recoveryPending := false
 	if backend := i.cgroupBackendInstance(); backend != nil {
 		complete, err := backend.SweepUDPRecovery(udpIdleSweepBudget)
+		if err != nil {
+			i.udpWarnings.cleanup.warn(i.logWarn, "sweep eBPF UDP recovery: ", err)
+		}
 		recoveryPending = err == nil && !complete
+	}
+	if backend := i.tcBackend(); backend != nil {
+		result, err := backend.SweepAssignments(i.udpTimeoutValue(), udpIdleSweepBudget)
+		if err != nil {
+			i.udpWarnings.cleanup.warn(i.logWarn, "sweep TC eBPF ", result.FailureMap, ": ", err)
+		} else {
+			recoveryPending = recoveryPending || !result.Complete
+		}
 	}
 	pending := round.local.more() || round.shared.more() || recoveryPending
 	if !pending {

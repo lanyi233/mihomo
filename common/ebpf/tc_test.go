@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"testing"
 	"unsafe"
@@ -27,8 +28,17 @@ func TestTCABI(t *testing.T) {
 	if size := unsafe.Sizeof(tcAssignKey{}); size != 44 {
 		t.Fatalf("unexpected TC assignment key size: %d", size)
 	}
-	if size := unsafe.Sizeof(TCAssignment{}); size != 32 {
+	if size := unsafe.Sizeof(TCAssignment{}); size != 40 {
 		t.Fatalf("unexpected TC assignment value size: %d", size)
+	}
+	if size := binary.Size(TCAssignment{}); size != 40 {
+		t.Fatalf("assignment batch encoding size = %d, want 40", size)
+	}
+	if offset := unsafe.Offsetof(TCAssignment{}.Generation); offset != 24 {
+		t.Fatalf("assignment generation offset = %d", offset)
+	}
+	if offset := unsafe.Offsetof(TCAssignment{}.LastSeenNS); offset != 32 {
+		t.Fatalf("assignment activity offset = %d", offset)
 	}
 	if offset := unsafe.Offsetof(TCAssignment{}.SocketCookie); offset != 0 {
 		t.Fatalf("unexpected TC assignment socket cookie offset: %d", offset)

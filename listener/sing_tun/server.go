@@ -370,10 +370,11 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			backgroundNetwork.SetAvailable(defaultInterface != nil)
 			if defaultInterface != nil {
 				log.Warnln("[TUN] default interface changed by monitor, => %s", defaultInterface.Name)
+				netchange.Notify()
 			} else {
 				log.Errorln("[TUN] default interface lost by monitor")
+				netchange.NotifyUnavailable()
 			}
-			netchange.Notify() // flush caches, reset resolver connections and re-probe providers
 		})
 		err = defaultInterfaceMonitor.Start()
 		if err != nil {

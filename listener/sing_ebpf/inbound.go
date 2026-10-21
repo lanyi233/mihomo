@@ -106,6 +106,8 @@ type Inbound struct {
 	selfBypassCgroup bool
 	processTracker   *ECommon.ProcessTracker
 
+	tcListeners       internalListenerSet
+	tcNamespace       *TCNamespace
 	listeners         internalListenerSet
 	udpClientTable    udpClientTable
 	udpReplySockets   udpReplySocketPool
@@ -118,7 +120,7 @@ type Inbound struct {
 	tcDataPlaneAccess   sync.RWMutex
 	interfaceMonitor    tcInterfaceMonitor
 	lifecycleAccess     sync.RWMutex
-	localRoutes         []*localRoute
+	localRoutes         *localRouteSet
 
 	sharedRewrite *sharedRewrite
 
@@ -171,7 +173,8 @@ type Inbound struct {
 	protectRegistered       bool
 	unregisterSocketProtect func()
 
-	closeOnce sync.Once
+	closeOnce   sync.Once
+	closeAccess sync.Mutex
 }
 
 type interfaceWarningLimiters struct {
@@ -179,6 +182,7 @@ type interfaceWarningLimiters struct {
 	topology         warningLimiter
 	defaultInterface warningLimiter
 	infrastructure   warningLimiter
+	redirectRoutes   warningLimiter
 	hostPolicy       warningLimiter
 	reconcile        warningLimiter
 	// bypassRuleSet covers the scheduler's retries of a failed bypass_rule_set
@@ -400,6 +404,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		_ = inbound.Close()
 		return nil, err
 	}
+	inbound.registerDiagnostics()
 	inbound.startUDPJanitor()
 	return inbound, nil
 }
@@ -483,6 +488,9 @@ func (i *Inbound) start() error {
 		}
 	}
 	if i.selfBypass != nil {
+		if err := i.selfBypass.Prepare(); err != nil {
+			return E.Cause(err, "prepare eBPF self-bypass sockets")
+		}
 		selfBypass := i.selfBypass
 		i.unregisterSocketProtect = dialer.RegisterSocketProtectFunc(func(_ context.Context, network, address string, rawConn syscall.RawConn) error {
 			return selfBypass.RegisterSocket(rawConn)
@@ -514,8 +522,26 @@ func (i *Inbound) start() error {
 	if sharedSocketAssignEnabled {
 		tcSharedInterfaces = sharedInterfaces
 	}
-	if i.localEnabled || sharedSocketAssignEnabled {
+	if i.localCgroupEnabled() {
 		if err := i.startTCListeners(); err != nil {
+			return err
+		}
+	}
+	if localTCEnabled || sharedSocketAssignEnabled {
+		var err error
+		i.tcNamespace, err = NewTCNamespace()
+		if err != nil {
+			return E.Cause(err, "create TC socket namespace")
+		}
+		err = i.tcListeners.start(i.enableTCP, i.enableUDP, true, i.localIPv6 || i.sharedIPv6, func(network string, ipv6 bool, port uint16) (current *internalListener, err error) {
+			err = i.tcNamespace.with(func() error {
+				var err error
+				current, err = newInternalListenerAt(i.socketControl(ipv6), network, ipv6, port, i, true)
+				return err
+			})
+			return
+		})
+		if err != nil {
 			return err
 		}
 	}
@@ -540,17 +566,19 @@ func (i *Inbound) start() error {
 	var dataPlane *tcDataPlane
 	if localTCEnabled || sharedSocketAssignEnabled {
 		backendConfig := ECommon.TCConfig{
-			ListenerPort:     i.listeners.selectedPort(),
-			EnableLocal:      localTCEnabled,
-			EnableShared:     sharedSocketAssignEnabled,
-			EnableIPv4:       true,
-			EnableLocalIPv6:  i.localIPv6,
-			EnableSharedIPv6: i.sharedIPv6,
-			EnableTCP:        i.enableTCP,
-			EnableUDP:        i.enableUDP,
-			Policy:           i.policySnapshot(),
-			TrackProcess:     i.processTracker != nil,
-			FakeIPICMPReply:  i.fakeIPICMPReply,
+			ListenerPort:       i.tcListeners.selectedPort(),
+			Isolated:           true,
+			AssignmentCapacity: max(i.localStateCapacity, i.sharedStateCapacity),
+			EnableLocal:        localTCEnabled,
+			EnableShared:       sharedSocketAssignEnabled,
+			EnableIPv4:         true,
+			EnableLocalIPv6:    i.localIPv6,
+			EnableSharedIPv6:   i.sharedIPv6,
+			EnableTCP:          i.enableTCP,
+			EnableUDP:          i.enableUDP,
+			Policy:             i.policySnapshot(),
+			TrackProcess:       i.processTracker != nil,
+			FakeIPICMPReply:    i.fakeIPICMPReply,
 		}
 		if i.selfBypass != nil {
 			backendConfig.SelfBypassMap = i.selfBypass.Map()
@@ -570,7 +598,7 @@ func (i *Inbound) start() error {
 		if err != nil {
 			return err
 		}
-		if err = i.listeners.registerTCTCPListeners(backend); err != nil {
+		if err = i.tcListeners.registerTCTCPListeners(backend); err != nil {
 			return E.Errors(err, backend.Close())
 		}
 		tcIPv6Enabled := localTCEnabled && i.localIPv6 || sharedSocketAssignEnabled && i.sharedIPv6
@@ -583,11 +611,12 @@ func (i *Inbound) start() error {
 			hostAddresses,
 			len(i.sharedIncludeMAC)+len(i.sharedExcludeMAC) > 0,
 			i.tcPriority,
+			i.tcNamespace,
 		)
+		i.setTCDataPlane(dataPlane)
 		if err != nil {
 			return err
 		}
-		i.setTCDataPlane(dataPlane)
 	}
 	if err := i.startBypassRuleSets(); err != nil {
 		return E.Cause(err, "initialize TC eBPF bypass_rule_set")
@@ -655,7 +684,7 @@ func (i *Inbound) logInboundReady(network, defaultInterface, localInterface stri
 		)
 		return
 	}
-	log.Infoln("[EBPF] TC active: mode=%s, network=%s, local_data_plane=%s, shared_data_plane=%s, default_interface=%s, local_interface=%s, shared_interfaces=[%s], listeners=[%s], tc_priority=%d, local_uid_include=%s, local_uid_exclude=%s",
+	log.Infoln("[EBPF] TC active: mode=%s, network=%s, local_data_plane=%s, shared_data_plane=%s, default_interface=%s, local_interface=%s, shared_interfaces=[%s], listeners=[%s], tc_listeners=[%s], tc_priority=%d, local_uid_include=%s, local_uid_exclude=%s",
 		i.mode,
 		network,
 		func() string {
@@ -674,6 +703,7 @@ func (i *Inbound) logInboundReady(network, defaultInterface, localInterface stri
 		localInterface,
 		joinStringList(sharedInterfaces),
 		i.listeners.String(),
+		i.tcListeners.String(),
 		i.tcPriority,
 		formatUIDRanges(i.localPolicy.IncludeUID),
 		formatUIDRanges(i.localPolicy.ExcludeUID),
@@ -846,12 +876,13 @@ func (i *Inbound) isCgroupRedirectAddress(address netip.Addr) bool {
 }
 
 func (i *Inbound) Close() error {
-	var closeErr error
+	i.closeAccess.Lock()
+	defer i.closeAccess.Unlock()
+	var monitorErr error
 	i.closeOnce.Do(func() {
+		i.unregisterDiagnostics()
 		i.stopUDPJanitor()
 		i.stopUDPRecoveryCleanup()
-		// Stopped and joined here, before anything below drops a backend or
-		// clears sharedRewrite: the reporter reads both without a lock.
 		i.stopDatapathReporter()
 		i.stopDNSRelays()
 		if i.protectRegistered {
@@ -862,43 +893,57 @@ func (i *Inbound) Close() error {
 			i.protectRegistered = false
 		}
 		i.stopFakeIPTracking()
-		monitorErr := i.stopTCInterfaceMonitor()
+		monitorErr = i.stopTCInterfaceMonitor()
 		i.stopBypassRuleSets()
-		// Remove only this inbound's contribution to the coexistence registry;
-		// another eBPF inbound may still be publishing.
 		i.bypassPublisher.Close()
-		var sharedRewriteErr error
-		if i.sharedRewrite != nil {
-			sharedRewriteErr = i.sharedRewrite.Close()
+	})
+	var sharedRewriteErr error
+	if i.sharedRewrite != nil {
+		sharedRewriteErr = i.sharedRewrite.Close()
+		if i.sharedRewrite.IsClosed() {
 			i.sharedRewrite = nil
 		}
-		dataPlane := i.takeTCDataPlane()
-		disableErr := dataPlane.disable()
-		cgroupBackend := i.takeCgroupBackend()
-		var cgroupErr error
-		if cgroupBackend != nil {
-			cgroupErr = cgroupBackend.Close()
+	}
+	dataPlane := i.takeTCDataPlane()
+	disableErr := dataPlane.disable()
+	cgroupBackend := i.takeCgroupBackend()
+	var cgroupErr error
+	if cgroupBackend != nil {
+		cgroupErr = cgroupBackend.Close()
+		if !cgroupBackend.IsClosed() {
+			i.setCgroupBackend(cgroupBackend)
 		}
-		listenerErr := i.listeners.close()
-		i.lifecycleAccess.Lock()
-		i.udpClientTable.expire(0, true)
-		i.lifecycleAccess.Unlock()
-		udpReplySocketErr := i.udpReplySockets.close()
-		dataPlaneErr := dataPlane.Close()
-		routeErr := i.removeLocalRoutes()
-		var processTrackerErr error
+	}
+	listenerErr := E.Errors(i.listeners.close(), i.tcListeners.close())
+	i.lifecycleAccess.Lock()
+	i.udpClientTable.expire(0, true)
+	i.lifecycleAccess.Unlock()
+	udpReplySocketErr := i.udpReplySockets.close()
+	dataPlaneErr := dataPlane.Close()
+	if !dataPlane.IsClosed() {
+		i.setTCDataPlane(dataPlane)
+	} else if i.tcNamespace != nil {
+		dataPlaneErr = E.Errors(dataPlaneErr, i.tcNamespace.Close())
+		i.tcNamespace = nil
+	}
+	routeErr := i.removeLocalRoutes()
+	var processTrackerErr, selfBypassErr error
+	// Backends can still use process metadata/self-bypass until detach succeeds.
+	if i.cgroupBackendInstance() == nil && i.tcBackend() == nil && i.sharedRewrite == nil {
 		if i.processTracker != nil {
 			processTrackerErr = i.processTracker.Close()
-			i.processTracker = nil
+			if i.processTracker.IsClosed() {
+				i.processTracker = nil
+			}
 		}
-		var selfBypassErr error
-		if i.selfBypass != nil {
+		if i.processTracker == nil && i.selfBypass != nil {
 			selfBypassErr = i.selfBypass.Close()
-			i.selfBypass = nil
+			if i.selfBypass.IsClosed() {
+				i.selfBypass = nil
+			}
 		}
-		closeErr = E.Errors(monitorErr, sharedRewriteErr, disableErr, listenerErr, udpReplySocketErr, dataPlaneErr, cgroupErr, routeErr, processTrackerErr, selfBypassErr)
-	})
-	return closeErr
+	}
+	return E.Errors(monitorErr, sharedRewriteErr, disableErr, listenerErr, udpReplySocketErr, dataPlaneErr, cgroupErr, routeErr, processTrackerErr, selfBypassErr)
 }
 
 func (i *Inbound) Address() string {
@@ -906,7 +951,7 @@ func (i *Inbound) Address() string {
 		return "eBPF(cgroup=" + i.cgroupBackendInstance().CgroupPath() + ", listen_port=" + fmt.Sprint(i.listeners.selectedPort()) + ")"
 	}
 	if i.tcDataPlane != nil {
-		return "eBPF(TC, listen_port=" + fmt.Sprint(i.listeners.selectedPort()) + ")"
+		return "eBPF(TC, listen_port=" + fmt.Sprint(i.tcListeners.selectedPort()) + ")"
 	}
 	return "eBPF"
 }

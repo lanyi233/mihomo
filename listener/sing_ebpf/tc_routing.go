@@ -474,21 +474,24 @@ func (r *tcPolicyRouting) Close() error {
 		return nil
 	}
 	var closeErr error
-	for index := range slices.Backward(r.rules) {
-		if err := netlink.RuleDel(r.rules[index]); !tcPolicyDeleteIgnored(err) {
-			closeErr = E.Errors(closeErr, err)
-		}
-	}
+	rules := r.rules
 	r.rules = nil
-	for index := range slices.Backward(r.routes) {
-		if err := netlink.RouteDel(&r.routes[index]); !tcPolicyDeleteIgnored(err) {
+	for _, rule := range slices.Backward(rules) {
+		if err := netlink.RuleDel(rule); !tcPolicyDeleteIgnored(err) {
 			closeErr = E.Errors(closeErr, err)
+			r.rules = append(r.rules, rule)
 		}
 	}
+	routes := r.routes
 	r.routes = nil
-	if r.lock != nil {
-		closeErr = E.Errors(closeErr, r.lock.Close())
-		r.lock = nil
+	for _, route := range slices.Backward(routes) {
+		if err := netlink.RouteDel(&route); !tcPolicyDeleteIgnored(err) {
+			closeErr = E.Errors(closeErr, err)
+			r.routes = append(r.routes, route)
+		}
 	}
-	return closeErr
+	if len(r.rules) != 0 || len(r.routes) != 0 {
+		return closeErr
+	}
+	return E.Errors(closeErr, closeOwned(&r.lock))
 }

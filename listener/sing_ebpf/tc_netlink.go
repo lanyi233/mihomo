@@ -5,7 +5,6 @@ package sing_ebpf
 import (
 	"errors"
 	"fmt"
-	"net"
 
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	E "github.com/metacubex/sing/common/exceptions"
@@ -14,18 +13,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func acquireTCInterfaceLock(interfaceName string, interfaceIndex int) (*net.UnixConn, error) {
-	connection, err := net.ListenUnixgram("unixgram", &net.UnixAddr{
-		Name: "@sing-box-ebpf-tc-" + fmt.Sprint(interfaceIndex),
-		Net:  "unixgram",
+func acquireTCInterfaceLock(interfaceName string, interfaceIndex int) (*ECommon.InstanceSlot, error) {
+	slot, err := ECommon.AcquireInstanceSlot(func(index int) string {
+		return ECommon.InstanceSlotName("@sing-box-ebpf-tc-"+fmt.Sprint(interfaceIndex), index)
 	})
 	if err != nil {
-		if errors.Is(err, unix.EADDRINUSE) {
-			return nil, E.New("interface ", interfaceName, " is already managed by another TC eBPF inbound")
-		}
-		return nil, E.Cause(err, "lock TC eBPF interface ", interfaceName)
+		return nil, E.Cause(err, "lock TC interface ", interfaceName)
 	}
-	return connection, nil
+	if err = reclaimTCSlotFilters(interfaceIndex, slot.Index()); err != nil {
+		return nil, E.Errors(err, slot.Close())
+	}
+	return slot, nil
 }
 
 func attachTCFilter(
@@ -35,7 +33,11 @@ func attachTCFilter(
 	programName string,
 	handle uint16,
 	priority uint16,
+	slots ...int,
 ) (*netlink.BpfFilter, error) {
+	if len(slots) > 0 {
+		programName, handle = tcSlotIdentity(programName, handle, slots[0])
+	}
 	if programFD < 0 {
 		return nil, E.New("TC eBPF program is unavailable")
 	}
@@ -80,7 +82,11 @@ func tcFilterAttached(
 	programName string,
 	handle uint16,
 	priority uint16,
+	slots ...int,
 ) (bool, error) {
+	if len(slots) > 0 {
+		programName, handle = tcSlotIdentity(programName, handle, slots[0])
+	}
 	filters, err := netlink.FilterList(link, parent)
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ESRCH) {
 		return false, nil

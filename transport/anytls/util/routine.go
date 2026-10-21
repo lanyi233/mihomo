@@ -15,13 +15,18 @@ func StartRoutine(ctx context.Context, d time.Duration, f func()) {
 				log.Errorln("[BUG] %v %s", r, string(debug.Stack()))
 			}
 		}()
+		timer := time.NewTimer(d)
+		defer timer.Stop()
 		for {
-			time.Sleep(d)
-			f()
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-timer.C:
+				if ctx.Err() != nil {
+					return
+				}
+				f()
+				timer.Reset(d)
 			}
 		}
 	}()

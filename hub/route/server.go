@@ -125,6 +125,7 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Get("/traffic", traffic)
 		r.Get("/memory", memory)
 		r.Get("/version", version)
+		addEBPFRoutes(r)
 		r.Mount("/configs", configRouter())
 		r.Mount("/proxies", proxyRouter())
 		r.Mount("/group", groupRouter())

@@ -24,8 +24,13 @@ func newTestAssignmentBackend(t *testing.T) *TCBackend {
 		t.Skipf("cannot create an assignment map: %v", err)
 	}
 	t.Cleanup(func() { _ = assignmentMap.Close() })
+	retired, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{Type: CiliumEBPF.LRUHash, KeySize: 56, ValueSize: 1, MaxEntries: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = retired.Close() })
 	backend := &TCBackend{}
-	backend.runtime = &tcRuntime{maps: map[string]*CiliumEBPF.Map{"tc_assignment": assignmentMap}}
+	backend.runtime = &tcRuntime{maps: map[string]*CiliumEBPF.Map{"tc_assignment": assignmentMap, "tc_retired_assignment": retired}}
 	backend.assignmentMapFD = assignmentMap.FD()
 	return backend
 }

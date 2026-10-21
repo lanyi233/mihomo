@@ -56,6 +56,7 @@ type udpClientState struct {
 }
 
 type udpRedirectBinding struct {
+	returnHandle    commonEBPF.TCReturnHandle
 	retireTC        func()
 	replyAlias      bool
 	redirectAddress netip.Addr
@@ -161,21 +162,32 @@ func (t *udpClientTable) setDirectBinding(
 	socketCookie uint64,
 	sharedPath bool,
 	retireTC func(),
+	handles ...commonEBPF.TCReturnHandle,
 ) {
 	state := t.loadOrCreate(client)
 	state.access.Lock()
-	defer state.access.Unlock()
+
 	if len(sourceMAC) > 0 {
 		state.sourceMAC = append(state.sourceMAC[:0], sourceMAC...)
 	}
 	state.socketCookie = socketCookie
-	state.bindings[destination] = udpRedirectBinding{sharedPath: sharedPath, retireTC: retireTC}
+	previous := state.bindings[destination]
+	binding := udpRedirectBinding{sharedPath: sharedPath, retireTC: retireTC}
+	if len(handles) > 0 {
+		binding.returnHandle = handles[0]
+	}
+	state.bindings[destination] = binding
+	state.access.Unlock()
+	if previous.retireTC != nil {
+		previous.retireTC()
+	}
 }
 
 func (t *udpClientTable) setDirectReplyBinding(
 	client netip.AddrPort,
 	expected *udpClientState,
 	destination netip.AddrPort,
+	handles ...commonEBPF.TCReturnHandle,
 ) bool {
 	shard := t.clientShard(client)
 	shard.access.RLock()
@@ -189,12 +201,20 @@ func (t *udpClientTable) setDirectReplyBinding(
 		return false
 	}
 	if _, loaded := expected.bindings[destination]; loaded {
+		if len(handles) > 0 {
+			handles[0].Release()
+		}
 		return true
 	}
 	if expected.replyAliasCount >= udpReplyAliasLimit {
 		return false
 	}
-	expected.bindings[destination] = udpRedirectBinding{replyAlias: true}
+	binding := udpRedirectBinding{replyAlias: true}
+	if len(handles) > 0 {
+		binding.returnHandle = handles[0]
+		binding.retireTC = handles[0].Release
+	}
+	expected.bindings[destination] = binding
 	expected.replyAliasCount++
 	return true
 }
@@ -202,8 +222,8 @@ func (t *udpClientTable) setDirectReplyBinding(
 func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState) []netip.Addr {
 	shard := t.clientShard(client)
 	shard.access.Lock()
-	defer shard.access.Unlock()
 	if shard.clients[client] != expected {
+		shard.access.Unlock()
 		return nil
 	}
 	delete(shard.clients, client)
@@ -214,9 +234,10 @@ func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState)
 		redirects = append(redirects, address)
 	}
 	expected.closed = true
+	var retire []func()
 	for _, binding := range expected.bindings {
 		if binding.retireTC != nil {
-			binding.retireTC()
+			retire = append(retire, binding.retireTC)
 		}
 	}
 	clear(expected.bindings)
@@ -224,6 +245,10 @@ func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState)
 	expected.cgroupDataPlane = false
 	expected.replyAliasCount = 0
 	expected.access.Unlock()
+	shard.access.Unlock()
+	for _, release := range retire {
+		release()
+	}
 	return redirects
 }
 
@@ -561,4 +586,15 @@ func (s *udpClientState) replyBinding(destination netip.AddrPort) (udpRedirectBi
 	cgroupDataPlane := s.cgroupDataPlane
 	s.access.RUnlock()
 	return binding, loaded, cgroupDataPlane
+}
+
+func (s *udpClientState) returnRoute(ipv4 bool) commonEBPF.TCReturnHandle {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	for address, binding := range s.bindings {
+		if address.Addr().Is4() == ipv4 && binding.returnHandle.IsValid() {
+			return binding.returnHandle
+		}
+	}
+	return commonEBPF.TCReturnHandle{}
 }

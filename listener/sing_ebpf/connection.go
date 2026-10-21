@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"syscall"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
@@ -117,6 +118,14 @@ func (i *Inbound) newTCConnection(backend *ECommon.TCBackend, conn net.Conn, des
 		_ = conn.Close()
 		return
 	}
+	if backend.Isolated() {
+		handle, err := backend.AcquireReturnRoute(ECommon.ProtocolTCP, source, destination)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		conn = &tcReturnConn{Conn: conn, handle: handle}
+	}
 	if i.hijackTCDNS(destination, assignment.Path == ECommon.TCPathShared) {
 		i.startTCPDNSRelay(conn)
 		return
@@ -204,6 +213,9 @@ func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, destinati
 		return
 	}
 	client := source
+	if backend.Isolated() {
+		interfaceIndex = 0
+	}
 	// The assignment record only carries per-flow facts (source MAC, socket
 	// cookie, path), so it is read once per client/destination pair. Every
 	// later packet of the flow skips the map syscall and the state write.
@@ -224,9 +236,21 @@ func (i *Inbound) newTCPacket(backend *ECommon.TCBackend, data []byte, destinati
 		if sharedPath && assignment.SourceMACValid != 0 {
 			sourceMAC = net.HardwareAddr(assignment.SourceMAC[:])
 		}
+		var handle ECommon.TCReturnHandle
+		if backend.Isolated() {
+			handle, err = backend.AcquireReturnRoute(ECommon.ProtocolUDP, client, destination)
+			if err != nil {
+				i.udpWarnings.cleanup.warn(i.logWarn, "retain TC UDP return route: ", err)
+				_ = pool.Put(data)
+				return
+			}
+		}
 		i.udpClientTable.setDirectBinding(client, destination, sourceMAC, assignment.SocketCookie, sharedPath, func() {
-			_ = backend.DeleteUDPAssignment(client, destination, interfaceIndex, assignment)
-		})
+			handle.Release()
+			if err := backend.DeleteUDPAssignment(client, destination, interfaceIndex, assignment); err != nil {
+				i.udpWarnings.cleanup.warn(i.logWarn, "retire TC UDP assignment: ", err)
+			}
+		}, handle)
 	}
 	if i.hijackTCDNS(destination, sharedPath) {
 		clientState := i.udpClientTable.loadOrCreate(client)
@@ -353,7 +377,19 @@ func (i *Inbound) writeUDPReply(client netip.AddrPort, clientState *udpClientSta
 		if !clientState.hasAddressFamily(destinationAddress.Addr().Is4()) {
 			return E.New("eBPF UDP reply alias limit reached or address family unavailable")
 		}
-		installed := i.udpClientTable.setDirectReplyBinding(client, clientState, destinationAddress)
+		var handle ECommon.TCReturnHandle
+		if backend := i.tcBackend(); backend != nil && backend.Isolated() {
+			original := clientState.returnRoute(destinationAddress.Addr().Is4())
+			var err error
+			handle, err = backend.AcquireReplyRoute(original, destinationAddress)
+			if err != nil {
+				return err
+			}
+		}
+		installed := i.udpClientTable.setDirectReplyBinding(client, clientState, destinationAddress, handle)
+		if !installed {
+			handle.Release()
+		}
 		if !installed {
 			return E.New("eBPF UDP session closed or reply alias was rejected")
 		}
@@ -396,24 +432,36 @@ func (p *udpPacket) LocalAddr() net.Addr {
 
 var _ C.UDPPacket = (*udpPacket)(nil)
 
-func (i *Inbound) newTCUDPReplySocket(source netip.AddrPort) (*net.UDPConn, error) {
+func (i *Inbound) newTCUDPReplySocket(source netip.AddrPort) (socket *net.UDPConn, err error) {
+	if i.tcNamespace == nil {
+		return i.newTCUDPReplySocketInNamespace(source)
+	}
+	err = i.tcNamespace.with(func() error { var err error; socket, err = i.newTCUDPReplySocketInNamespace(source); return err })
+	return
+}
+func (i *Inbound) newTCUDPReplySocketInNamespace(source netip.AddrPort) (*net.UDPConn, error) {
 	network := "udp6"
 	if source.Addr().Is4() {
 		network = "udp4"
 	}
 	listenConfig := net.ListenConfig{Control: func(_ string, _ string, rawConn syscall.RawConn) error {
+		var optionErr error
 		if err := rawConn.Control(func(fd uintptr) {
-			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			if optionErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); optionErr != nil {
 				return
 			}
 			if source.Addr().Is4() {
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
+				optionErr = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
 			} else {
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1)
-				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1)
+				if optionErr = unix.SetsockoptInt(int(fd), unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1); optionErr == nil {
+					optionErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1)
+				}
 			}
 		}); err != nil {
 			return err
+		}
+		if optionErr != nil {
+			return optionErr
 		}
 		if i.selfBypass != nil {
 			return i.selfBypass.RegisterSocket(rawConn)
@@ -474,3 +522,19 @@ func packetDestinationsFromOOB(oob []byte) (netip.Addr, netip.AddrPort, uint32, 
 	}
 	return packetAddress, originalDestination, interfaceIndex, nil
 }
+
+type tcReturnConn struct {
+	net.Conn
+	handle ECommon.TCReturnHandle
+	once   sync.Once
+}
+
+func (c *tcReturnConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.handle.Release)
+	return err
+}
+func (c *tcReturnConn) Upstream() any { return c.Conn }
+
+func (c *tcReturnConn) ReaderReplaceable() bool { return true }
+func (c *tcReturnConn) WriterReplaceable() bool { return true }

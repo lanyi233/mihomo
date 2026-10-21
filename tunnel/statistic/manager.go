@@ -1,6 +1,7 @@
 package statistic
 
 import (
+	"context"
 	"os"
 	"sync"
 	"time"
@@ -21,9 +22,10 @@ func init() {
 		uploadTotal:   atomic.NewInt64(0),
 		downloadTotal: atomic.NewInt64(0),
 		pid:           int32(os.Getpid()),
+		trafficWake:   make(chan struct{}, 1),
 	}
 
-	go DefaultManager.handle()
+	go DefaultManager.handle(context.Background(), time.Second)
 }
 
 type Manager struct {
@@ -39,6 +41,8 @@ type Manager struct {
 	memory        atomic.Uint64
 	memoryMu      sync.Mutex
 	memoryUpdated time.Time
+	trafficActive atomic.Bool
+	trafficWake   chan struct{}
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -67,11 +71,17 @@ func (m *Manager) Range(f func(c Tracker) bool) {
 func (m *Manager) PushUploaded(size int64) {
 	m.uploadTemp.Add(size)
 	m.uploadTotal.Add(size)
+	if size != 0 {
+		m.wakeTraffic()
+	}
 }
 
 func (m *Manager) PushDownloaded(size int64) {
 	m.downloadTemp.Add(size)
 	m.downloadTotal.Add(size)
+	if size != 0 {
+		m.wakeTraffic()
+	}
 }
 
 func (m *Manager) Now() (up int64, down int64) {
@@ -126,12 +136,45 @@ func (m *Manager) ResetStatistic() {
 	m.downloadTotal.Store(0)
 }
 
-func (m *Manager) handle() {
-	ticker := time.NewTicker(time.Second)
+func (m *Manager) wakeTraffic() {
+	if m.trafficWake != nil && !m.trafficActive.Load() && m.trafficActive.CompareAndSwap(false, true) {
+		select {
+		case m.trafficWake <- struct{}{}:
+		default:
+		}
+	}
+}
 
-	for range ticker.C {
-		m.uploadBlip.Store(m.uploadTemp.Swap(0))
-		m.downloadBlip.Store(m.downloadTemp.Swap(0))
+func (m *Manager) handle(ctx context.Context, interval time.Duration) {
+	timer := time.NewTimer(interval)
+	timer.Stop()
+	defer timer.Stop()
+	var tick <-chan time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.trafficWake:
+			if tick == nil {
+				timer.Reset(interval)
+				tick = timer.C
+			}
+		case <-tick:
+			up, down := m.uploadTemp.Swap(0), m.downloadTemp.Swap(0)
+			m.uploadBlip.Store(up)
+			m.downloadBlip.Store(down)
+			if up != 0 || down != 0 {
+				timer.Reset(interval)
+				continue
+			}
+			// Publish dormancy before checking for traffic that raced the
+			// swaps. A writer either wakes us itself or is caught here.
+			tick = nil
+			m.trafficActive.Store(false)
+			if m.uploadTemp.Load() != 0 || m.downloadTemp.Load() != 0 {
+				m.wakeTraffic()
+			}
+		}
 	}
 }
 

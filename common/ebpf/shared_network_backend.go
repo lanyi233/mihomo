@@ -45,6 +45,7 @@ type sharedNetworkRuntime struct {
 }
 
 type SharedNetworkBackend struct {
+	maintenance         mapMaintenanceState
 	access              sync.RWMutex
 	health              backendHealth
 	flowAccess          sync.Mutex
@@ -55,6 +56,8 @@ type SharedNetworkBackend struct {
 	flowWake            chan struct{}
 	flowSweepAccess     sync.Mutex
 	flowSweepScratch    mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]
+	flowPurgeScratch    mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]
+	flowPurgeInterface  uint32
 	flowSweepCandidates []sharedNetworkFlowEntry
 	flowSweepRemoved    uint32
 	runtime             *sharedNetworkRuntime
@@ -170,7 +173,9 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 			verifierErrorStage(err),
 			err,
 		)
-		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
+		if errors.Is(err, unix.EPERM) {
+			prepareErr = explainBPFPermissionError(prepareErr, memlockErr)
+		} else if memlockErr != nil && errors.Is(err, unix.ENOMEM) {
 			prepareErr = E.Errors(prepareErr, E.Cause(memlockErr, "remove memlock limit"))
 		}
 		return nil, prepareErr
@@ -497,8 +502,8 @@ func (b *SharedNetworkBackend) KnownFlowUsage() MapUsage {
 }
 
 // RequestMaintenance wakes the shared flow janitor without introducing a
-// polling interval. It is used to continue bounded scans after a partial map
-// traversal.
+// polling interval. The janitor coalesces requests while a bounded scan or
+// pressure check is already scheduled.
 func (b *SharedNetworkBackend) RequestMaintenance() {
 	if b != nil {
 		b.signalFlowWake()

@@ -335,25 +335,58 @@ func (f closerFunc) Close() error { return f() }
 // The purge deletes by name, and Android's tethering-offload programs sit on
 // the same hooks, so the predicate has to be exact rather than a bare "sb"
 // prefix -- deleting one of those silently turns off forwarding acceleration.
-func TestOwnedTCFilterNameMatchesOnlyOurOwn(t *testing.T) {
+func TestTCSlotZeroOnlyReclaimsOwnedFilterNames(t *testing.T) {
 	for _, name := range []string{
-		"sb_tc_local", "sb_tc_shared", "sb_tc_deliver",
+		"sb_tc_local", "sb_tc_shared",
 		"sb_share_in", "sb_share_out",
 		"sb_icmp_local", "sb_icmp_shared", "sb_icmp_share",
 		"sbi1", "sbo1", "sbc1", "sbifff", "sboa2c",
 	} {
-		if !ownedTCFilterName(name) {
+		if !tcSlotOwnsFilter(0, name) {
 			t.Errorf("own filter %q was not recognised, so a restart leaks it", name)
 		}
 	}
 	for _, name := range []string{
 		"", "sb", "sbi", "sbo", "sbc",
+		"sb_tc_deliver", // private delivery links do not belong to a host-interface slot
 		"sbix", "sbo-1", "sbc 1",
 		"sb_tc", "sb_tc_localx", "xsb_tc_local",
 		"offload", "sched_cls_tether_downstream6_ether", "bpf_prog",
 	} {
-		if ownedTCFilterName(name) {
+		if tcSlotOwnsFilter(0, name) {
 			t.Errorf("foreign filter %q would be deleted by the startup purge", name)
 		}
+	}
+}
+
+func TestInboundCloseRetriesFailedTCAttachment(t *testing.T) {
+	fail, released := true, false
+	attachment := &tcInterfaceAttachment{
+		interfaceName: "test0", localFilter: &netlink.BpfFilter{}, lockOwned: true,
+		lock: closerFunc(func() error { released = true; return nil }),
+		detachFilter: func(*netlink.BpfFilter) error {
+			if fail {
+				return errors.New("device busy")
+			}
+			return nil
+		},
+	}
+	plane := &tcDataPlane{attachments: []*tcInterfaceAttachment{attachment}}
+	inbound := &Inbound{tcDataPlane: plane}
+	if err := inbound.Close(); err == nil {
+		t.Fatal("Close swallowed detach failure")
+	}
+	if inbound.tcDataPlane != plane || plane.IsClosed() || released {
+		t.Fatal("failed Close dropped ownership")
+	}
+	fail = false
+	if err := inbound.Close(); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if inbound.tcDataPlane != nil || !plane.IsClosed() || !released {
+		t.Fatal("successful retry retained resources")
+	}
+	if err := inbound.Close(); err != nil {
+		t.Fatalf("idempotent close: %v", err)
 	}
 }

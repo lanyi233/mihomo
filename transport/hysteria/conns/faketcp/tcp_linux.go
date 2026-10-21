@@ -98,22 +98,29 @@ func (conn *TCPConn) lockflow(addr net.Addr, f func(e *tcpFlow)) {
 
 // clean expired flows
 func (conn *TCPConn) cleaner() {
-	ticker := time.NewTicker(time.Minute)
-	select {
-	case <-conn.die:
-		return
-	case <-ticker.C:
-		conn.flowsLock.Lock()
-		for k, v := range conn.flowTable {
-			if time.Now().Sub(v.ts) > expire {
-				if v.conn != nil {
-					setTTL(v.conn, 64)
-					v.conn.Close()
+	conn.cleanerLoop(time.Minute)
+}
+
+func (conn *TCPConn) cleanerLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-conn.die:
+			return
+		case now := <-ticker.C:
+			conn.flowsLock.Lock()
+			for k, v := range conn.flowTable {
+				if now.Sub(v.ts) > expire {
+					if v.conn != nil {
+						setTTL(v.conn, 64)
+						v.conn.Close()
+					}
+					delete(conn.flowTable, k)
 				}
-				delete(conn.flowTable, k)
 			}
+			conn.flowsLock.Unlock()
 		}
-		conn.flowsLock.Unlock()
 	}
 }
 
@@ -442,6 +449,7 @@ func Dial(network, address string) (*TCPConn, error) {
 	// will hack this tcp connection for packet transmission
 	tcpconnConn, err := newProtectedDialer(lTcpAddr).Dial(network, raddr.String())
 	if err != nil {
+		handle.Close()
 		return nil, err
 	}
 	tcpconn := tcpconnConn.(*net.TCPConn)
@@ -464,6 +472,7 @@ func Dial(network, address string) (*TCPConn, error) {
 	// iptables
 	err = setTTL(tcpconn, 1)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 
@@ -554,6 +563,7 @@ func Listen(network, address string) (*TCPConn, error) {
 	// start listening
 	l, err := net.ListenTCP(network, laddr)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 
@@ -596,9 +606,10 @@ func Listen(network, address string) (*TCPConn, error) {
 				return
 			}
 
-			// if we cannot set TTL = 1, the only thing reasonable is panic
+			// A failed per-connection socket option must not stop the proxy.
 			if err := setTTL(tcpconn, 1); err != nil {
-				panic(err)
+				tcpconn.Close()
+				continue
 			}
 
 			// record net.Conn

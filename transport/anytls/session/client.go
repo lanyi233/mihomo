@@ -6,10 +6,12 @@ import (
 	"io"
 	"math"
 	"net"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/anytls/padding"
 	"github.com/metacubex/mihomo/transport/anytls/skiplist"
 	"github.com/metacubex/mihomo/transport/anytls/util"
@@ -25,6 +27,7 @@ type Client struct {
 
 	idleSession     *skiplist.SkipList[uint64, *Session]
 	idleSessionLock sync.Mutex
+	idleWake        chan struct{}
 
 	sessions     map[uint64]*Session
 	sessionsLock sync.Mutex
@@ -45,6 +48,7 @@ func NewClient(ctx context.Context, dialOut util.DialOutFunc, _padding *atomic.P
 		clientMetadata:     clientMetadata,
 		idleSessionTimeout: idleSessionTimeout,
 		minIdleSession:     minIdleSession,
+		idleWake:           make(chan struct{}, 1),
 		disableReuse:       disableReuse,
 	}
 	if idleSessionCheckInterval <= time.Second*5 {
@@ -56,7 +60,7 @@ func NewClient(ctx context.Context, dialOut util.DialOutFunc, _padding *atomic.P
 	c.die, c.dieCancel = context.WithCancel(ctx)
 	c.idleSession = skiplist.NewSkipList[uint64, *Session]()
 	if !c.disableReuse {
-		util.StartRoutine(c.die, idleSessionCheckInterval, c.idleCleanup)
+		go c.runIdleCleanup(idleSessionCheckInterval)
 	}
 	return c
 }
@@ -101,8 +105,16 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 				session.Close()
 			default:
 				c.idleSessionLock.Lock()
-				session.idleSince = time.Now()
-				c.idleSession.Insert(math.MaxUint64-session.seq, session)
+				// Close may have canceled after the select above, or the
+				// session may already have removed itself from this pool.
+				if c.die.Err() == nil && !session.IsClosed() {
+					session.idleSince = time.Now()
+					c.idleSession.Insert(math.MaxUint64-session.seq, session)
+					select {
+					case c.idleWake <- struct{}{}:
+					default:
+					}
+				}
 				c.idleSessionLock.Unlock()
 			}
 		}
@@ -143,6 +155,13 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	}
 
 	c.sessionsLock.Lock()
+	if c.die.Err() != nil {
+		c.sessionsLock.Unlock()
+		// A dialer may finish after Close has already drained the map.
+		// Do not publish a session that no later Close would see.
+		session.Close()
+		return nil, io.ErrClosedPipe
+	}
 	c.sessions[session.seq] = session
 	c.sessionsLock.Unlock()
 
@@ -170,6 +189,42 @@ func (c *Client) Close() error {
 
 func (c *Client) idleCleanup() {
 	c.idleCleanupExpTime(time.Now().Add(-c.idleSessionTimeout))
+}
+
+func (c *Client) runIdleCleanup(interval time.Duration) {
+	// Preserve the panic reporting previously supplied by util.StartRoutine.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorln("[BUG] %v %s", r, string(debug.Stack()))
+		}
+	}()
+	timer := time.NewTimer(interval)
+	timer.Stop()
+	defer timer.Stop()
+	var tick <-chan time.Time
+	for {
+		select {
+		case <-c.die.Done():
+			return
+		case <-c.idleWake:
+		case <-tick:
+			tick = nil
+			if c.die.Err() != nil {
+				return
+			}
+			c.idleCleanup()
+		}
+		c.idleSessionLock.Lock()
+		needsCleanup := c.idleSession.Len() > max(c.minIdleSession, 0)
+		c.idleSessionLock.Unlock()
+		if needsCleanup && tick == nil {
+			timer.Reset(interval)
+			tick = timer.C
+		} else if !needsCleanup && tick != nil {
+			timer.Stop()
+			tick = nil
+		}
+	}
 }
 
 func (c *Client) idleCleanupExpTime(expTime time.Time) {

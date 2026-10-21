@@ -56,7 +56,7 @@ func (b *CgroupBackend) loadCgroupObjectPrograms() ([]*CiliumEBPF.Program, error
 		}
 		selections = append(selections, programSelection{
 			section: b.cgroupProgramSection(slot),
-			name:    definition.name,
+			name:    cgroupKernelProgramName(definition.name, b.runtime.instanceSlot.Index()),
 		})
 		slots = append(slots, slot)
 	}

@@ -33,29 +33,24 @@ The process must be privileged or hold the following effective capabilities:
 - `CAP_BPF` or `CAP_SYS_ADMIN` for BPF syscalls and cgroup attach.
 - `CAP_NET_ADMIN` for shared-network TC qdisc attachment and route/sysctl setup.
 - `CAP_NET_RAW` for raw socket operations used by the data path.
+- `CAP_SYS_ADMIN` for creating/entering the private network namespace used by
+  local TC and shared socket assignment.
 - The ability to raise `RLIMIT_MEMLOCK` enough for configured BPF maps.
 
 The kernel needs at least `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, and
 `CONFIG_CGROUP_BPF`. `CONFIG_BPF_JIT` is strongly recommended for throughput.
-The shared-network path additionally needs `CONFIG_NET_CLS_BPF`.
+The shared-network path additionally needs `CONFIG_NET_CLS_BPF`. Local TC and
+shared socket assignment also require `CONFIG_NET_NS`, `CONFIG_VETH`, and
+`bpf_sk_assign` (upstream Linux 5.7 or a vendor backport).
 
 ## Capability probe
 
-Run the bundled probe before starting mihomo:
-
-```bash
-bash common/ebpf/check-kernel.sh --mode all
-```
-
-For a specific cgroup path and a shared-network downstream interface:
-
-```bash
-bash common/ebpf/check-kernel.sh --mode all --cgroup /sys/fs/cgroup --interface wlan0
-```
-
-The probe does not attach programs or change routes. With `bpftool` installed
-it performs transient feature probes; without `bpftool` it reports
-`UNKNOWN` for features that cannot be proven safely.
+At startup the inbound probes the selected data planes and reports required
+features and optional performance features. Unsupported map types, helpers and
+attachment modes select compatible fallbacks where available; a missing required
+feature stops startup with its operation and kernel error. Creating the private
+socket-assignment namespace additionally verifies namespace permissions, and
+veth creation reports missing `CONFIG_VETH` or `CAP_NET_ADMIN` support.
 
 ## Build
 
@@ -89,7 +84,7 @@ listeners:
     mode: hybrid              # local | shared | hybrid, default local
     network: [tcp, udp]
     udp-timeout: 300          # seconds
-    tc-priority: 1            # TC filter priority; 1 also enables TCX
+    tc-priority: 1            # lower priorities run first; TCX or clsact
     bypass-rule-set: []       # rule providers (behavior: ipcidr) bypassed by every role
     bypass-tun-direct: true   # see "Coexisting with TUN"
     fakeip-icmp: off          # off (default) | reply, see "FakeIP"
@@ -153,9 +148,9 @@ Field behavior:
   the enablement selector are ignored, including during rule-set updates.
 - `network`: `tcp`, `udp`, or both. Defaults to both when omitted.
 - `udp-timeout`: UDP session timeout in seconds. Defaults to 300, floor 5.
-- `tc-priority`: priority of the TC filters. With the default `1` the inbound
-  attaches through TCX on kernels that support it and falls back to clsact
-  filters otherwise; any other value always uses clsact filters.
+- `tc-priority`: priority of the TC programs; smaller numbers run first.
+  Every priority uses TCX when the kernel and permissions allow ordered
+  attachment, with clsact as fallback. Equal priorities retain attach order.
 - `local.bypass-exclude` / `shared.bypass-exclude`: destination CIDRs that force
   interception ahead of configurable DNS, UID/source, port, private-address
   and rule-set bypasses. The feature does not choose an outbound; normal mihomo
@@ -534,3 +529,58 @@ assignment. Assignment and retirement storage remain bounded LRUs. Startup logs
 show the actual UDP release/cleanup path and fallback reason, and the existing
 30-second datapath report includes `cgroup_udp_release_drops` for kernel-ring or
 userspace-queue overflow.
+
+## Socket-assignment isolation and multiple instances
+
+Local TC and shared socket assignment use a private, unnamed network namespace
+for transparent listeners and reply sockets. A veth pair carries selected
+packets into it; return programs send replies to the original host interface.
+IP addresses, ports and transport checksums stay intact, including fragmented
+IPv4/IPv6 UDP replies. The private return route follows the smallest selected
+interface MTU and is repaired when that MTU changes. Host NAT and listener port
+ownership do not affect these private sockets. Routing and sysctl setup for
+socket assignment stays inside the private namespace.
+
+Cgroup interception and packet rewrite keep their respective routing setup.
+Packet-rewrite instances lease shared interface sysctls; only the last holder
+restores a setting, and only if its current value is still the value applied.
+
+Up to 16 interception backends can share a cgroup or a TC interface. Each holds
+its own slot and reclaims only stale resources owned by that slot. The first
+instance on an otherwise unowned cgroup can clean up all stale interception
+programs. Uncertain ownership across network namespaces prevents cleanup of
+potentially live peers. Existing exclusive cgroup owners, including incompatible
+netd attachments, cause an explicit conflict instead of detaching a live owner.
+
+On TC hooks, smaller `tc-priority` values run first; the first matching
+interception takes the packet. Configure disjoint UID/source/destination
+policies or deliberate priorities when several instances share traffic. Closing
+one instance keeps peers' filters, programs and sysctl leases intact. A failed
+detach retains ownership and can be retried with `Close`.
+
+The legacy `local.state-capacity` and `shared.state-capacity` settings also size
+TC assignment, retirement and return maps. A hybrid TC backend uses the larger
+value; zero selects the default 65536 entries. Return routes use a hash map:
+a full map rejects new routes rather than evicting routes pinned by live
+connections. Retired assignment generations stay in bounded LRUs, so cleanup
+cannot delete a newer generation under the same tuple.
+
+## Runtime diagnostics
+
+`GET /ebpf` on the external controller uses the controller's normal secret
+authentication. It returns `inbounds`, one entry per active eBPF inbound, with
+data-plane selection, self-bypass mode, owned program/map IDs, map capacity and
+occupancy, and bounded maintenance statistics. It inspects only resources held
+by these inbounds, so other processes' maps are excluded.
+
+Map key counting happens only on this explicit request. Counts are a bounded
+observation of mutable maps, not an atomic snapshot. Runtime usage at 85% is a
+warning and at 95% is degraded; configured policy maps are labelled
+`configured`, since filling them is expected. An unreadable count is
+`unavailable`. Unsupported map types are `not_applicable`.
+
+Maintenance statistics include scan progress, known usage, retired generations,
+actual removals and failures. `usage_known` is true only after a complete,
+successful traversal; a partial pass must not be interpreted as an empty map.
+TC cleanup retains active return-route references and a short grace period for
+FIN packets and delayed replies after the last consumer releases its route.

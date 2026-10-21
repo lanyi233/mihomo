@@ -71,7 +71,17 @@ type FeatureTransforms struct {
 	UntransformedFeatures []string          `json:"untransformed_features"`
 }
 
-func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
+func featureOrderForCount(count int) map[int]string {
+	order := make(map[int]string)
+	for idx, name := range defaultFeatureOrder {
+		if idx < count {
+			order[idx] = name
+		}
+	}
+	return order
+}
+
+func LoadTransformsFromModel(modelPath string, featureCount int) (*FeatureTransforms, error) {
 	file, err := os.Open(modelPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open model file: %v", err)
@@ -108,7 +118,7 @@ func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
 	if startIdx == -1 {
 		return &FeatureTransforms{
 			TransformsEnabled: false,
-			FeatureOrder:      defaultFeatureOrder,
+			FeatureOrder:      featureOrderForCount(featureCount),
 			Transforms:        []TransformParams{},
 		}, nil
 	}
@@ -120,7 +130,7 @@ func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
 
 	transformsContent := content[startIdx+len(startMarker) : endIdx]
 
-	featureTransforms, err := parseTransformsContent(transformsContent)
+	featureTransforms, err := parseTransformsContent(transformsContent, featureCount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse transforms parameters: %v", err)
 	}
@@ -128,9 +138,11 @@ func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
 	return featureTransforms, nil
 }
 
-func parseTransformsContent(content string) (*FeatureTransforms, error) {
+func parseTransformsContent(content string, featureCount int) (*FeatureTransforms, error) {
 	featureTransforms := &FeatureTransforms{
-		FeatureOrder: make(map[int]string),
+		// Fill only the model's slots. Keep explicit order entries so that
+		// declarations from another schema still fail compatibility checks.
+		FeatureOrder: featureOrderForCount(featureCount),
 		Transforms:   []TransformParams{},
 	}
 
@@ -236,19 +248,6 @@ func parseTransformsContent(content string) (*FeatureTransforms, error) {
 
 		featureTransforms.Transforms = append(featureTransforms.Transforms, *transform)
 		validTransformCount++
-	}
-
-	if len(featureTransforms.FeatureOrder) == 0 {
-		featureTransforms.FeatureOrder = defaultFeatureOrder
-	} else {
-		expectedCount := MaxFeatureSize
-		if len(featureTransforms.FeatureOrder) != expectedCount {
-			for idx, name := range defaultFeatureOrder {
-				if _, exists := featureTransforms.FeatureOrder[idx]; !exists {
-					featureTransforms.FeatureOrder[idx] = name
-				}
-			}
-		}
 	}
 
 	if len(errors) > 0 {

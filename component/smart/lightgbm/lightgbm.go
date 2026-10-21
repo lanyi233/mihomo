@@ -595,7 +595,7 @@ func (m *WeightModel) loadModel(path string) error {
 		log.Warnln("[Smart] Unsupported model feature schema [%d], using traditional weights", featureCount)
 	}
 
-	transforms, err := LoadTransformsFromModel(path)
+	transforms, err := LoadTransformsFromModel(path, featureCount)
 	if err != nil {
 		return fmt.Errorf("load feature transforms: %w", err)
 	} else {

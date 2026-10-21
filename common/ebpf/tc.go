@@ -21,6 +21,7 @@ const (
 	tcProgramSharedIngressEthernet
 	tcProgramSharedIngressRawIP
 	tcProgramDeliveryIngress
+	tcProgramIsolatedReturn
 	tcProgramCount
 )
 
@@ -58,19 +59,21 @@ const (
 )
 
 type TCConfig struct {
-	ListenerPort      uint16
-	EnableLocal       bool
-	EnableShared      bool
-	EnableIPv4        bool
-	EnableLocalIPv6   bool
-	EnableSharedIPv6  bool
-	EnableTCP         bool
-	EnableUDP         bool
-	DeliveryInterface uint32
-	Policy            CompiledPolicy
-	RoutingMark       uint32
-	SelfBypassMap     *CiliumEBPF.Map
-	TrackProcess      bool
+	Isolated           bool
+	AssignmentCapacity uint32
+	ListenerPort       uint16
+	EnableLocal        bool
+	EnableShared       bool
+	EnableIPv4         bool
+	EnableLocalIPv6    bool
+	EnableSharedIPv6   bool
+	EnableTCP          bool
+	EnableUDP          bool
+	DeliveryInterface  uint32
+	Policy             CompiledPolicy
+	RoutingMark        uint32
+	SelfBypassMap      *CiliumEBPF.Map
+	TrackProcess       bool
 	// FakeIPICMPReply loads the independent fakeip_icmp object (see
 	// tc_fakeip_icmp.go) and attaches it wherever this TC data plane already
 	// attaches local or shared filters. Left false, prepareTC never touches
@@ -123,7 +126,9 @@ type TCAssignment struct {
 	SourceMAC      MACAddress
 	Path           uint8
 	SourceMACValid uint8
+	Reserved       uint32 // explicit C alignment for batch encoding
 	Generation     uint64
+	LastSeenNS     uint64
 }
 
 type tcRuntime struct {
@@ -132,16 +137,27 @@ type tcRuntime struct {
 }
 
 type TCBackend struct {
-	access          sync.RWMutex
-	health          backendHealth
-	runtime         *tcRuntime
-	tcpListenerMap  bool
-	control         tcControl
-	controlMapFD    int
-	assignmentMapFD int
-	selfMapExternal bool
-	bypassIPv4      []netip.Prefix
-	bypassIPv6      []netip.Prefix
+	isolation                  bool
+	assignmentCapacity         uint32
+	assignmentSweepAccess      sync.Mutex
+	assignmentSweepScratch     mapScanScratch[tcAssignKey, TCAssignment]
+	returnAccess               sync.Mutex
+	returnReferences           map[tcReturnReference]uint32
+	returnReleased             map[tcReturnReference]uint64
+	returnSweepScratch         mapScanScratch[tcAssignKey, tcReturnValue]
+	returnFragmentSweepScratch mapScanScratch[tcAssignKey, tcReturnValue]
+	returnSweepRemoved         uint32
+	maintenance                mapMaintenanceState
+	access                     sync.RWMutex
+	health                     backendHealth
+	runtime                    *tcRuntime
+	tcpListenerMap             bool
+	control                    tcControl
+	controlMapFD               int
+	assignmentMapFD            int
+	selfMapExternal            bool
+	bypassIPv4                 []netip.Prefix
+	bypassIPv6                 []netip.Prefix
 	// sharedBypassIPv4/6 are what the shared path's own table holds; see
 	// UpdateCompiledSharedBypassCIDR.
 	sharedBypassIPv4 []netip.Prefix
@@ -175,6 +191,9 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 	if config.RoutingMark == 0 {
 		config.RoutingMark = DefaultTCRoutingMark
 	}
+	if config.AssignmentCapacity == 0 {
+		config.AssignmentCapacity = tcAssignmentCapacity
+	}
 	policy := config.Policy
 	var err error
 	uidEntries := policy.uidEntries
@@ -188,7 +207,7 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 	); err != nil {
 		return nil, err
 	}
-	_ = raiseMemlockLimit()
+	memlockErr := raiseMemlockLimit()
 	mapOverrides := map[string]mapSpecOverride{
 		"tc_local_force_ipv4":    {name: "sb_tc_lforce4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassExcludeEntries, flags: bpfFlagNoPrealloc},
 		"tc_local_force_ipv6":    {name: "sb_tc_lforce6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassExcludeEntries, flags: bpfFlagNoPrealloc},
@@ -196,8 +215,8 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		"tc_shared_force_ipv6":   {name: "sb_tc_sforce6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassExcludeEntries, flags: bpfFlagNoPrealloc},
 		"tc_control":             {name: "sb_tc_ctl", mapType: CiliumEBPF.Array, maxEntries: 1},
 		"tc_listener_sockets":    {name: "sb_tc_listen", mapType: CiliumEBPF.SockMap, maxEntries: 2},
-		"tc_assignment":          {name: "sb_tc_assign", mapType: CiliumEBPF.LRUHash, maxEntries: tcAssignmentCapacity},
-		"tc_retired_assignment":  {name: "sb_tc_retired", mapType: CiliumEBPF.LRUHash, maxEntries: tcAssignmentCapacity},
+		"tc_assignment":          {name: "sb_tc_assign", mapType: CiliumEBPF.LRUHash, maxEntries: config.AssignmentCapacity},
+		"tc_retired_assignment":  {name: "sb_tc_retired", mapType: CiliumEBPF.LRUHash, maxEntries: config.AssignmentCapacity},
 		"tc_uid_policy":          {name: "sb_tc_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: max(uint32(len(uidEntries)), 1), flags: bpfFlagNoPrealloc},
 		"tc_bypass_ipv4":         {name: "sb_tc_bypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
 		"tc_bypass_ipv6":         {name: "sb_tc_bypass6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
@@ -215,9 +234,19 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		"tc_shared_bypass_port":  {name: "sb_tc_sport", mapType: CiliumEBPF.Hash, maxEntries: tcPortPolicyCapacity},
 		"tc_stats":               {name: "sb_tc_stats", mapType: CiliumEBPF.PerCPUArray, maxEntries: tcStatCount},
 	}
+	if config.Isolated {
+		mapOverrides["tc_return"] = mapSpecOverride{name: "sb_tc_return", mapType: CiliumEBPF.Hash, maxEntries: config.AssignmentCapacity}
+		mapOverrides["tc_return_frag"] = mapSpecOverride{name: "sb_tc_rfrag", mapType: CiliumEBPF.LRUHash, maxEntries: min(config.AssignmentCapacity, 1024)}
+	}
 	if config.EnableLocal {
+		selfMapCapacity := uint32(selfBypassSocketCapacity)
+		if config.SelfBypassMap != nil {
+			// This map is replaced before program loading; a full-size
+			// temporary map would double allocation during backend rebuilds.
+			selfMapCapacity = 1
+		}
 		mapOverrides["tc_self_sockets"] = mapSpecOverride{
-			name: "sb_self_sockets", mapType: CiliumEBPF.LRUHash, maxEntries: selfBypassSocketCapacity,
+			name: "sb_self_sockets", mapType: CiliumEBPF.LRUHash, maxEntries: selfMapCapacity,
 		}
 	}
 	legacyTCP := forceLegacyTCP || !config.EnableTCP
@@ -227,7 +256,7 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		maps, loadedPrograms, err = loadTCResources(config, mapOverrides, true)
 	}
 	if err != nil {
-		return nil, err
+		return nil, explainBPFPermissionError(err, memlockErr)
 	}
 	controlValue := tcControl{
 		Flags:             tcFlags(config, policy),
@@ -259,13 +288,18 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		controlValue.FakeIPIPv6Prefix = fakeIPIPv6.Addr().As16()
 		controlValue.FakeIPIPv6Mask = prefixMask16(fakeIPIPv6.Bits())
 	}
+	if config.Isolated {
+		controlValue.Flags |= 1 << 19
+	}
 	backend := &TCBackend{
-		runtime:         &tcRuntime{maps: maps, programs: loadedPrograms},
-		tcpListenerMap:  config.EnableTCP && !legacyTCP,
-		control:         controlValue,
-		controlMapFD:    maps["tc_control"].FD(),
-		assignmentMapFD: maps["tc_assignment"].FD(),
-		selfMapExternal: config.EnableLocal && config.SelfBypassMap != nil,
+		isolation:          config.Isolated,
+		assignmentCapacity: config.AssignmentCapacity,
+		runtime:            &tcRuntime{maps: maps, programs: loadedPrograms},
+		tcpListenerMap:     config.EnableTCP && !legacyTCP,
+		control:            controlValue,
+		controlMapFD:       maps["tc_control"].FD(),
+		assignmentMapFD:    maps["tc_assignment"].FD(),
+		selfMapExternal:    config.EnableLocal && config.SelfBypassMap != nil,
 	}
 	// From here, backend owns maps and loadedPrograms: giving up on either of the
 	// steps below has to close it rather than just returning the step's error, or
@@ -332,6 +366,10 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 			localEthernetSection = "classifier/local_egress_ethernet_process"
 			localRawIPSection = "classifier/local_egress_raw_ip_process"
 		}
+		if config.Isolated {
+			localEthernetSection += "_isolated"
+			localRawIPSection += "_isolated"
+		}
 		selections = append(selections,
 			programSelection{section: localEthernetSection, name: "sb_tc_local_l2"},
 			programSelection{section: localRawIPSection, name: "sb_tc_local_l3"},
@@ -341,7 +379,10 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 	if config.EnableShared {
 		sharedEthernetSection := "classifier/shared_ingress_ethernet"
 		sharedRawIPSection := "classifier/shared_ingress_raw_ip"
-		if !config.EnableTCP {
+		if config.Isolated {
+			sharedEthernetSection += "_isolated"
+			sharedRawIPSection += "_isolated"
+		} else if !config.EnableTCP {
 			sharedEthernetSection += "_udp"
 			sharedRawIPSection += "_udp"
 		} else if legacyTCP {
@@ -354,8 +395,11 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 		)
 		programIndexes = append(programIndexes, tcProgramSharedIngressEthernet, tcProgramSharedIngressRawIP)
 	}
-	if config.EnableLocal {
+	if config.EnableLocal || config.Isolated {
 		deliverySection := "classifier/delivery_ingress"
+		if config.Isolated {
+			deliverySection = "classifier/isolated_delivery"
+		}
 		if !config.EnableTCP {
 			deliverySection += "_udp"
 		} else if legacyTCP {
@@ -363,6 +407,10 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 		}
 		selections = append(selections, programSelection{section: deliverySection, name: "sb_tc_deliver"})
 		programIndexes = append(programIndexes, tcProgramDeliveryIngress)
+	}
+	if config.Isolated {
+		selections = append(selections, programSelection{section: "classifier/isolated_return", name: "sb_tc_return"})
+		programIndexes = append(programIndexes, tcProgramIsolatedReturn)
 	}
 	loadedPrograms, err := loadObjectPrograms(loadTC, maps, selections)
 	if err != nil {
@@ -563,7 +611,7 @@ func (b *TCBackend) LookupAssignment(protocol uint8, source, destination netip.A
 	if err = lookupMap(b.assignmentMapFD, unsafe.Pointer(&key), unsafe.Pointer(&assignment)); err != nil {
 		return TCAssignment{}, err
 	}
-	if protocol == ProtocolUDP && assignment.Generation != 0 {
+	if assignment.Generation != 0 {
 		identity := tcRetiredKey{Flow: key, Generation: assignment.Generation}
 		var retired uint8
 		if err = lookupMap(b.runtime.maps["tc_retired_assignment"].FD(), unsafe.Pointer(&identity), unsafe.Pointer(&retired)); err == nil {
@@ -572,8 +620,16 @@ func (b *TCBackend) LookupAssignment(protocol uint8, source, destination netip.A
 			return TCAssignment{}, err
 		}
 	}
-	if remove {
-		_ = deleteMap(b.assignmentMapFD, unsafe.Pointer(&key))
+	if remove && assignment.Generation == 0 {
+		if err = deleteMap(b.assignmentMapFD, unsafe.Pointer(&key)); err != nil {
+			return TCAssignment{}, err
+		}
+	} else if remove {
+		identity := tcRetiredKey{Flow: key, Generation: assignment.Generation}
+		value := uint8(1)
+		if err = updateMap(b.runtime.maps["tc_retired_assignment"].FD(), unsafe.Pointer(&identity), unsafe.Pointer(&value)); err != nil {
+			return TCAssignment{}, err
+		}
 	}
 	return assignment, nil
 }
@@ -877,6 +933,10 @@ func (b *TCBackend) Close() error {
 	closeErr = E.Errors(closeErr, b.fakeIPICMP.Close())
 	b.fakeIPICMP = nil
 	b.runtime = nil
+	b.returnAccess.Lock()
+	clear(b.returnReferences)
+	clear(b.returnReleased)
+	b.returnAccess.Unlock()
 	b.controlMapFD = -1
 	b.assignmentMapFD = -1
 	b.selfMapExternal = false
@@ -888,3 +948,6 @@ func (b *TCBackend) Close() error {
 	b.hostIPv6 = nil
 	return closeErr
 }
+
+func (b *TCBackend) IsolatedReturnProgramFD() int { return b.programFD(tcProgramIsolatedReturn) }
+func (b *TCBackend) Isolated() bool               { return b != nil && b.isolation }

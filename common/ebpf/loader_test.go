@@ -3,11 +3,81 @@
 package ebpf
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"golang.org/x/sys/unix"
 )
+
+func TestProgramLoadRecoversMaskedVerifierError(t *testing.T) {
+	masked := &CiliumEBPF.VerifierError{Cause: unix.EINVAL}
+	logged := &CiliumEBPF.VerifierError{Cause: unix.EINVAL, Log: []string{"invalid access"}}
+	for _, test := range []struct {
+		name        string
+		initial     error
+		retry       error
+		logDisabled bool
+		want        error
+		calls       int
+	}{
+		{name: "load succeeds", calls: 1},
+		{name: "retry succeeds", initial: masked, calls: 2},
+		{name: "recover complexity error", initial: masked, retry: unix.E2BIG, want: unix.E2BIG, calls: 2},
+		{name: "keep original EINVAL", initial: masked, retry: unix.EINVAL, want: masked, calls: 2},
+		{name: "keep verifier output", initial: logged, want: logged, calls: 1},
+		{name: "logging already disabled", initial: masked, logDisabled: true, want: masked, calls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			original := newProgramCollection
+			t.Cleanup(func() { newProgramCollection = original })
+			calls := 0
+			newProgramCollection = func(_ *CiliumEBPF.CollectionSpec, options CiliumEBPF.CollectionOptions) (*CiliumEBPF.Collection, error) {
+				calls++
+				wantDisabled := test.logDisabled || calls > 1
+				if options.Programs.LogDisabled != wantDisabled || options.Programs.LogLevel != CiliumEBPF.LogLevel(1) {
+					t.Fatalf("load %d changed unexpected program options: %+v", calls, options.Programs)
+				}
+				err := test.initial
+				if calls > 1 {
+					err = test.retry
+				}
+				if err != nil {
+					return nil, fmt.Errorf("program p: %w", err)
+				}
+				return &CiliumEBPF.Collection{}, nil
+			}
+			_, err := loadObjectProgramsWithOptions(func() (*CiliumEBPF.CollectionSpec, error) {
+				return &CiliumEBPF.CollectionSpec{}, nil
+			}, nil, nil, CiliumEBPF.ProgramOptions{LogLevel: CiliumEBPF.LogLevel(1), LogDisabled: test.logDisabled})
+			if !errors.Is(err, test.want) || calls != test.calls {
+				t.Fatalf("load = %v (%d calls), want %v (%d calls)", err, calls, test.want, test.calls)
+			}
+		})
+	}
+}
+
+func TestVerifierLogRetryMaskedError(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"rejected log buffer", fmt.Errorf("program p: %w", &CiliumEBPF.VerifierError{Cause: unix.EINVAL}), true},
+		{"verifier rejection", &CiliumEBPF.VerifierError{Cause: unix.EINVAL, Log: []string{"invalid func unknown#99"}}, false},
+		{"complexity limit", &CiliumEBPF.VerifierError{Cause: unix.E2BIG}, false},
+		{"non-verifier EINVAL", unix.EINVAL, false},
+		{"nil", nil, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := verifierLogRetryMaskedError(test.err); got != test.want {
+				t.Fatalf("masked error = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
 
 type objectMapLayout struct {
 	keySize   uint32
@@ -75,7 +145,7 @@ func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
 		"tc_control":             {4, 72},
 		"tc_listener_sockets":    {4, 4},
-		"tc_assignment":          {44, 32},
+		"tc_assignment":          {44, 40},
 		"tc_self_sockets":        {8, 4},
 		"tc_uid_policy":          {8, 1},
 		"tc_bypass_ipv4":         {8, 1},

@@ -85,6 +85,9 @@ const (
 	datapathStatTCSKAssignFailed
 	datapathStatTCAssignmentUpdateFailed
 	datapathStatTCDeliveryRewriteFailed
+	datapathStatTCReturnUpdateFailed
+	datapathStatTCReturnLookupFailed
+	datapathStatTCReturnConflict
 	datapathStatSharedTokenReservationFailure
 	datapathStatSharedRewriteFailure
 	datapathStatTCFakeIPICMPRewriteFailure
@@ -109,6 +112,9 @@ type datapathStatDescriptor struct {
 // that repeats per packet on a static misconfiguration, which must not be able
 // to raise a warning every interval forever.
 var datapathStatDescriptors = [datapathStatCount]datapathStatDescriptor{
+	datapathStatTCReturnUpdateFailed: {name: "tc_return_update_failed", level: datapathReportInfo, heavy: datapathHeavySustainedDelta},
+	datapathStatTCReturnLookupFailed: {name: "tc_return_lookup_failed", level: datapathReportInfo, heavy: datapathHeavySustainedDelta},
+	datapathStatTCReturnConflict:     {name: "tc_return_conflict", level: datapathReportInfo, heavy: datapathHeavySustainedDelta},
 	datapathStatCgroupUDPReleaseDrops: {
 		name: "cgroup_udp_release_drops", level: datapathReportInfo, heavy: datapathHeavySustainedDelta,
 	},
@@ -399,6 +405,9 @@ func tcDatapathStatReadings(stats ECommon.TCStats) []datapathStatReading {
 		{datapathStatTCSKAssignFailed, stats.SKAssignFailed},
 		{datapathStatTCAssignmentUpdateFailed, stats.AssignmentUpdateFailed},
 		{datapathStatTCDeliveryRewriteFailed, stats.DeliveryRewriteFailed},
+		{datapathStatTCReturnUpdateFailed, stats.ReturnUpdateFailed},
+		{datapathStatTCReturnLookupFailed, stats.ReturnLookupFailed},
+		{datapathStatTCReturnConflict, stats.ReturnConflict},
 	}
 }
 

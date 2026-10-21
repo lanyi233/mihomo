@@ -5,11 +5,46 @@ package ebpf
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 	"unsafe"
 
 	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 )
+
+type trackerTestLink struct {
+	err    error
+	closed bool
+}
+
+func (l *trackerTestLink) Close() error {
+	if l.err == nil {
+		l.closed = true
+	}
+	return l.err
+}
+
+func (l *trackerTestLink) IsClosed() bool { return l.closed }
+
+func TestProcessTrackerKeepsCleanupUntilWritersDetach(t *testing.T) {
+	cleanup := &trackerTestLink{}
+	writer := &trackerTestLink{err: errors.New("detach failed")}
+	tracker := &ProcessTracker{links: []cgroupProgramLink{cleanup, writer}, releaseCleanup: true}
+	if err := tracker.Close(); !errors.Is(err, writer.err) {
+		t.Fatalf("lost detach error: %v", err)
+	}
+	if cleanup.closed || !tracker.ReleaseCleanup() {
+		t.Fatal("release hook detached while metadata writer was still attached")
+	}
+	writer.err = nil
+	if err := tracker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !writer.closed || !cleanup.closed || tracker.ReleaseCleanup() {
+		t.Fatal("retry did not finish cleanup")
+	}
+}
 
 func TestProcessSocketOwnerABI(t *testing.T) {
 	if size := unsafe.Sizeof(ProcessSocketOwner{}); size != 8 {
@@ -62,5 +97,26 @@ func TestProcessTrackerPolicyMetadata(t *testing.T) {
 				t.Fatalf("unexpected metadata: got=%d expected=%d", actual, test.expected)
 			}
 		})
+	}
+}
+
+func TestProcessTrackerUIDUsesClassicNetworkByteOrder(t *testing.T) {
+	instructions := processTrackerInstructions(1, 2, 3, false)
+	var conversions int
+	for _, instruction := range instructions {
+		if instruction.OpCode == asm.BSwap(asm.R0, asm.Word).OpCode {
+			t.Fatal("UID policy requires an ISA v4 unconditional swap")
+		}
+		if instruction.OpCode == asm.HostTo(asm.BE, asm.R0, asm.Word).OpCode && instruction.Constant == 32 {
+			conversions++
+		}
+	}
+	if conversions != 1 {
+		t.Fatalf("UID network-order conversions = %d, want 1", conversions)
+	}
+	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		if err := instructions.Marshal(new(bytes.Buffer), order); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

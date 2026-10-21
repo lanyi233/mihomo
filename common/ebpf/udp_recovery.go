@@ -86,7 +86,7 @@ func (b *CgroupBackend) DeleteUDPRecovery(event UDPReleaseEvent) error {
 // SweepUDPRecovery also covers overflow, unsupported ring buffers and recovery
 // records produced by userspace idle cleanup. Iteration is resumable and bound
 // by budget even on kernels with batch operations.
-func (b *CgroupBackend) SweepUDPRecovery(budget uint32) (bool, error) {
+func (b *CgroupBackend) SweepUDPRecovery(budget uint32) (complete bool, sweepErr error) {
 	if b == nil {
 		return true, nil
 	}
@@ -98,21 +98,39 @@ func (b *CgroupBackend) SweepUDPRecovery(budget uint32) (bool, error) {
 		return true, nil
 	}
 	m := b.runtime.maps["cgroup_udp_recovery_value"]
+	capacity := min(b.mapCapacity.UDPRedirect, uint32(UDPRecoveryMapCapacity))
+	var scan mapScanResult
+	var removed uint32
+	defer func() {
+		if scan.Restarted {
+			b.recoverySweepRemoved = 0
+		}
+		b.recoverySweepRemoved += removed
+		entries := scan.Entries - min(scan.Entries, b.recoverySweepRemoved)
+		b.maintenance.record("sb_cg_rec_value", capacity, scan, removed, entries, complete, sweepErr)
+		if complete {
+			b.recoverySweepRemoved = 0
+		}
+	}()
 	now, idle := monotonicNowNS(), time.Duration(b.udpTimeoutSeconds)*time.Second
 	var expired []UDPReleaseEvent
-	scan, err := b.recoverySweepScratch.scanFallback(m.FD(), min(b.mapCapacity.UDPRedirect, uint32(UDPRecoveryMapCapacity)), budget,
+	scan, sweepErr = b.recoverySweepScratch.scanFallback(m.FD(), capacity, budget,
 		func(key UDPReleaseEvent, _ originalDestinationValue) {
 			if recoveryExpired(key, now, idle) {
 				expired = append(expired, key)
 			}
 		})
-	if err != nil {
-		return false, err
+	if sweepErr != nil {
+		return false, sweepErr
 	}
 	for _, key := range expired {
-		if err = deleteMap(m.FD(), unsafe.Pointer(&key)); err != nil && !errors.Is(err, unix.ENOENT) {
+		if err := deleteMap(m.FD(), unsafe.Pointer(&key)); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
 			return false, err
 		}
+		removed++
 	}
 	return scan.Complete, nil
 }

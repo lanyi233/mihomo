@@ -261,11 +261,21 @@ func newInternalListener(
 	port uint16,
 	handler internalListenerHandler,
 ) (*internalListener, error) {
+	return newInternalListenerAt(socketControl, network, ipv6, port, handler, false)
+}
+
+func newInternalListenerAt(socketControl func(string, string, syscall.RawConn) error, network string, ipv6 bool, port uint16, handler internalListenerHandler, loopback bool) (*internalListener, error) {
 	listenAddress := "0.0.0.0"
 	listenNetwork := network + "4"
 	if ipv6 {
 		listenAddress = "::"
 		listenNetwork = network + "6"
+	}
+	if loopback && network == "udp" {
+		listenAddress = "127.0.0.1"
+		if ipv6 {
+			listenAddress = "::1"
+		}
 	}
 	listenPort := "0"
 	if port != 0 {

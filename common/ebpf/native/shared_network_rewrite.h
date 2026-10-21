@@ -4,17 +4,35 @@
 #ifndef SING_BOX_EBPF_SHARED_NETWORK_REWRITE_H
 #define SING_BOX_EBPF_SHARED_NETWORK_REWRITE_H
 
-INLINE __u64 checksum_flags(__u8 protocol, __u64 size, bool ipv6) {
+INLINE __u64 checksum_flags(__u8 protocol, __u64 size) {
 	__u64 flags = size;
 	if (protocol == IPPROTO_UDP_VALUE) {
         flags |= BPF_F_MARK_MANGLED_0;
-        if (ipv6) flags |= BPF_F_MARK_ENFORCE;
+        flags |= BPF_F_MARK_ENFORCE;
     }
 	return flags;
 }
 
-INLINE __u64 pseudo_header_checksum_flags(__u8 protocol, __u64 size, bool ipv6) {
-	return checksum_flags(protocol, size, ipv6) | BPF_F_PSEUDO_HDR;
+INLINE __u64 pseudo_header_checksum_flags(__u8 protocol, __u64 size) {
+	return checksum_flags(protocol, size) | BPF_F_PSEUDO_HDR;
+}
+
+// A zero IPv4 UDP checksum can mean either "checksum disabled" or a zero
+// CHECKSUM_PARTIAL pseudo-header seed. __sk_buff does not expose ip_summed.
+// A non-pseudo-header adjustment is ignored for CHECKSUM_PARTIAL, so probe
+// with a nonzero delta and immediately restore the field. This preserves both
+// meanings without reading kernel-private skb fields or completing checksums
+// in software. Only the zero-checksum slow path needs these extra helpers.
+INLINE int ipv4_udp_checksum_disabled(struct __sk_buff *skb, __u32 offset) {
+    __u16 checksum;
+    if (skb_load_bytes(skb, offset, &checksum, sizeof(checksum)) != 0) return -1;
+    if (checksum != 0U) return 0;
+    if (l4_csum_replace(skb, offset, 0U, 1U, 2U) != 0 ||
+        skb_load_bytes(skb, offset, &checksum, sizeof(checksum)) != 0) return -1;
+    if (checksum == 0U) return 0;
+    checksum = 0U;
+    if (skb_store_bytes(skb, offset, &checksum, sizeof(checksum), 0U) != 0) return -1;
+    return 1;
 }
 
 INLINE int rewrite_ipv4(
@@ -34,6 +52,9 @@ INLINE int rewrite_ipv4(
 	__u32 checksum_offset = l4_offset + (protocol == IPPROTO_TCP_VALUE
 		? __builtin_offsetof(struct tcp_header_min, checksum)
 		: __builtin_offsetof(struct udp_header_min, checksum));
+	int checksum_disabled = protocol == IPPROTO_UDP_VALUE
+		? ipv4_udp_checksum_disabled(skb, checksum_offset) : 0;
+	if (checksum_disabled < 0) { record_rewrite_failure(); return TC_ACT_SHOT; }
 	if (l3_csum_replace(
 			skb,
             l3_offset + __builtin_offsetof(struct ipv4_header, checksum),
@@ -43,8 +64,8 @@ INLINE int rewrite_ipv4(
 		record_rewrite_failure();
 		return TC_ACT_SHOT;
 	}
-	if (l4_csum_replace(skb, checksum_offset, old_address, new_address, pseudo_header_checksum_flags(protocol, 4U, false)) != 0 ||
-		l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U, false)) != 0) {
+	if (!checksum_disabled && (l4_csum_replace(skb, checksum_offset, old_address, new_address, pseudo_header_checksum_flags(protocol, 4U)) != 0 ||
+		l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U)) != 0)) {
         record_rewrite_failure();
         return TC_ACT_SHOT;
     }
@@ -88,27 +109,20 @@ INLINE int rewrite_ipv6(
         ? __builtin_offsetof(struct ipv6_header, source)
         : __builtin_offsetof(struct ipv6_header, destination));
     __u32 port_offset = l4_offset + (source ? 0U : 2U);
-	if (l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U, true)) != 0 ||
-        l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U, true)) != 0) {
+	if (l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U)) != 0 ||
+        l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U)) != 0) {
         record_rewrite_failure();
         return TC_ACT_SHOT;
     }
-    /* Checksum helpers invalidate all prior packet bounds. */
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
-    /* Callers bound offsets below 8192. Keep the mask and pointer addition
-     * together: 5.4 loses scalar bounds when LLVM spills between them. */
-    void *address = data + (address_offset & 0x1fffU);
-    __u64 bounded_port_offset = port_offset;
-    void *port = data;
-    asm volatile("%1 &= 8191\n%0 += %1"
-        : "+r"(port), "+r"(bounded_port_offset));
-    if (address + 16U > data_end || port + sizeof(new_port) > data_end) return TC_ACT_SHOT;
-    __builtin_memcpy(address, new_address, 16U);
-    __builtin_memcpy(port, &new_port, sizeof(new_port));
+    // Pseudo-header updates subtract the IPv6 address delta from skb->csum
+    // on CHECKSUM_COMPLETE packets. Put it back when writing the address.
+    if (skb_store_bytes(skb, address_offset, new_address, 16U, BPF_F_RECOMPUTE_CSUM) != 0 ||
+        skb_store_bytes(skb, port_offset, &new_port, sizeof(new_port), 0U) != 0) {
+        record_rewrite_failure();
+        return TC_ACT_SHOT;
+    }
     return TC_ACT_OK;
 }
-
 INLINE bool ipv4_token_address(__be32 address, const struct sb_shared_control *control) {
     __u32 host = swap32(address);
     __u32 prefix = ((__u32)control->token_ipv4_prefix[0] << 24U) |

@@ -73,34 +73,46 @@ func deleteMap(mapFD int, key unsafe.Pointer) error {
 func (s *mapScanScratch[K, V]) scan(
 	mapInstance *CiliumEBPF.Map,
 	capacity uint32,
-	fallbackBudget uint32,
+	budget uint32,
 	visit func(K, V),
-) (mapScanResult, error) {
+) (result mapScanResult, err error) {
+	restarted := s.restartPending
+	s.restartPending = false
+	defer func() { result.Restarted = restarted }()
 	if mapInstance == nil {
 		return mapScanResult{}, errBackendClosed
 	}
-	if capacity == 0 || fallbackBudget == 0 {
+	if capacity == 0 || budget == 0 {
 		return mapScanResult{}, unix.EINVAL
 	}
 	if s.lookupSupport.mode.Load() != mapBatchUnsupported {
-		count, err := s.scanBatch(mapInstance, capacity, visit)
+		result, err := s.scanBatch(capacity, budget, func(cursor *CiliumEBPF.MapBatchCursor, keys []K, values []V) (int, error) {
+			return mapInstance.BatchLookup(cursor, keys, values, nil)
+		}, visit)
 		if err == nil {
-			return mapScanResult{Scanned: count, Entries: count, Complete: true}, nil
+			return result, nil
 		}
-		if !mapBatchUnsupportedError(err) {
-			return mapScanResult{Scanned: count}, err
+		if !mapBatchUnsupportedError(err) && !errors.Is(err, unix.ENOSPC) {
+			return result, err
 		}
+		// A hash bucket may exceed the caller's budget. Use the bounded key
+		// iterator instead of enlarging the batch or retrying forever.
 		s.lookupSupport.mode.Store(mapBatchUnsupported)
+		s.batchCursor = CiliumEBPF.MapBatchCursor{}
+		s.batchEntries = 0
+		s.restartPending = true
 		s.resetFallbackScan()
+		return result, nil
 	}
-	return s.scanFallback(mapInstance.FD(), capacity, fallbackBudget, visit)
+	return s.scanFallback(mapInstance.FD(), capacity, budget, visit)
 }
 
 func (s *mapScanScratch[K, V]) scanBatch(
-	mapInstance *CiliumEBPF.Map,
 	capacity uint32,
+	budget uint32,
+	lookup func(*CiliumEBPF.MapBatchCursor, []K, []V) (int, error),
 	visit func(K, V),
-) (uint32, error) {
+) (mapScanResult, error) {
 	if cap(s.keys) < mapBatchMaxEntries {
 		s.keys = make([]K, mapBatchMaxEntries)
 		s.values = make([]V, mapBatchMaxEntries)
@@ -108,29 +120,39 @@ func (s *mapScanScratch[K, V]) scanBatch(
 		s.keys = s.keys[:mapBatchMaxEntries]
 		s.values = s.values[:mapBatchMaxEntries]
 	}
-	var cursor CiliumEBPF.MapBatchCursor
 	var scanned uint32
-	for scanned < capacity {
-		batchSize := min(uint32(mapBatchMaxEntries), capacity-scanned)
-		countValue, err := mapInstance.BatchLookup(&cursor, s.keys[:batchSize], s.values[:batchSize], nil)
+	for scanned < budget && s.batchEntries < capacity {
+		batchSize := min(uint32(mapBatchMaxEntries), budget-scanned, capacity-s.batchEntries)
+		countValue, err := lookup(&s.batchCursor, s.keys[:batchSize], s.values[:batchSize])
 		count := uint32(countValue)
 		for index := range count {
 			visit(s.keys[index], s.values[index])
 		}
 		scanned += count
+		s.batchEntries += count
 		if errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
 			s.lookupSupport.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
-			return scanned, nil
+			return s.completeBatchScan(scanned), nil
 		}
 		if err != nil {
-			return scanned, err
+			return mapScanResult{Scanned: scanned}, err
 		}
 		if count == 0 {
-			return scanned, unix.EIO
+			return mapScanResult{Scanned: scanned}, unix.EIO
 		}
 		s.lookupSupport.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
 	}
-	return scanned, nil
+	if s.batchEntries >= capacity {
+		return s.completeBatchScan(scanned), nil
+	}
+	return mapScanResult{Scanned: scanned}, nil
+}
+
+func (s *mapScanScratch[K, V]) completeBatchScan(scanned uint32) mapScanResult {
+	result := mapScanResult{Scanned: scanned, Entries: s.batchEntries, Complete: true}
+	s.batchCursor = CiliumEBPF.MapBatchCursor{}
+	s.batchEntries = 0
+	return result
 }
 
 func (s *mapScanScratch[K, V]) scanFallback(
@@ -401,6 +423,9 @@ func policyRollbackFailed(err error) bool {
 
 type mapScanScratch[K comparable, V any] struct {
 	lookupSupport  mapBatchSupport
+	batchCursor    CiliumEBPF.MapBatchCursor
+	batchEntries   uint32
+	restartPending bool
 	keys           []K
 	values         []V
 	seen           map[K]struct{}
@@ -410,7 +435,8 @@ type mapScanScratch[K comparable, V any] struct {
 }
 
 type mapScanResult struct {
-	Scanned  uint32
-	Entries  uint32
-	Complete bool
+	Restarted bool // Traversal restarted after switching from batch to per-key lookup.
+	Scanned   uint32
+	Entries   uint32
+	Complete  bool
 }

@@ -8,10 +8,8 @@ import (
 	"net/netip"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -23,33 +21,14 @@ import (
 const (
 	sharedRewriteIngressFilterHandle = 0x5342
 	sharedRewriteEgressFilterHandle  = 0x5343
-	// The permanent fakeip_icmp handle has to sit BELOW the ingress base, not
-	// above it: it shares the ingress parent with the temporary ingress handles,
-	// which run base+sequence over a 12-bit sequence and therefore cover
-	// [0x5343, 0x6341]. A permanent handle inside that window collides with the
-	// 4096th-and-every-4096th rebuild, and attachTCFilter only clears a stale
-	// filter by name -- a handle clash is a hard error that rolls the whole
-	// reconcile back.
-	sharedRewriteICMPFilterHandle = 0x5341
-	// Likewise the temporary ICMP range starts above the temporary ingress one.
-	sharedRewriteICMPTemporaryHandleBase = 0x6400
+	sharedRewriteICMPFilterHandle    = 0x5341
 )
-
-var sharedRewriteAttachmentSequence atomic.Uint32
-
-type sharedRewriteAttachmentOptions struct {
-	skipLock  bool
-	temporary bool
-}
-
-func temporarySharedRewriteAttachmentOptions() sharedRewriteAttachmentOptions {
-	return sharedRewriteAttachmentOptions{temporary: true}
-}
 
 type sharedRewriteDataPlane struct {
 	access        sync.Mutex
 	owner         *sharedRewrite
 	backend       *ECommon.SharedNetworkBackend
+	retired       []*sharedRewriteAttachment
 	attachments   map[string]*sharedRewriteAttachment
 	hostAddresses []netip.Addr
 	priority      uint16
@@ -75,14 +54,11 @@ type sharedRewriteAttachment struct {
 	// alongside ingressFilter/ingressLink (same interface, same direction)
 	// only when backend.FakeIPICMPEnabled(); nil whenever that feature is
 	// off, the same as every other field here is nil when it does not apply.
-	icmpFilter      *netlink.BpfFilter
-	icmpLink        link.Link
-	restoreLocalnet bool
-	// restoreArpAnnounce is the arp_announce value the interface had before
-	// the attachment raised it to 2, or "" when it was already 2. See
-	// raiseSharedArpAnnounce for why redirected replies need it.
-	restoreArpAnnounce string
-	attachmentType     string
+	icmpFilter     *netlink.BpfFilter
+	icmpLink       link.Link
+	localnetLease  *ECommon.InstanceLease
+	arpLease       *ECommon.InstanceLease
+	attachmentType string
 }
 
 func newSharedRewriteDataPlane(owner *sharedRewrite, priority uint16) *sharedRewriteDataPlane {
@@ -160,7 +136,10 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 
 	cleanupCandidates := func(cause error) error {
 		for _, attachment := range slices.Backward(created) {
-			cause = E.Errors(cause, attachment.Close())
+			if err := attachment.Close(); err != nil {
+				cause = E.Errors(cause, err)
+				d.retired = append(d.retired, attachment)
+			}
 		}
 		if hostChanged {
 			rollbackErr := backend.UpdateHostAddresses(d.hostAddresses)
@@ -169,7 +148,11 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 			}
 		}
 		if newBackend {
-			cause = E.Errors(cause, discardSharedRewriteBackend(d.owner, backend))
+			if len(d.retired) > 0 {
+				d.backend = backend
+			} else {
+				cause = E.Errors(cause, discardSharedRewriteBackend(d.owner, backend))
+			}
 		}
 		return cause
 	}
@@ -178,21 +161,11 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 		device := desired[name]
 		previous := current[name]
 		if previous != nil && device.Attrs().Index == previous.interfaceIndex {
-			localnetChanged, err := ensureSharedRewriteLocalnet(name)
-			if err != nil {
-				return cleanupCandidates(E.Cause(err, "repair route_localnet for ", name))
+			if err := claimSharedRewriteLocalnet(name, &previous.localnetLease); err != nil {
+				return cleanupCandidates(err)
 			}
-			if localnetChanged {
-				previous.restoreLocalnet = true
-			}
-			// Something (netd, a sysctl service) may have reset arp_announce
-			// under a healthy attachment; put it back the same way.
-			arpOriginal, err := raiseSharedArpAnnounce(name)
-			if err != nil {
-				return cleanupCandidates(E.Cause(err, "repair arp_announce for ", name))
-			}
-			if arpOriginal != "" && previous.restoreArpAnnounce == "" {
-				previous.restoreArpAnnounce = arpOriginal
+			if err := claimSharedArpAnnounce(name, &previous.arpLease); err != nil {
+				return cleanupCandidates(err)
 			}
 			healthy, err := previous.healthy(device, d.priority, backend.FakeIPICMPEnabled())
 			if err != nil {
@@ -207,15 +180,11 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 		if previous != nil {
 			retired = append(retired, previous)
 		}
-		options := sharedRewriteAttachmentOptions{}
-		if previous != nil && device.Attrs().Index == previous.interfaceIndex {
-			options = temporarySharedRewriteAttachmentOptions()
-			options.skipLock = true
-		} else if previous != nil {
-			options = temporarySharedRewriteAttachmentOptions()
-		}
-		attachment, err := attachSharedRewriteInterfaceWithOptions(device, backend, d.priority, options)
+		attachment, err := attachSharedRewriteInterface(device, backend, d.priority)
 		if err != nil {
+			if attachment != nil {
+				created = append(created, attachment)
+			}
 			return cleanupCandidates(E.Cause(err, "attach shared packet-rewrite interface ", name))
 		}
 		candidate[name] = attachment
@@ -242,41 +211,12 @@ func (d *sharedRewriteDataPlane) reconcile(interfaceNames []string, hostAddresse
 	}
 
 	var closeErr error
-	for _, previous := range retired {
-		replacement := candidate[previous.interfaceName]
-		if replacement != nil && replacement.interfaceIndex == previous.interfaceIndex {
-			lock := previous.lock
-			previous.lock = nil
-			if previous.restoreLocalnet {
-				replacement.restoreLocalnet = true
-				previous.restoreLocalnet = false
-			}
-			// The replacement saw arp_announce already raised, so only the
-			// retired attachment knows the value to restore on detach.
-			if previous.restoreArpAnnounce != "" {
-				if replacement.restoreArpAnnounce == "" {
-					replacement.restoreArpAnnounce = previous.restoreArpAnnounce
-				}
-				previous.restoreArpAnnounce = ""
-			}
-			if err := d.detachLocked(previous); err != nil {
-				// The candidate is already active. Keep it as the committed state
-				// and report the old attachment cleanup failure to the caller.
-				closeErr = E.Errors(closeErr, E.Cause(err, "detach shared packet-rewrite interface ", previous.interfaceName))
-				changed = true
-				if replacement.lock == nil {
-					replacement.lock = lock
-				}
-				continue
-			}
-			replacement.lock = lock
-		} else {
-			if err := d.detachLocked(previous); err != nil {
-				// Continue committing the candidate topology so a stale attachment
-				// cannot prevent a newly discovered interface from being used.
-				closeErr = E.Errors(closeErr, E.Cause(err, "detach shared packet-rewrite interface ", previous.interfaceName))
-				changed = true
-			}
+	pending := append(d.retired, retired...)
+	d.retired = nil
+	for _, previous := range pending {
+		if err := d.detachLocked(previous); err != nil {
+			closeErr = E.Errors(closeErr, err)
+			d.retired = append(d.retired, previous)
 		}
 	}
 
@@ -340,6 +280,15 @@ func (d *sharedRewriteDataPlane) attachmentDescriptionsLocked() []string {
 	return descriptions
 }
 
+func (d *sharedRewriteDataPlane) IsClosed() bool {
+	if d == nil {
+		return true
+	}
+	d.access.Lock()
+	defer d.access.Unlock()
+	return !d.enabled && len(d.attachments) == 0 && len(d.retired) == 0
+}
+
 func (d *sharedRewriteDataPlane) Close() error {
 	if d == nil {
 		return nil
@@ -349,11 +298,24 @@ func (d *sharedRewriteDataPlane) Close() error {
 	var closeErr error
 	if d.enabled && d.backend != nil {
 		closeErr = d.backend.Disable()
-		d.enabled = false
+		if closeErr == nil {
+			d.enabled = false
+		}
 	}
 	for name, attachment := range d.attachments {
-		closeErr = E.Errors(closeErr, d.detachLocked(attachment))
+		if err := d.detachLocked(attachment); err != nil {
+			closeErr = E.Errors(closeErr, err)
+			d.retired = append(d.retired, attachment)
+		}
 		delete(d.attachments, name)
+	}
+	pending := d.retired
+	d.retired = nil
+	for _, attachment := range pending {
+		if err := attachment.Close(); err != nil {
+			closeErr = E.Errors(closeErr, err)
+			d.retired = append(d.retired, attachment)
+		}
 	}
 	return closeErr
 }
@@ -363,85 +325,57 @@ func attachSharedRewriteInterface(
 	backend *ECommon.SharedNetworkBackend,
 	priority uint16,
 ) (*sharedRewriteAttachment, error) {
-	return attachSharedRewriteInterfaceWithOptions(device, backend, priority, sharedRewriteAttachmentOptions{})
-}
-
-func attachSharedRewriteInterfaceWithOptions(
-	device netlink.Link,
-	backend *ECommon.SharedNetworkBackend,
-	priority uint16,
-	options sharedRewriteAttachmentOptions,
-) (*sharedRewriteAttachment, error) {
 	name := device.Attrs().Name
 	attachment := &sharedRewriteAttachment{interfaceName: name, interfaceIndex: device.Attrs().Index}
 	var err error
 	cleanup := func(err error) (*sharedRewriteAttachment, error) {
-		return nil, E.Errors(err, attachment.Close())
-	}
-	if !options.skipLock {
-		interfaceLock, err := acquireTCInterfaceLock(name, device.Attrs().Index)
-		if err != nil {
-			return nil, err
+		if closeErr := attachment.Close(); closeErr != nil {
+			return attachment, E.Errors(err, closeErr)
 		}
-		attachment.lock = interfaceLock
+		return nil, err
 	}
-	attachment.ingressName = "sb_share_in"
-	attachment.egressName = "sb_share_out"
-	attachment.icmpName = "sb_icmp_share"
-	attachment.ingressHandle = sharedRewriteIngressFilterHandle
-	attachment.egressHandle = sharedRewriteEgressFilterHandle
-	attachment.icmpHandle = sharedRewriteICMPFilterHandle
-	if options.temporary {
-		sequence := sharedRewriteAttachmentSequence.Add(1) & 0x0fff
-		if sequence == 0 {
-			sequence = 1
-		}
-		suffix := strconv.FormatUint(uint64(sequence), 16)
-		attachment.ingressName = "sbi" + suffix
-		attachment.egressName = "sbo" + suffix
-		attachment.icmpName = "sbc" + suffix
-		attachment.ingressHandle += uint16(sequence)
-		attachment.egressHandle += uint16(sequence)
-		attachment.icmpHandle = sharedRewriteICMPTemporaryHandleBase + uint16(sequence)
+	interfaceLock, err := acquireTCInterfaceLock(name, device.Attrs().Index)
+	if err != nil {
+		return nil, err
 	}
-	attachment.restoreLocalnet, err = enableSharedRewriteLocalnet(name)
+	attachment.lock = interfaceLock
+	slot := tcLockSlot(attachment.lock)
+	ingress := tcSlotFilter(slot, 0, tcFilterRoleRewriteIngress)
+	egress := tcSlotFilter(slot, 0, tcFilterRoleRewriteEgress)
+	icmp := tcSlotFilter(slot, 0, tcFilterRoleRewriteICMP)
+	attachment.ingressName, attachment.ingressHandle = ingress.name, ingress.handle
+	attachment.egressName, attachment.egressHandle = egress.name, egress.handle
+	attachment.icmpName, attachment.icmpHandle = icmp.name, icmp.handle
+	err = claimSharedRewriteLocalnet(name, &attachment.localnetLease)
 	if err != nil {
 		return cleanup(err)
 	}
-	attachment.restoreArpAnnounce, err = raiseSharedArpAnnounce(name)
+	err = claimSharedArpAnnounce(name, &attachment.arpLease)
 	if err != nil {
 		return cleanup(err)
 	}
-	if priority == defaultTCPriority && tcxSupport.Load() != tcxSupportUnavailable {
-		attachment.egressLink, err = link.AttachTCX(link.TCXOptions{
-			Interface: device.Attrs().Index,
-			Program:   backend.EgressProgram(),
-			Attach:    CiliumEBPF.AttachTCXEgress,
-		})
+	if tcxSupport.Load() != tcxSupportUnavailable {
+		attachment.egressLink, err = ECommon.AttachTCXOrdered(device.Attrs().Index, CiliumEBPF.AttachTCXEgress, backend.EgressProgram(), priority)
 		if err == nil {
-			attachment.ingressLink, err = link.AttachTCX(link.TCXOptions{
-				Interface: device.Attrs().Index,
-				Program:   backend.IngressProgram(),
-				Attach:    CiliumEBPF.AttachTCXIngress,
-			})
+			attachment.ingressLink, err = ECommon.AttachTCXOrdered(device.Attrs().Index, CiliumEBPF.AttachTCXIngress, backend.IngressProgram(), priority)
 		}
 		if err == nil && backend.FakeIPICMPEnabled() {
-			attachment.icmpLink, err = link.AttachTCX(link.TCXOptions{
-				Interface: device.Attrs().Index,
-				Program:   backend.FakeIPICMPSharedReplyProgram(ECommon.TCLinkFramingEthernet),
-				Attach:    CiliumEBPF.AttachTCXIngress,
-			})
+			attachment.icmpLink, err = ECommon.AttachTCXOrdered(device.Attrs().Index, CiliumEBPF.AttachTCXIngress, backend.FakeIPICMPSharedReplyProgram(ECommon.TCLinkFramingEthernet), priority)
 		}
 		if err == nil {
 			tcxSupport.Store(tcxSupportAvailable)
 			attachment.attachmentType = "tcx"
 			return attachment, nil
 		}
-		_ = attachment.closeLinks()
-		if !tcxUnsupportedError(err) {
+		if closeErr := attachment.closeLinks(); closeErr != nil {
+			return cleanup(E.Errors(err, closeErr))
+		}
+		if !tcxUnsupportedError(err) && !errors.Is(err, ECommon.ErrTCXOrderUnavailable) {
 			return cleanup(err)
 		}
-		tcxSupport.CompareAndSwap(tcxSupportUnknown, tcxSupportUnavailable)
+		if tcxUnsupportedError(err) {
+			tcxSupport.CompareAndSwap(tcxSupportUnknown, tcxSupportUnavailable)
+		}
 	}
 	if err = ensureTCClsact(device); err != nil {
 		return cleanup(err)
@@ -499,56 +433,27 @@ func (a *sharedRewriteAttachment) healthy(device netlink.Link, priority uint16, 
 }
 
 func (a *sharedRewriteAttachment) closeLinks() error {
-	var closeErr error
-	if a.ingressLink != nil {
-		closeErr = a.ingressLink.Close()
-		a.ingressLink = nil
-	}
-	if a.egressLink != nil {
-		closeErr = E.Errors(closeErr, a.egressLink.Close())
-		a.egressLink = nil
-	}
-	if a.icmpLink != nil {
-		closeErr = E.Errors(closeErr, a.icmpLink.Close())
-		a.icmpLink = nil
-	}
-	return closeErr
+	return E.Errors(closeOwned(&a.ingressLink), closeOwned(&a.egressLink), closeOwned(&a.icmpLink))
 }
 
 func (a *sharedRewriteAttachment) Close() error {
 	if a == nil {
 		return nil
 	}
-	closeErr := E.Errors(
-		a.closeLinks(),
-		detachTCFilter(a.ingressFilter),
-		detachTCFilter(a.egressFilter),
-		detachTCFilter(a.icmpFilter),
-	)
-	a.ingressFilter = nil
-	a.egressFilter = nil
-	a.icmpFilter = nil
-	if a.restoreLocalnet {
-		closeErr = E.Errors(closeErr, restoreSharedRewriteLocalnet(a.interfaceName))
-		a.restoreLocalnet = false
+	closeErr := E.Errors(a.closeLinks(), detachTCFilterOwned(&a.ingressFilter, detachTCFilter), detachTCFilterOwned(&a.egressFilter, detachTCFilter), detachTCFilterOwned(&a.icmpFilter, detachTCFilter))
+	if closeErr != nil {
+		return closeErr
 	}
-	if a.restoreArpAnnounce != "" {
-		closeErr = E.Errors(closeErr, restoreSharedArpAnnounce(a.interfaceName, a.restoreArpAnnounce))
-		a.restoreArpAnnounce = ""
+	closeErr = E.Errors(releaseSharedRewriteLocalnet(a.interfaceName, &a.localnetLease), releaseSharedArpAnnounce(a.interfaceName, &a.arpLease))
+	if closeErr != nil {
+		return closeErr
 	}
-	if a.lock != nil {
-		closeErr = E.Errors(closeErr, a.lock.Close())
-		a.lock = nil
-	}
+	closeErr = closeOwned(&a.lock)
 	return closeErr
 }
 
 func sharedRewriteLocalnetPath(interfaceName string) string {
 	return "/proc/sys/net/ipv4/conf/" + interfaceName + "/route_localnet"
-}
-
-func enableSharedRewriteLocalnet(interfaceName string) (bool, error) {
-	return ensureSharedRewriteLocalnet(interfaceName)
 }
 
 func ensureSharedRewriteLocalnet(interfaceName string) (bool, error) {

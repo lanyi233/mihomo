@@ -111,3 +111,39 @@ purge. The listener suite passed three repeated race runs on the host and
 three native arm64 runs on the Android 5.4 device. Forwarding still uses two
 allocations per packet; an active-client sweep allocates no heap memory. BPF
 source and objects are unchanged by this follow-up.
+
+## TC namespace isolation and multiple instances (2026-10-20)
+
+Host: WSL2 Arch Linux, `6.18.33.2-microsoft-standard-WSL2`, amd64,
+Go 1.27.0. BPF objects use the pinned NDK r29 Clang 21 compiler for both
+byte orders. `make ebpf_check` reproduces the objects; SHA-256 verification
+also covers the staged source/object bytes against the staged manifest.
+
+The privileged `common/ebpf` and `listener/sing_ebpf` suites pass with
+`with_gvisor,with_ebpf,ebpf_integration` and `SING_BOX_EBPF_INTEGRATION=1`.
+The core suite runs in a private mount namespace with bpffs mounted; the
+listener suite uses disposable network namespaces and interfaces. Coverage:
+
+- Isolated and compatibility classifiers load for TCP/UDP, Ethernet/raw IP,
+  IPv4/IPv6, and optional process tracking. Compatibility IPv6 parsing retains
+  its separate function boundary for older verifiers.
+- Real isolated TCP/UDP round trips, host listener port conflicts and SNAT,
+  oversized IPv4/IPv6 UDP replies, and MTU/filter/MAC/veth repair.
+- Cgroup instance slots, stale reclamation without detaching live peers,
+  distinct IPv6 redirect prefixes without double interception, TCX priority
+  ordering, clsact slots, slot reuse, interface recreation with a live peer,
+  and final-holder sysctl restoration.
+- Return-route capacity rejects extra flows while preserving pinned routes;
+  handle ownership, duplicate releases, alias routes, idle cleanup and the
+  delayed-reply grace period.
+- Assignment retirement scans stay within budget on both batch and per-key
+  iteration paths. Old tombstones do not reject replacement generations, and
+  retiring metadata does not delete concurrently replaceable map entries.
+- Controller diagnostics require the configured secret. Ordinary tests cover
+  map classification/pressure and retrying an inbound close after detach fails.
+
+Host checks include the full repository with `with_gvisor,with_ebpf`, race
+checks for the two eBPF packages and controller, and builds for Linux arm64,
+Android arm64 and Darwin arm64. The controller also compiles/tests without
+`with_ebpf`. These checks exercise the WSL kernel and cross compilation; this
+change has not been run on the previously documented Android 5.4 device.

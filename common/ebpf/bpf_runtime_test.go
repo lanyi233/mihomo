@@ -13,7 +13,7 @@ import (
 )
 
 func TestOperationErrorPreservesVerifierDetails(t *testing.T) {
-	for _, errno := range []error{unix.EINVAL, unix.EACCES, unix.EPERM, unix.EBUSY} {
+	for _, errno := range []error{unix.EINVAL, unix.EACCES, unix.EPERM, unix.EBUSY, unix.E2BIG} {
 		t.Run(errno.Error(), func(t *testing.T) {
 			original := &CiliumEBPF.VerifierError{Cause: errno, Log: []string{"invalid access to packet"}}
 			wrapped := eBPFOperationError("load programs", fmt.Errorf("program shared_ingress: %w", original))

@@ -20,6 +20,7 @@ const bpfFlagNoPrealloc = 1
 
 var rawAttachProgram = link.RawAttachProgram
 var queryCgroupPrograms = link.QueryPrograms
+var newProgramCollection = CiliumEBPF.NewCollectionWithOptions
 
 var loadTC = BPFGen.LoadTC
 
@@ -106,12 +107,9 @@ func attachProgramRawWithMode(
 	// fallback because there is no safe way to distinguish an empty hook from
 	// an unqueryable one.
 	if result, queryErr := queryCgroupPrograms(link.QueryOptions{Target: target, Attach: attachType}); queryErr == nil && len(result.Programs) > 0 {
-		if replacePassThrough {
-			// Only the interception backend owns the exclusive cgroup lock.
-			if _, cleanupErr := detachOwnedCgroupProgramsForAttach(target, attachType); cleanupErr != nil {
-				return legacyCgroupAttachment{}, E.Cause(cleanupErr, "clean stale eBPF cgroup program")
-			}
-		}
+		// Startup reclaims stale programs only while holding the exclusive
+		// cgroup lock. At attach time another live backend may own every
+		// program reported here; no interception program may be detached.
 		result, queryErr = queryCgroupPrograms(link.QueryOptions{Target: target, Attach: attachType})
 		if queryErr != nil {
 			return legacyCgroupAttachment{}, queryErr
@@ -291,10 +289,27 @@ func loadObjectProgramsWithOptions(
 		mapSpec.Flags = info.Flags
 		mapSpec.Extra = nil
 	}
-	collection, err := CiliumEBPF.NewCollectionWithOptions(spec, CiliumEBPF.CollectionOptions{
+	collection, err := newProgramCollection(spec, CiliumEBPF.CollectionOptions{
 		MapReplacements: maps,
 		Programs:        programOptions,
 	})
+	if err != nil && !programOptions.LogDisabled && verifierLogRetryMaskedError(err) {
+		// Before Linux 5.2, a verifier log buffer above 16 MiB is rejected
+		// with EINVAL before verification. Retry without a log to recover
+		// the underlying error (often the verifier's complexity limit).
+		retryOptions := programOptions
+		retryOptions.LogDisabled = true
+		retryCollection, retryErr := newProgramCollection(spec, CiliumEBPF.CollectionOptions{
+			MapReplacements: maps,
+			Programs:        retryOptions,
+		})
+		switch {
+		case retryErr == nil:
+			collection, err = retryCollection, nil
+		case !errors.Is(retryErr, unix.EINVAL):
+			err = retryErr
+		}
+	}
 	if err != nil {
 		return nil, eBPFOperationError("load eBPF programs", err)
 	}
@@ -309,6 +324,11 @@ func loadObjectProgramsWithOptions(
 	}
 	collection.Close()
 	return programs, nil
+}
+
+func verifierLogRetryMaskedError(err error) bool {
+	var verifierErr *CiliumEBPF.VerifierError
+	return errors.Is(err, unix.EINVAL) && errors.As(err, &verifierErr) && len(verifierErr.Log) == 0
 }
 
 func closePrograms(programs []*CiliumEBPF.Program) error {

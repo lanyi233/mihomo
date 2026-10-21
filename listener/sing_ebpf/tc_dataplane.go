@@ -67,6 +67,7 @@ type tcInterfaceAttachment struct {
 	sharedICMPFilter *netlink.BpfFilter
 	localICMPLink    link.Link
 	sharedICMPLink   link.Link
+	priority         uint16
 	attachmentType   string
 	// detachFilter overrides the netlink detach, for tests that need to
 	// reproduce a kernel that refuses to let a filter go.
@@ -74,6 +75,11 @@ type tcInterfaceAttachment struct {
 }
 
 type tcDeliveryLink struct {
+	namespace     *TCNamespace
+	returnFilter  *netlink.BpfFilter
+	enableIPv6    bool
+	replyMTU      int
+	deliveryMAC   commonEBPF.MACAddress
 	redirectName  string
 	deliveryName  string
 	redirect      netlink.Link
@@ -90,6 +96,9 @@ type tcSysctlState struct {
 }
 
 type tcDataPlane struct {
+	namespace   *TCNamespace
+	enableIPv6  bool
+	replyMTU    int
 	access      sync.Mutex
 	backend     *commonEBPF.TCBackend
 	routing     *tcPolicyRouting
@@ -114,31 +123,48 @@ func startTCDataPlane(
 	hostAddresses []netip.Addr,
 	sharedSourceMACPolicy bool,
 	priority uint16,
+	namespaces ...*TCNamespace,
 ) (*tcDataPlane, error) {
-	dataPlane := &tcDataPlane{backend: backend, sharedSourceMACPolicy: sharedSourceMACPolicy, priority: priority}
-	cleanup := func(startErr error) (*tcDataPlane, error) {
-		return nil, E.Errors(startErr, dataPlane.Close())
+	dataPlane := &tcDataPlane{backend: backend, sharedSourceMACPolicy: sharedSourceMACPolicy, priority: priority, enableIPv6: enableIPv6}
+	if len(namespaces) > 0 {
+		dataPlane.namespace = namespaces[0]
 	}
-	routing, err := startTCPolicyRouting(enableIPv6)
+	cleanup := func(startErr error) (*tcDataPlane, error) {
+		closeErr := dataPlane.Close()
+		if dataPlane.IsClosed() {
+			return nil, E.Errors(startErr, closeErr)
+		}
+		return dataPlane, E.Errors(startErr, closeErr)
+	}
+	var routing *tcPolicyRouting
+	err := dataPlane.inNamespace(func() error { var err error; routing, err = startTCPolicyRouting(enableIPv6); return err })
 	if err != nil {
 		return cleanup(err)
 	}
 	dataPlane.routing = routing
 	if err = backend.SetRoutingMark(routing.mark); err != nil {
-		return cleanup(E.Cause(err, "set TC eBPF routing mark"))
+		return cleanup(err)
 	}
-	if localEnabled {
-		delivery, err := createTCDeliveryLink(backend, priority)
+	if dataPlane.namespace != nil {
+		dataPlane.replyMTU, err = dataPlane.isolatedReplyMTU(localInterface, sharedInterfaces)
 		if err != nil {
 			return cleanup(err)
 		}
-		dataPlane.delivery = delivery
+		dataPlane.delivery, err = dataPlane.createIsolatedTCDeliveryLink()
+		if err != nil {
+			return cleanup(err)
+		}
+	} else if localEnabled {
+		dataPlane.delivery, err = createTCDeliveryLink(backend, priority)
+		if err != nil {
+			return cleanup(err)
+		}
 	}
 	attachments, err := attachTCInterfaces(backend, localInterface, sharedInterfaces, sharedSourceMACPolicy, priority)
+	dataPlane.attachments = attachments
 	if err != nil {
 		return cleanup(err)
 	}
-	dataPlane.attachments = attachments
 	dataPlane.localInterface = localInterface
 	dataPlane.sharedInterfaces = slices.Clone(sharedInterfaces)
 	if err = backend.UpdateHostAddresses(hostAddresses); err != nil {
@@ -171,16 +197,15 @@ func attachTCInterfaces(
 			continue
 		}
 		if err != nil {
-			return nil, E.Cause(err, "find TC eBPF interface ", interfaceName)
+			return attachments, E.Cause(err, "find TC eBPF interface ", interfaceName)
 		}
 		attachment, err := attachTCInterface(link, backend, role, sharedSourceMACPolicy, priority)
-		if err != nil {
-			for _, attachment := range slices.Backward(attachments) {
-				_ = attachment.Close()
-			}
-			return nil, E.Cause(err, "attach TC eBPF interface ", interfaceName)
+		if attachment != nil {
+			attachments = append(attachments, attachment)
 		}
-		attachments = append(attachments, attachment)
+		if err != nil {
+			return attachments, E.Cause(err, "attach TC eBPF interface ", interfaceName)
+		}
 	}
 	return attachments, nil
 }
@@ -244,6 +269,7 @@ func (d *tcDataPlane) reconcile(localInterface string, sharedInterfaces []string
 		}
 		for _, createdAttachment := range slices.Backward(created) {
 			rollbackErr = E.Errors(rollbackErr, createdAttachment.Close())
+			d.retire(createdAttachment)
 		}
 		if hostChanged {
 			rollbackErr = E.Errors(rollbackErr, d.backend.UpdateHostAddresses(d.hostAddresses))
@@ -297,25 +323,17 @@ func (d *tcDataPlane) reconcile(localInterface string, sharedInterfaces []string
 			delete(current, interfaceName)
 			continue
 		}
-		var lock io.Closer
-		lockOwned := false
-		if previous != nil {
-			lock = previous.lock
-			replaced[interfaceName] = previous
-			if lock == nil {
-				lock, err = acquireTCInterfaceLock(interfaceName, state.index)
-				if err != nil {
-					return rollback(E.Cause(err, "lock TC eBPF interface ", interfaceName))
-				}
-				lockOwned = true
-			}
-		} else {
-			lock, err = acquireTCInterfaceLock(interfaceName, state.index)
-			if err != nil {
-				return rollback(E.Cause(err, "lock TC eBPF interface ", interfaceName))
-			}
-			lockOwned = true
+		// A replacement belongs to the new interface index and must claim its
+		// own slot even if the interface name is unchanged. The previous
+		// attachment keeps its slot until all of its programs detach.
+		lock, lockErr := acquireTCInterfaceLock(interfaceName, state.index)
+		if lockErr != nil {
+			return rollback(E.Cause(lockErr, "lock TC eBPF interface ", interfaceName))
 		}
+		if previous != nil {
+			replaced[interfaceName] = previous
+		}
+
 		attachment, attachErr := attachTCInterfaceWithLock(
 			netlink.LinkByName,
 			d.backend,
@@ -324,9 +342,10 @@ func (d *tcDataPlane) reconcile(localInterface string, sharedInterfaces []string
 			d.sharedSourceMACPolicy,
 			d.priority,
 			lock,
-			lockOwned,
+			true,
 		)
 		if attachErr != nil {
+			d.retire(attachment)
 			return rollback(E.Cause(attachErr, "attach TC eBPF interface ", interfaceName))
 		}
 		attachments = append(attachments, attachment)
@@ -338,30 +357,9 @@ func (d *tcDataPlane) reconcile(localInterface string, sharedInterfaces []string
 		closeErr = E.Errors(closeErr, previous.Close())
 		d.retire(previous)
 	}
-	for interfaceName, previous := range replaced {
-		lock := previous.lock
-		if lock != nil {
-			previous.lock = nil
-			previous.lockOwned = false
-		}
+	for _, previous := range replaced {
 		closeErr = E.Errors(closeErr, previous.Close())
-		// The lock has already moved to the replacement, but programs that
-		// failed to detach are still in the kernel and have to be retried.
 		d.retire(previous)
-		for _, attachment := range created {
-			if attachment.interfaceName == interfaceName {
-				if lock != nil {
-					attachment.lock = lock
-					attachment.lockOwned = true
-				}
-				break
-			}
-		}
-	}
-	for _, attachment := range created {
-		if _, wasReplaced := replaced[attachment.interfaceName]; !wasReplaced {
-			attachment.lockOwned = true
-		}
 	}
 	d.attachments = attachments
 	if localInterface != "" {
@@ -491,8 +489,7 @@ func (a *tcInterfaceAttachment) filtersAttached(priority uint16, fakeIPICMPEnabl
 			netlink.HANDLE_MIN_EGRESS,
 			"sb_tc_local",
 			tcLocalFilterHandle,
-			priority,
-		)
+			priority, tcLockSlot(a.lock))
 		if err != nil {
 			return false, E.Cause(err, "inspect TC local egress filter on interface ", a.interfaceName)
 		}
@@ -505,8 +502,7 @@ func (a *tcInterfaceAttachment) filtersAttached(priority uint16, fakeIPICMPEnabl
 				netlink.HANDLE_MIN_EGRESS,
 				"sb_icmp_local",
 				tcLocalICMPReplyFilterHandle,
-				priority,
-			)
+				priority, tcLockSlot(a.lock))
 			if err != nil {
 				return false, E.Cause(err, "inspect fakeip_icmp local egress filter on interface ", a.interfaceName)
 			}
@@ -521,8 +517,7 @@ func (a *tcInterfaceAttachment) filtersAttached(priority uint16, fakeIPICMPEnabl
 			netlink.HANDLE_MIN_INGRESS,
 			"sb_tc_shared",
 			tcSharedFilterHandle,
-			priority,
-		)
+			priority, tcLockSlot(a.lock))
 		if err != nil {
 			return false, E.Cause(err, "inspect TC shared ingress filter on interface ", a.interfaceName)
 		}
@@ -535,8 +530,7 @@ func (a *tcInterfaceAttachment) filtersAttached(priority uint16, fakeIPICMPEnabl
 				netlink.HANDLE_MIN_INGRESS,
 				"sb_icmp_shared",
 				tcSharedICMPReplyFilterHandle,
-				priority,
-			)
+				priority, tcLockSlot(a.lock))
 			if err != nil {
 				return false, E.Cause(err, "inspect fakeip_icmp shared ingress filter on interface ", a.interfaceName)
 			}
@@ -583,18 +577,39 @@ func (d *tcDataPlane) repairInfrastructure() (bool, error) {
 	if d.backend == nil {
 		return false, E.New("TC eBPF data plane is closed")
 	}
-	routingChanged, routingErr := d.routing.ensure()
+	mtuChanged := false
+	if d.namespace != nil {
+		mtu, err := d.isolatedReplyMTU(d.localInterface, d.sharedInterfaces)
+		if err != nil {
+			return false, err
+		}
+		if mtu != d.replyMTU {
+			d.replyMTU = mtu
+			mtuChanged = true
+			if d.delivery != nil {
+				d.delivery.replyMTU = mtu
+			}
+		}
+	}
+	var routingChanged bool
+	routingErr := d.inNamespace(func() error { var err error; routingChanged, err = d.routing.ensure(); return err })
 	if d.delivery == nil {
 		return routingChanged, routingErr
 	}
 	deliveryChanged, replaceDelivery, err := d.delivery.repair(d.backend, d.priority)
+	deliveryChanged = deliveryChanged || mtuChanged
 	if err != nil {
 		return routingChanged || deliveryChanged, E.Errors(routingErr, err)
 	}
 	if !replaceDelivery {
 		return routingChanged || deliveryChanged, routingErr
 	}
-	delivery, err := createTCDeliveryLink(d.backend, d.priority)
+	var delivery *tcDeliveryLink
+	if d.namespace != nil {
+		delivery, err = d.createIsolatedTCDeliveryLink()
+	} else {
+		delivery, err = createTCDeliveryLink(d.backend, d.priority)
+	}
 	if err != nil {
 		return routingChanged || deliveryChanged, E.Errors(
 			routingErr,
@@ -611,6 +626,9 @@ func (d *tcDataPlane) repairInfrastructure() (bool, error) {
 }
 
 func (d *tcDeliveryLink) repair(backend *commonEBPF.TCBackend, priority uint16) (bool, bool, error) {
+	if d != nil && d.namespace != nil {
+		return d.repairIsolated(backend, priority)
+	}
 	if d == nil || d.redirect == nil || d.delivery == nil || d.filter == nil {
 		return false, true, nil
 	}
@@ -699,14 +717,6 @@ func (d *tcDeliveryLink) repair(backend *commonEBPF.TCBackend, priority uint16) 
 		changed = true
 	}
 	return changed, false, nil
-}
-
-func closeTCInterfaceAttachments(attachments []*tcInterfaceAttachment) error {
-	var closeErr error
-	for _, attachment := range slices.Backward(attachments) {
-		closeErr = E.Errors(closeErr, attachment.Close())
-	}
-	return closeErr
 }
 
 // retire parks an attachment whose detach did not fully succeed. It still owns
@@ -825,6 +835,7 @@ func attachTCInterfaceWithLock(
 		return nil, E.New("shared source MAC policy requires Ethernet framing on interface ", link.Attrs().Name)
 	}
 	attachment := &tcInterfaceAttachment{
+		priority:       priority,
 		interfaceName:  link.Attrs().Name,
 		interfaceIndex: link.Attrs().Index,
 		framing:        framing,
@@ -833,24 +844,28 @@ func attachTCInterfaceWithLock(
 		lockOwned:      lockOwned,
 	}
 	cleanup := func(startErr error) (*tcInterfaceAttachment, error) {
-		return nil, E.Errors(startErr, attachment.Close())
+		closeErr := attachment.Close()
+		if attachment.IsClosed() {
+			return nil, E.Errors(startErr, closeErr)
+		}
+		return attachment, E.Errors(startErr, closeErr)
 	}
 	if attachment.lock == nil {
 		return nil, E.New("TC eBPF interface lock is unavailable")
 	}
-	// TCX links do not expose the numeric TC priority. Preserve the existing
-	// tc_priority contract by using TCX only with the default priority.
-	if priority == 1 {
-		if tcxSupport.Load() != tcxSupportUnavailable {
-			tcxAttachment, tcxErr := attachTCXInterface(link, backend, attachment)
-			if tcxErr == nil && tcxAttachment {
-				tcxSupport.Store(tcxSupportAvailable)
-				attachment.attachmentType = "tcx"
-				return attachment, nil
-			}
-			if tcxUnsupportedError(tcxErr) {
-				tcxSupport.CompareAndSwap(tcxSupportUnknown, tcxSupportUnavailable)
-			}
+	// The priority marker orders TCX attachments across instances.
+	if tcxSupport.Load() != tcxSupportUnavailable {
+		tcxAttachment, tcxErr := attachTCXInterface(link, backend, attachment, priority)
+		if tcxErr == nil && tcxAttachment {
+			tcxSupport.Store(tcxSupportAvailable)
+			attachment.attachmentType = "tcx"
+			return attachment, nil
+		}
+		if attachment.hasAttachedResources() {
+			return cleanup(tcxErr)
+		}
+		if tcxUnsupportedError(tcxErr) {
+			tcxSupport.CompareAndSwap(tcxSupportUnknown, tcxSupportUnavailable)
 		}
 	}
 	if err = ensureTCClsact(link); err != nil {
@@ -864,8 +879,7 @@ func attachTCInterfaceWithLock(
 			backend.LocalEgressProgramFD(framing),
 			"sb_tc_local",
 			tcLocalFilterHandle,
-			priority,
-		)
+			priority, tcLockSlot(attachment.lock))
 		if err != nil {
 			return cleanup(E.Cause(err, "attach TC local egress filter on interface ", interfaceName))
 		}
@@ -876,8 +890,7 @@ func attachTCInterfaceWithLock(
 				backend.FakeIPICMPLocalReplyProgramFD(framing),
 				"sb_icmp_local",
 				tcLocalICMPReplyFilterHandle,
-				priority,
-			)
+				priority, tcLockSlot(attachment.lock))
 			if err != nil {
 				return cleanup(E.Cause(err, "attach fakeip_icmp local reply filter on interface ", interfaceName))
 			}
@@ -890,8 +903,7 @@ func attachTCInterfaceWithLock(
 			backend.SharedIngressProgramFD(framing),
 			"sb_tc_shared",
 			tcSharedFilterHandle,
-			priority,
-		)
+			priority, tcLockSlot(attachment.lock))
 		if err != nil {
 			return cleanup(E.Cause(err, "attach TC shared ingress filter on interface ", interfaceName))
 		}
@@ -902,8 +914,7 @@ func attachTCInterfaceWithLock(
 				backend.FakeIPICMPSharedReplyProgramFD(framing),
 				"sb_icmp_shared",
 				tcSharedICMPReplyFilterHandle,
-				priority,
-			)
+				priority, tcLockSlot(attachment.lock))
 			if err != nil {
 				return cleanup(E.Cause(err, "attach fakeip_icmp shared reply filter on interface ", interfaceName))
 			}
@@ -917,21 +928,16 @@ func tcxUnsupportedError(err error) bool {
 		errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOSYS))
 }
 
-func attachTCXInterface(linkDevice netlink.Link, backend *commonEBPF.TCBackend, attachment *tcInterfaceAttachment) (bool, error) {
+func attachTCXInterface(linkDevice netlink.Link, backend *commonEBPF.TCBackend, attachment *tcInterfaceAttachment, priority uint16) (bool, error) {
 	closeLinks := func(err error) (bool, error) {
-		_ = attachment.closeLinks()
-		return false, err
+		return false, E.Errors(err, attachment.closeLinks())
 	}
 	if attachment.role.local {
 		program := backend.LocalEgressProgram(attachment.framing)
 		if program == nil {
 			return closeLinks(E.New("TC eBPF local program is unavailable"))
 		}
-		attached, err := link.AttachTCX(link.TCXOptions{
-			Interface: linkDevice.Attrs().Index,
-			Program:   program,
-			Attach:    CiliumEBPF.AttachTCXEgress,
-		})
+		attached, err := commonEBPF.AttachTCXOrdered(linkDevice.Attrs().Index, CiliumEBPF.AttachTCXEgress, program, priority)
 		if err != nil {
 			return closeLinks(err)
 		}
@@ -941,11 +947,7 @@ func attachTCXInterface(linkDevice netlink.Link, backend *commonEBPF.TCBackend, 
 			if icmpProgram == nil {
 				return closeLinks(E.New("fakeip_icmp local reply program is unavailable"))
 			}
-			icmpAttached, err := link.AttachTCX(link.TCXOptions{
-				Interface: linkDevice.Attrs().Index,
-				Program:   icmpProgram,
-				Attach:    CiliumEBPF.AttachTCXEgress,
-			})
+			icmpAttached, err := commonEBPF.AttachTCXOrdered(linkDevice.Attrs().Index, CiliumEBPF.AttachTCXEgress, icmpProgram, priority)
 			if err != nil {
 				return closeLinks(err)
 			}
@@ -957,11 +959,7 @@ func attachTCXInterface(linkDevice netlink.Link, backend *commonEBPF.TCBackend, 
 		if program == nil {
 			return closeLinks(E.New("TC eBPF shared program is unavailable"))
 		}
-		attached, err := link.AttachTCX(link.TCXOptions{
-			Interface: linkDevice.Attrs().Index,
-			Program:   program,
-			Attach:    CiliumEBPF.AttachTCXIngress,
-		})
+		attached, err := commonEBPF.AttachTCXOrdered(linkDevice.Attrs().Index, CiliumEBPF.AttachTCXIngress, program, priority)
 		if err != nil {
 			return closeLinks(err)
 		}
@@ -971,11 +969,7 @@ func attachTCXInterface(linkDevice netlink.Link, backend *commonEBPF.TCBackend, 
 			if icmpProgram == nil {
 				return closeLinks(E.New("fakeip_icmp shared reply program is unavailable"))
 			}
-			icmpAttached, err := link.AttachTCX(link.TCXOptions{
-				Interface: linkDevice.Attrs().Index,
-				Program:   icmpProgram,
-				Attach:    CiliumEBPF.AttachTCXIngress,
-			})
+			icmpAttached, err := commonEBPF.AttachTCXOrdered(linkDevice.Attrs().Index, CiliumEBPF.AttachTCXIngress, icmpProgram, priority)
 			if err != nil {
 				return closeLinks(err)
 			}
@@ -1004,7 +998,7 @@ func updateTCInterfaceAttachment(
 		return E.New("shared source MAC policy requires Ethernet framing on interface ", link.Attrs().Name)
 	}
 	if attachment.attachmentType == "tcx" {
-		return updateTCXInterfaceAttachment(link, backend, attachment, role)
+		return updateTCXInterfaceAttachment(link, backend, attachment, role, priority)
 	}
 	if attachment.localLink != nil || attachment.sharedLink != nil {
 		return E.New("TC eBPF interface has an inconsistent attachment type")
@@ -1038,8 +1032,7 @@ func updateTCInterfaceAttachment(
 			backend.LocalEgressProgramFD(attachment.framing),
 			"sb_tc_local",
 			tcLocalFilterHandle,
-			priority,
-		)
+			priority, tcLockSlot(attachment.lock))
 		if err != nil {
 			return E.Cause(err, "attach TC local egress filter on interface ", attachment.interfaceName)
 		}
@@ -1052,8 +1045,7 @@ func updateTCInterfaceAttachment(
 			backend.FakeIPICMPLocalReplyProgramFD(attachment.framing),
 			"sb_icmp_local",
 			tcLocalICMPReplyFilterHandle,
-			priority,
-		)
+			priority, tcLockSlot(attachment.lock))
 		if err != nil {
 			if addedLocal {
 				rollbackLocal()
@@ -1069,8 +1061,7 @@ func updateTCInterfaceAttachment(
 			backend.SharedIngressProgramFD(attachment.framing),
 			"sb_tc_shared",
 			tcSharedFilterHandle,
-			priority,
-		)
+			priority, tcLockSlot(attachment.lock))
 		if err != nil {
 			if addedLocal {
 				rollbackLocal()
@@ -1086,8 +1077,7 @@ func updateTCInterfaceAttachment(
 			backend.FakeIPICMPSharedReplyProgramFD(attachment.framing),
 			"sb_icmp_shared",
 			tcSharedICMPReplyFilterHandle,
-			priority,
-		)
+			priority, tcLockSlot(attachment.lock))
 		if err != nil {
 			if addedShared {
 				rollbackShared()
@@ -1134,6 +1124,7 @@ func updateTCXInterfaceAttachment(
 	backend *commonEBPF.TCBackend,
 	attachment *tcInterfaceAttachment,
 	role tcInterfaceRole,
+	priority uint16,
 ) error {
 	if role == attachment.role {
 		return nil
@@ -1158,11 +1149,7 @@ func updateTCXInterfaceAttachment(
 			}
 			return E.New("TC eBPF shared program is unavailable")
 		}
-		attached, err := link.AttachTCX(link.TCXOptions{
-			Interface: linkDevice.Attrs().Index,
-			Program:   program,
-			Attach:    attachType,
-		})
+		attached, err := commonEBPF.AttachTCXOrdered(linkDevice.Attrs().Index, attachType, program, priority)
 		if err != nil {
 			return err
 		}
@@ -1189,11 +1176,7 @@ func updateTCXInterfaceAttachment(
 			}
 			return rollback(E.New("fakeip_icmp shared reply program is unavailable"))
 		}
-		icmpAttached, err := link.AttachTCX(link.TCXOptions{
-			Interface: linkDevice.Attrs().Index,
-			Program:   icmpProgram,
-			Attach:    attachType,
-		})
+		icmpAttached, err := commonEBPF.AttachTCXOrdered(linkDevice.Attrs().Index, attachType, icmpProgram, priority)
 		if err != nil {
 			return rollback(err)
 		}
@@ -1656,6 +1639,9 @@ func (d *tcDeliveryLink) Close() error {
 	if d == nil {
 		return nil
 	}
+	if d.namespace != nil {
+		return d.closeIsolated()
+	}
 	var closeErr error
 	if d.filter != nil {
 		closeErr = detachTCFilter(d.filter)
@@ -1682,6 +1668,16 @@ func (d *tcDeliveryLink) Close() error {
 	return closeErr
 }
 
+// IsClosed reports whether every kernel attachment and its ownership has gone.
+func (d *tcDataPlane) IsClosed() bool {
+	if d == nil {
+		return true
+	}
+	d.access.Lock()
+	defer d.access.Unlock()
+	return d.backend == nil && d.routing == nil && d.delivery == nil && len(d.attachments) == 0 && len(d.retiredAttachments) == 0
+}
+
 func (d *tcDataPlane) Close() error {
 	if d == nil {
 		return nil
@@ -1695,16 +1691,31 @@ func (d *tcDataPlane) Close() error {
 	closeErr = E.Errors(closeErr, d.closeRetired())
 	for _, attachment := range slices.Backward(d.attachments) {
 		closeErr = E.Errors(closeErr, attachment.Close())
+		if !attachment.IsClosed() {
+			d.retire(attachment)
+		}
 	}
 	d.attachments = nil
-	// Anything still attached here has no later reconcile to retry it, so the
-	// error is all the caller gets; the lock stays held rather than being handed
-	// over on top of orphaned programs.
-	d.retiredAttachments = nil
-	closeErr = E.Errors(closeErr, d.routing.Close())
-	d.routing = nil
-	closeErr = E.Errors(closeErr, d.delivery.Close())
-	d.delivery = nil
+	// Keep the maps, private namespace and slot locks until all hooks detach.
+	// A later Close can retry without handing ownership to a new instance.
+	if len(d.retiredAttachments) != 0 {
+		return closeErr
+	}
+	if d.routing != nil {
+		if err := d.inNamespace(func() error { return d.routing.Close() }); err != nil {
+			closeErr = E.Errors(closeErr, err)
+		} else {
+			d.routing = nil
+		}
+	}
+	if err := d.delivery.Close(); err != nil {
+		closeErr = E.Errors(closeErr, err)
+	} else {
+		d.delivery = nil
+	}
+	if d.routing != nil || d.delivery != nil {
+		return closeErr
+	}
 	if d.backend != nil {
 		closeErr = E.Errors(closeErr, d.backend.Close())
 		d.backend = nil

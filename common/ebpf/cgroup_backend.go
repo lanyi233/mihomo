@@ -53,6 +53,7 @@ var cgroupProgramDefinitions = [cgroupProgramCount]cgroupProgramDefinition{
 }
 
 type cgroupRuntime struct {
+	instanceSlot                *InstanceSlot
 	udpReleaseReader            *ringbuf.Reader
 	udpReleaseFallback          string
 	cgroupFile                  *os.File
@@ -90,6 +91,8 @@ type cgroupRuntime struct {
 }
 
 type CgroupBackend struct {
+	maintenance           mapMaintenanceState
+	recoverySweepRemoved  uint32
 	access                sync.RWMutex
 	health                backendHealth
 	udpReleaseReadAccess  sync.Mutex
@@ -193,14 +196,39 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	if err != nil {
 		return nil, eBPFOperationError("open cgroup", err)
 	}
-	if err = lockCgroupFile(cgroupFile); err != nil {
+	exclusive, err := lockSharedCgroupFile(cgroupFile)
+	if err != nil {
 		_ = cgroupFile.Close()
 		return nil, err
 	}
-	if err = detachOwnedCgroupPrograms(int(cgroupFile.Fd())); err != nil {
-		_ = cgroupFile.Close()
-		return nil, eBPFOperationError("detach stale cgroup programs", err)
+	if exclusive {
+		if err = detachOwnedCgroupPrograms(int(cgroupFile.Fd())); err != nil {
+			_ = cgroupFile.Close()
+			return nil, err
+		}
+		if err = shareCgroupLock(cgroupFile); err != nil {
+			_ = cgroupFile.Close()
+			return nil, err
+		}
 	}
+	instanceSlot, err := acquireCgroupSlot(cgroupFile)
+	if err != nil {
+		_ = cgroupFile.Close()
+		return nil, err
+	}
+	if !exclusive && !cgroupSharedAcrossNetworkNamespaces(cgroupFile) {
+		if err = detachOwnedCgroupPrograms(int(cgroupFile.Fd()), instanceSlot.Index()); err != nil {
+			_ = instanceSlot.Close()
+			_ = cgroupFile.Close()
+			return nil, err
+		}
+	}
+	keepSlot := false
+	defer func() {
+		if !keepSlot {
+			_ = instanceSlot.Close()
+		}
+	}()
 	socketReleaseSupported := false
 	coarseTimeSupported := false
 	if config.EnableUDP {
@@ -212,6 +240,7 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		}
 	}
 	runtimeState := &cgroupRuntime{
+		instanceSlot:             instanceSlot,
 		cgroupFile:               cgroupFile,
 		maps:                     make(map[string]*CiliumEBPF.Map),
 		programs:                 make([]*CiliumEBPF.Program, cgroupProgramCount),
@@ -231,11 +260,14 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		}
 		_ = closeMaps(runtimeState.maps)
 		_ = runtimeState.cgroupFile.Close()
-		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
+		if errors.Is(err, unix.EPERM) {
+			err = explainBPFPermissionError(err, memlockErr)
+		} else if memlockErr != nil && errors.Is(err, unix.ENOMEM) {
 			err = E.Errors(err, E.Cause(memlockErr, "remove memlock limit"))
 		}
 		return nil, err
 	}
+	keepSlot = true
 	backend := &CgroupBackend{
 		mapCapacity:          mapCapacity,
 		runtime:              runtimeState,

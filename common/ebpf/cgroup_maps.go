@@ -55,6 +55,13 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 		"cgroup_host_ipv4":          {name: "sb_cg_host4", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
 		"cgroup_host_ipv6":          {name: "sb_cg_host6", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
 	}
+	if selfBypassMap != nil {
+		// The temporary object map is replaced by a clone of the shared map
+		// below, so it does not need its own full socket capacity.
+		override := overrides["cgroup_socket_bypass"]
+		override.maxEntries = 1
+		overrides["cgroup_socket_bypass"] = override
+	}
 	if runtimeState.enable_udp && runtimeState.socket_release_supported {
 		runtimeState.udpReleaseFallback = "ringbuf_unsupported"
 		if features.HaveMapType(CiliumEBPF.RingBuf) == nil {

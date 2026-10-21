@@ -51,15 +51,28 @@ func Notify() {
 	defaultNotifier.notify()
 }
 
+// NotifyUnavailable resets state after losing the default interface. Probing
+// providers waits until Notify reports a usable replacement interface.
+func NotifyUnavailable() {
+	defaultNotifier.notifyAvailability(false)
+}
+
 // notify returns a channel closed once this run's goroutine exits, which is
 // what the tests wait on instead of sleeping.
 func (n *notifier) notify() <-chan struct{} {
+	return n.notifyAvailability(true)
+}
+
+func (n *notifier) notifyAvailability(available bool) <-chan struct{} {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	n.access.Lock()
 	previous := n.cancel
 	n.cancel = cancel
 	work := n.work
+	if !available {
+		work.providers = nil
+	}
 	n.access.Unlock()
 	if previous != nil {
 		previous()

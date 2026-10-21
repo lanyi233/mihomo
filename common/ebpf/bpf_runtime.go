@@ -46,6 +46,8 @@ func eBPFOperationError(operation string, err error) error {
 			return E.Cause(err, "eBPF inbound is not supported by this kernel: ", operation)
 		case unix.EPERM, unix.EACCES:
 			return E.Cause(err, "eBPF inbound is not permitted on this device: ", operation)
+		case unix.E2BIG:
+			return E.Cause(err, "eBPF inbound exceeds this kernel's eBPF limits: ", operation)
 		}
 	}
 	return E.Cause(err, operation)
@@ -69,7 +71,7 @@ func checkKernelCapabilities(scope string, cgroupPath string) error {
 		}
 	}
 	if err := features.HaveMapType(CiliumEBPF.Array); err != nil {
-		return eBPFOperationError("probe "+scope+" BPF_MAP_TYPE_ARRAY", err)
+		return eBPFOperationError("probe "+scope+" BPF_MAP_TYPE_ARRAY", explainBPFPermissionError(err, nil))
 	}
 	return nil
 }

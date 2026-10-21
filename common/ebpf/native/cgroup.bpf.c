@@ -75,8 +75,20 @@ INLINE __u64 flow_time_ns(void) {
 #endif
 }
 
-INLINE __u16 swap16(__u16 value) { return __builtin_bswap16(value); }
-INLINE __u32 swap32(__u32 value) { return __builtin_bswap32(value); }
+INLINE __u16 swap16(__u16 value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap16(value);
+#else
+    return value;
+#endif
+}
+INLINE __u32 swap32(__u32 value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap32(value);
+#else
+    return value;
+#endif
+}
 
 INLINE const struct sb_ebpf_cgroup_control *control(void) {
     __u32 key = 0U;
@@ -268,6 +280,8 @@ INLINE bool token_v6(
         __builtin_memcpy(key->token_addr, config->redirect_ipv6_prefix, 8U);
         __builtin_memcpy(key->token_addr + 8U, &seed0, 4U);
         __builtin_memcpy(key->token_addr + 12U, &seed1, 4U);
+        key->token_addr[8] = SB_EBPF_IPV6_TOKEN_MARKER0;
+        key->token_addr[9] = SB_EBPF_IPV6_TOKEN_MARKER1;
         if (protocol == TCP_VALUE) {
             struct sb_ebpf_original_dst *existing = map_lookup(&cgroup_tcp_redirect, key);
             if (existing != 0 && equal_original(existing, value)) return true;
@@ -308,10 +322,38 @@ INLINE bool rewrite_v4_mapped(struct bpf_sock_addr *ctx, const struct sb_ebpf_li
     __builtin_memcpy(&address, key->token_addr, sizeof(address));
     *(volatile __u32 *)&ctx->user_ip6[0] = 0U;
     *(volatile __u32 *)&ctx->user_ip6[1] = 0U;
-    *(volatile __u32 *)&ctx->user_ip6[2] = 0xffff0000U;
+    *(volatile __u32 *)&ctx->user_ip6[2] = swap32(0x0000ffffU);
     *(volatile __u32 *)&ctx->user_ip6[3] = address;
     ctx->user_port = swap16(key->listener_port);
     return true;
+}
+
+_Static_assert(__builtin_offsetof(struct sb_ebpf_udp_flow_key, family) % sizeof(__u32) == 0U &&
+        __builtin_offsetof(struct sb_ebpf_udp_flow_key, addr) -
+                __builtin_offsetof(struct sb_ebpf_udp_flow_key, family) ==
+            __builtin_offsetof(struct sb_ebpf_original_dst, addr) &&
+        __builtin_offsetof(struct sb_ebpf_original_dst, flags) == 20U,
+    "UDP flow key and original destination must share the destination layout");
+
+// A cached proxy decision holds only while the redirect entry it names still
+// records this socket's destination. Without socket-release support that map
+// is an LRU, and nothing else looks the entry up while the cache answers, so
+// the busiest flows would be evicted first and a later flow could claim the
+// token. The lookup also keeps the entry recently used.
+INLINE bool flow_redirect_current(
+    const struct sb_ebpf_udp_flow_key *key,
+    const struct sb_ebpf_listener_key *listener) {
+    const struct sb_ebpf_original_dst *original = map_lookup(&cgroup_udp_redirect, listener);
+    if (original == 0 || original->socket_cookie != key->cookie) return false;
+    // family, protocol, port and address, then flags and reserved bytes, which
+    // are zero for the unconnected sends that this cache serves.
+    const __u32 *expected = (const __u32 *)&key->family;
+    const __u32 *actual = (const __u32 *)original;
+#pragma clang loop unroll(full)
+    for (__u32 index = 0U; index < 5U; ++index) {
+        if (expected[index] != actual[index]) return false;
+    }
+    return actual[5] == 0U;
 }
 
 INLINE int flow_action(
@@ -343,6 +385,10 @@ INLINE int flow_action(
     if (flow->last_seen_seconds != now) flow->last_seen_seconds = now;
     if (flow->action == SB_EBPF_UDP_FLOW_ACTION_BYPASS) return FLOW_CACHE_BYPASS;
     if (flow->action == SB_EBPF_UDP_FLOW_ACTION_PROXY) {
+        if (!flow_redirect_current(&flow_key, &flow->listener)) {
+            map_delete(&cgroup_udp_flow, &flow_key);
+            return FLOW_CACHE_MISS;
+        }
         if (mapped_context) rewrite_v4_mapped(ctx, &flow->listener);
         else if (family == AF_INET_VALUE) rewrite_v4(ctx, &flow->listener);
         else rewrite_v6(ctx, &flow->listener);
@@ -472,7 +518,7 @@ INLINE bool restore_udp_peer_for_empty_v6(
     if (peer->family == AF_INET_VALUE) {
         address[0] = 0U;
         address[1] = 0U;
-        address[2] = 0xffff0000U;
+        address[2] = swap32(0x0000ffffU);
         __builtin_memcpy(&address[3], peer->addr, sizeof(address[3]));
     } else if (peer->family == AF_INET6_VALUE) {
         __builtin_memcpy(address, peer->addr, sizeof(peer->addr));
@@ -677,6 +723,7 @@ INLINE int handle_v6(
             (void)restore_udp_peer_v6(cookie, address, &port);
         }
     }
+    if (sb_ebpf_ipv6_redirect_token((const __u8 *)address)) return 1;
     bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
     bool intercept_dns = port == 53U && config->dns_mode != SB_EBPF_DNS_MODE_OFF;
     if (connected_udp) {
@@ -784,7 +831,7 @@ INLINE int recv_v6(struct bpf_sock_addr *ctx, bool enable_native_ipv6) {
         __builtin_memcpy(&original_address, original->addr, sizeof(original_address));
         *(volatile __u32 *)&ctx->user_ip6[0] = 0U;
         *(volatile __u32 *)&ctx->user_ip6[1] = 0U;
-        *(volatile __u32 *)&ctx->user_ip6[2] = 0xffff0000U;
+        *(volatile __u32 *)&ctx->user_ip6[2] = swap32(0x0000ffffU);
         *(volatile __u32 *)&ctx->user_ip6[3] = original_address;
         ctx->user_port = swap16(original->port);
         return 1;

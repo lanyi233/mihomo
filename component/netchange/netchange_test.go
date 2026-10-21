@@ -74,6 +74,40 @@ func TestNotifyRunsEveryStage(t *testing.T) {
 	}
 }
 
+func TestNotifyOfflineResetsWithoutProbingAndResumeProbes(t *testing.T) {
+	r := &recorder{}
+	n := newTestNotifier(r, nil)
+	waitDone(t, n.notifyAvailability(false))
+	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "reset"}) {
+		t.Fatalf("offline fan-out: %v", events)
+	}
+	waitDone(t, n.notify())
+	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "reset", "flush", "reset", "check"}) {
+		t.Fatalf("resume fan-out: %v", events)
+	}
+}
+
+func TestOfflineNotificationSupersedesPendingProbes(t *testing.T) {
+	r := &recorder{}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	n := newTestNotifier(r, func() {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+	})
+	online := n.notify()
+	<-entered
+	offline := n.notifyAvailability(false)
+	close(release)
+	waitDone(t, online)
+	waitDone(t, offline)
+	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "flush", "reset"}) {
+		t.Fatalf("offline event did not suppress pending checks: %v", events)
+	}
+}
+
 func TestNotifySupersedesInFlightRun(t *testing.T) {
 	r := &recorder{}
 	entered := make(chan struct{}, 4)

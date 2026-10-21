@@ -30,6 +30,7 @@ func (b *CgroupBackend) Close() error {
 	if b.runtime.cgroupFile != nil {
 		closeErr = E.Errors(closeErr, b.runtime.cgroupFile.Close())
 	}
+	closeErr = E.Errors(closeErr, b.runtime.instanceSlot.Close())
 	b.runtime = nil
 	b.tcpRedirectMapFD = -1
 	b.udpRedirectMapFD = -1

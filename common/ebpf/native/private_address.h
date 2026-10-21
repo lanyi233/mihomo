@@ -51,6 +51,21 @@ static __attribute__((always_inline)) bool sb_ebpf_ipv6_safety_bypass(const __u8
     return address[12] == 0xffU;
 }
 
+// Every IPv6 cgroup redirect token carries this marker in the first two bytes
+// of its interface identifier. Several interception backends can share the
+// cgroup hooks a socket runs through, and a backend whose program runs after
+// another one's sees the token that one redirected to. It has to recognize the
+// destination as already redirected instead of redirecting it a second time.
+// IPv4 tokens need no marker: they lie in 127.0.0.0/8, which the safety bypass
+// already skips.
+#define SB_EBPF_IPV6_TOKEN_MARKER0 0x5eU
+#define SB_EBPF_IPV6_TOKEN_MARKER1 0xb6U
+
+static __attribute__((always_inline)) bool sb_ebpf_ipv6_redirect_token(const __u8 address[16]) {
+    return (address[0] & 0xfeU) == 0xfcU &&
+        address[8] == SB_EBPF_IPV6_TOKEN_MARKER0 && address[9] == SB_EBPF_IPV6_TOKEN_MARKER1;
+}
+
 static __attribute__((always_inline)) bool sb_ebpf_ipv4_private_address(const __u8 address[4]) {
     if (address[0] == 0U || address[0] == 10U || address[0] == 127U || address[0] >= 224U) return true;
     if (address[0] == 100U && (address[1] & 0xc0U) == 0x40U) return true;
