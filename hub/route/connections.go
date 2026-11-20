@@ -17,10 +17,22 @@ import (
 func connectionRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getConnections)
+	r.Get("/summary", getConnectionSummary)
+	r.Get("/sources", getConnectionSources)
 	r.Delete("/", closeAllConnections)
 	r.Delete("/{id}", closeConnection)
 	r.Delete("/smart/{id}", setSmartBlock)
 	return r
+}
+
+func getConnectionSummary(writer http.ResponseWriter, request *http.Request) {
+	render.JSON(writer, request, statistic.DefaultManager.Summary())
+}
+
+// getConnectionSources reports traffic per source address since start, so a
+// dashboard can show per-device totals and derive rates between polls.
+func getConnectionSources(writer http.ResponseWriter, request *http.Request) {
+	render.JSON(writer, request, render.M{"sources": statistic.DefaultManager.SourceTraffic()})
 }
 
 func getConnections(w http.ResponseWriter, r *http.Request) {

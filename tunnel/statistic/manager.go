@@ -2,8 +2,10 @@ package statistic
 
 import (
 	"context"
+	"net/netip"
 	"os"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -49,6 +51,11 @@ type Manager struct {
 	uploadArmed  atomic.Bool
 	uploadWaitMu sync.Mutex
 	uploadWait   chan struct{}
+
+	// Per-source traffic counters, see source.go.
+	sources     xsync.Map[netip.Addr, *sourceCounter]
+	sourceCount stdatomic.Int32
+	sourceSweep stdatomic.Int64
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -155,6 +162,22 @@ func (m *Manager) Snapshot() *Snapshot {
 	}
 }
 
+type TrafficSummary struct {
+	DownloadTotal   int64  `json:"downloadTotal"`
+	UploadTotal     int64  `json:"uploadTotal"`
+	ConnectionCount int    `json:"connectionCount"`
+	Memory          uint64 `json:"memory"`
+}
+
+func (m *Manager) Summary() TrafficSummary {
+	return TrafficSummary{
+		DownloadTotal:   m.downloadTotal.Load(),
+		UploadTotal:     m.uploadTotal.Load(),
+		ConnectionCount: m.connections.Size(),
+		Memory:          m.Memory(),
+	}
+}
+
 func (m *Manager) updateMemory() {
 	m.memoryMu.Lock()
 	defer m.memoryMu.Unlock()
@@ -178,6 +201,7 @@ func (m *Manager) ResetStatistic() {
 	m.downloadTemp.Store(0)
 	m.downloadBlip.Store(0)
 	m.downloadTotal.Store(0)
+	m.resetSources()
 }
 
 func (m *Manager) wakeTraffic() {

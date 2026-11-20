@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	C "github.com/metacubex/mihomo/constant"
+
 	"github.com/metacubex/tailscale/ipn"
 	"github.com/metacubex/tailscale/tsnet"
 )
@@ -209,6 +211,25 @@ func TestParseAdvertiseRoutes(t *testing.T) {
 
 	if _, err := parseAdvertiseRoutes(TailscaleOption{AdvertiseRoutes: []string{"not-a-prefix"}}); err == nil {
 		t.Fatal("invalid route accepted")
+	}
+}
+
+func TestTailscaleEagerStartSkippedDuringConfigCheck(t *testing.T) {
+	routes := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+	t.Cleanup(func() { C.SetConfigCheck(false) })
+	serve := []tailscaleServeTarget{{port: 80, network: "tcp", address: "127.0.0.1:9099"}}
+	if tailscaleEagerStart(nil, nil) {
+		t.Fatal("eager start without advertised routes")
+	}
+	if !tailscaleEagerStart(routes, nil) {
+		t.Fatal("advertised routes did not start eagerly")
+	}
+	if !tailscaleEagerStart(nil, serve) {
+		t.Fatal("serve targets did not start eagerly")
+	}
+	C.SetConfigCheck(true)
+	if tailscaleEagerStart(routes, serve) {
+		t.Fatal("configuration check started the backend eagerly")
 	}
 }
 

@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"context"
 	"errors"
 
 	CiliumEBPF "github.com/cilium/ebpf"
@@ -35,6 +36,12 @@ const (
 	// MapCategoryConfiguredPolicy identifies maps whose capacity is derived
 	// from the currently compiled policy.
 	MapCategoryConfiguredPolicy MapCategory = "configured_policy"
+	// MapCategoryCache identifies LRU maps whose entries are only a
+	// recomputable fast-path cache. Stale entries are left for LRU eviction,
+	// so running near capacity is their steady state; an evicted entry merely
+	// falls back to the full policy evaluation. Maps whose eviction would drop
+	// live connection state must stay MapCategoryRuntime.
+	MapCategoryCache MapCategory = "cache"
 )
 
 // mapMetadata is the library-owned semantic metadata for a kernel map. The
@@ -94,11 +101,22 @@ var configuredPolicyMapMetadata = map[string]mapMetadata{
 	"sb_sh_port":        {category: MapCategoryConfiguredPolicy},
 }
 
+// cacheMapMetadata lists LRU maps that only memoize a decision the datapath
+// can recompute. Entries are never removed on connection close, so these maps
+// sit near max_entries during normal operation and must not be reported as
+// pressure.
+var cacheMapMetadata = map[string]mapMetadata{
+	// Shared-network bypass decision cache; a miss re-runs the bypass policy.
+	"sb_sh_bypass": {category: MapCategoryCache},
+}
+
 func metadataForMapName(name string) mapMetadata {
-	for fullName, metadata := range configuredPolicyMapMetadata {
-		// BPF_OBJ_NAME_LEN includes the trailing NUL.
-		if name == fullName[:min(len(fullName), 15)] {
-			return metadata
+	for _, table := range []map[string]mapMetadata{configuredPolicyMapMetadata, cacheMapMetadata} {
+		for fullName, metadata := range table {
+			// BPF_OBJ_NAME_LEN includes the trailing NUL.
+			if name == fullName[:min(len(fullName), 15)] {
+				return metadata
+			}
 		}
 	}
 	return mapMetadata{category: MapCategoryRuntime}
@@ -110,7 +128,7 @@ type MapOccupancyReport struct {
 	Error  string         `json:"error,omitempty"`
 }
 
-func inspectMapOccupancy(m *CiliumEBPF.Map, id CiliumEBPF.MapID, info *CiliumEBPF.MapInfo) MapOccupancy {
+func inspectMapOccupancy(ctx context.Context, m *CiliumEBPF.Map, id CiliumEBPF.MapID, info *CiliumEBPF.MapInfo) MapOccupancy {
 	item := MapOccupancy{ID: id, Name: info.Name, Category: metadataForMapName(info.Name).category, Type: info.Type.String(),
 		MaxEntries: info.MaxEntries, KeySize: info.KeySize, ValueSize: info.ValueSize, Flags: info.Flags}
 	if !occupancySupported(info.Type) {
@@ -119,7 +137,7 @@ func inspectMapOccupancy(m *CiliumEBPF.Map, id CiliumEBPF.MapID, info *CiliumEBP
 	}
 	item.Supported = true
 	var err error
-	item.Entries, err = countMapKeys(m, info.KeySize, info.MaxEntries)
+	item.Entries, err = countMapKeys(ctx, m, info.KeySize, info.MaxEntries)
 	if err != nil {
 		item.Error = err.Error()
 	}
@@ -148,6 +166,9 @@ func mapPressure(category MapCategory, entries, maxEntries uint32, failed bool) 
 	if category == MapCategoryConfiguredPolicy {
 		return "configured"
 	}
+	if category == MapCategoryCache {
+		return "cache"
+	}
 	if maxEntries == 0 {
 		return "unknown"
 	}
@@ -164,18 +185,32 @@ func mapPressure(category MapCategory, entries, maxEntries uint32, failed bool) 
 
 var errMapKeyIterationAborted = errors.New("map key iteration aborted")
 
-func countMapKeys(m *CiliumEBPF.Map, keySize uint32, maxEntries uint32) (uint32, error) {
+const mapOccupancyKeyBudget = 16384
+
+type mapKeyIterator interface {
+	NextKey(key, nextKey any) error
+}
+
+func countMapKeys(ctx context.Context, iterator mapKeyIterator, keySize uint32, maxEntries uint32) (uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	key := make([]byte, keySize)
 	next := make([]byte, keySize)
-	err := m.NextKey(nil, &next)
+	err := iterator.NextKey(nil, &next)
 	var entries uint32
 	for err == nil {
-		if entries >= maxEntries {
+		if entries%64 == 0 {
+			if err := ctx.Err(); err != nil {
+				return entries, err
+			}
+		}
+		if entries >= min(maxEntries, mapOccupancyKeyBudget) {
 			return entries, errMapKeyIterationAborted
 		}
 		entries++
 		copy(key, next)
-		err = m.NextKey(key, &next)
+		err = iterator.NextKey(key, &next)
 	}
 	if errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
 		return entries, nil

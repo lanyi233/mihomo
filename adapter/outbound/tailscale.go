@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -54,7 +55,11 @@ type Tailscale struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	startAccess      sync.Mutex
-	startErr         error
+	startErr         atomic.TypedValue[error]
+	startTaskAccess  sync.Mutex
+	startTask        *tailscaleStartTask
+	controlAccess    sync.Mutex
+	controlStatus    tailscaleControlSnapshot
 	serverFactory    func() *tsnet.Server
 	serverGeneration uint64
 	closed           bool
@@ -83,6 +88,8 @@ type Tailscale struct {
 	advertisedRoutes []netip.Prefix
 	udpFlows         chan struct{}
 	inboundTunnel    C.Tunnel
+	serveTargets     []tailscaleServeTarget
+	serveServers     []*http.Server
 
 	unregisterDNSResolver func()
 }
@@ -127,6 +134,8 @@ type TailscaleOption struct {
 	ExitNodeAllowLANAccess *bool    `proxy:"exit-node-allow-lan-access,omitempty"`
 	AdvertiseRoutes        []string `proxy:"advertise-routes,omitempty"`
 	AdvertiseExitNode      bool     `proxy:"advertise-exit-node,omitempty"`
+
+	Serve []TailscaleServeOption `proxy:"serve,omitempty"`
 }
 
 // parseAdvertiseRoutes builds the AdvertiseRoutes prefix list from the
@@ -203,6 +212,10 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	if _, err := buildTailscaleMaskedPrefs(option); err != nil {
 		return nil, err
 	}
+	serveTargets, err := parseTailscaleServe(option.Serve)
+	if err != nil {
+		return nil, err
+	}
 	if option.StateDir == "" {
 		option.StateDir = "tailscale"
 	}
@@ -232,6 +245,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		cancel:           cancel,
 		backendInitGate:  newTailscaleBackendInitGate(),
 		advertisedRoutes: advertisedRoutes,
+		serveTargets:     serveTargets,
 		udpFlows:         make(chan struct{}, 1024),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
@@ -306,15 +320,34 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		} else {
 			log.Warnln("[Tailscale](%s) advertise-routes configured but no tunnel available; inbound flows will be rejected", option.Name)
 		}
-		// Advertised routes mean this node serves the tailnet (subnet router
-		// or exit node), so bring the backend up eagerly instead of waiting
-		// for the first locally-routed connection. Do this in the background:
-		// tsnet startup may need to wait for state files, control-plane reachability,
-		// or Android's network to come out of Doze. A transient failure must not
-		// prevent the rest of the configuration (and VPN) from starting.
-		go outbound.startWithRetry()
+	}
+	// Advertised routes and serve targets mean this node serves the tailnet
+	// (subnet router, exit node or published service), so bring the backend up
+	// eagerly instead of waiting for the first locally-routed connection. Do
+	// this in the background: tsnet startup may need to wait for state files,
+	// control-plane reachability, or Android's network to come out of Doze. A
+	// transient failure must not prevent the rest of the configuration (and
+	// VPN) from starting.
+	if tailscaleServesTailnet(advertisedRoutes, serveTargets) {
+		if tailscaleEagerStart(advertisedRoutes, serveTargets) {
+			go outbound.startWithRetry()
+		} else {
+			log.Debugln("[Tailscale](%s) configuration check: skip eager backend start", option.Name)
+		}
 	}
 	return outbound, nil
+}
+
+func tailscaleServesTailnet(advertisedRoutes []netip.Prefix, serveTargets []tailscaleServeTarget) bool {
+	return len(advertisedRoutes) > 0 || len(serveTargets) > 0
+}
+
+// tailscaleEagerStart reports whether the backend should come up while the
+// outbound is constructed. `mihomo -t` only parses the configuration; starting
+// tsnet there would bring up a second node with the same state directory and
+// identity as the running instance.
+func tailscaleEagerStart(advertisedRoutes []netip.Prefix, serveTargets []tailscaleServeTarget) bool {
+	return tailscaleServesTailnet(advertisedRoutes, serveTargets) && !C.ConfigCheck()
 }
 
 func (t *Tailscale) start() error {
@@ -323,15 +356,52 @@ func (t *Tailscale) start() error {
 	return t.startLocked()
 }
 
+type tailscaleStartTask struct {
+	done chan struct{}
+	err  error
+}
+
+func (t *Tailscale) startContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	t.startTaskAccess.Lock()
+	task := t.startTask
+	if task == nil {
+		if t.serverStarted.Load() {
+			t.startTaskAccess.Unlock()
+			return t.ctx.Err()
+		}
+		task = &tailscaleStartTask{done: make(chan struct{})}
+		t.startTask = task
+		go func() {
+			task.err = t.start()
+			t.startTaskAccess.Lock()
+			t.startTask = nil
+			close(task.done)
+			t.startTaskAccess.Unlock()
+		}()
+	}
+	t.startTaskAccess.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.ctx.Done():
+		return t.ctx.Err()
+	case <-task.done:
+		return task.err
+	}
+}
+
 func (t *Tailscale) startLocked() error {
 	if t.closed {
 		err := errors.New("tailscale outbound closed")
-		t.startErr = err
+		t.startErr.Store(err)
 		t.completeBackendInitializedLockedForStart(t.currentBackendInitGate(), err)
 		return err
 	}
 	if err := t.ctx.Err(); err != nil {
-		t.startErr = err
+		t.startErr.Store(err)
 		t.completeBackendInitializedLockedForStart(t.currentBackendInitGate(), err)
 		return err
 	}
@@ -339,6 +409,7 @@ func (t *Tailscale) startLocked() error {
 		return nil
 	}
 	gate := t.resetBackendInitializedLockedForStart()
+	t.resetControlStatus()
 	if t.serverFactory != nil {
 		t.server = t.serverFactory()
 	}
@@ -350,7 +421,7 @@ func (t *Tailscale) startLocked() error {
 	if t.server == nil {
 		err := errors.New("tailscale server is unavailable")
 		t.server = nil
-		t.startErr = err
+		t.startErr.Store(err)
 		t.completeBackendInitializedLockedForStart(gate, err)
 		return err
 	}
@@ -360,7 +431,7 @@ func (t *Tailscale) startLocked() error {
 	if t.inboundTunnel != nil {
 		t.registerInboundHandlers(server, t.inboundTunnel)
 	}
-	t.startErr = nil
+	t.startErr.Store(nil)
 	closeServer := func() error {
 		if t.closeServerHook != nil {
 			return t.closeServerHook()
@@ -374,17 +445,17 @@ func (t *Tailscale) startLocked() error {
 		return server.Start()
 	}
 	if err := startServer(); err != nil {
-		t.startErr = err
+		t.startErr.Store(err)
 		// Start is one-shot even when it returns an error. Close the attempted
 		// instance before retiring it so a partial tsnet initialization cannot
 		// leak listeners, goroutines, or state locks across retry attempts.
 		if closeErr := closeServer(); closeErr != nil {
-			t.startErr = errors.Join(err, fmt.Errorf("close after start failure: %w", closeErr))
+			t.startErr.Store(errors.Join(err, fmt.Errorf("close after start failure: %w", closeErr)))
 		}
 		// tsnet.Start uses sync.Once; a failed instance must never be reused.
 		t.server = nil
-		t.completeBackendInitializedLockedForStart(gate, t.startErr)
-		return t.startErr
+		t.completeBackendInitializedLockedForStart(gate, t.startErr.Load())
+		return t.startErr.Load()
 	}
 	t.serverStarted.Store(true)
 	// Close may cancel the outbound while tsnet.Start is in flight. Never
@@ -392,9 +463,9 @@ func (t *Tailscale) startLocked() error {
 	// cancellation (notably when eager start runs in the background).
 	if err := t.ctx.Err(); err != nil {
 		closeErr := t.closeStartedServer()
-		t.startErr = errors.Join(err, closeErr)
-		t.completeBackendInitializedLockedForStart(gate, t.startErr)
-		return t.startErr
+		t.startErr.Store(errors.Join(err, closeErr))
+		t.completeBackendInitializedLockedForStart(gate, t.startErr.Load())
+		return t.startErr.Load()
 	}
 	ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 	defer cancel()
@@ -403,14 +474,15 @@ func (t *Tailscale) startLocked() error {
 		applyPrefs = t.startApplyPrefsHook
 	}
 	if err := applyPrefs(ctx); err != nil {
-		t.startErr = err
+		t.startErr.Store(err)
 		if closeErr := t.closeStartedServer(); closeErr != nil {
-			t.startErr = errors.Join(err, fmt.Errorf("close after start failure: %w", closeErr))
+			t.startErr.Store(errors.Join(err, fmt.Errorf("close after start failure: %w", closeErr)))
 		}
-		t.completeBackendInitializedLockedForStart(gate, t.startErr)
-		return t.startErr
+		t.completeBackendInitializedLockedForStart(gate, t.startErr.Load())
+		return t.startErr.Load()
 	}
-	t.startErr = nil
+	t.startErr.Store(nil)
+	t.startServeLocked(server)
 	go t.watchBackendStateFor(server, generation, gate)
 	return nil
 }
@@ -420,6 +492,7 @@ func (t *Tailscale) closeStartedServer() error {
 		return nil
 	}
 	server := t.server
+	t.closeServeLocked()
 	// Retire the instance before attempting Close. A Close error must not make
 	// a tsnet.Server look reusable: Start is one-shot on that object.
 	t.serverStarted.Store(false)
@@ -439,7 +512,7 @@ func (t *Tailscale) closeStartedServer() error {
 func (t *Tailscale) startWithRetry() {
 	delay := tailscaleStartRetryDelay
 	for {
-		if err := t.start(); err == nil {
+		if err := t.startContext(t.ctx); err == nil {
 			return
 		} else if t.ctx.Err() != nil {
 			return
@@ -459,7 +532,7 @@ func (t *Tailscale) startWithRetry() {
 }
 
 func (t *Tailscale) ensureStarted(ctx context.Context) error {
-	if err := t.start(); err != nil {
+	if err := t.startContext(ctx); err != nil {
 		return err
 	}
 	if err := t.waitBackendInitialized(ctx); err != nil {
@@ -551,7 +624,7 @@ func (t *Tailscale) subscribeIPNBusOnServer(server *tsnet.Server) (tailscaleIPNB
 	if err != nil {
 		return nil, err
 	}
-	return lc.WatchIPNBus(t.ctx, ipn.NotifyInitialState)
+	return lc.WatchIPNBus(t.ctx, ipn.NotifyInitialState|ipn.NotifyInitialPrefs|ipn.NotifyInitialNetMap|ipn.NotifyInitialHealthState|ipn.NotifyNoNetMap)
 }
 
 func (t *Tailscale) consumeIPNBus(watcher tailscaleIPNBusWatcher, exitNodeNeedsStatus bool) error {
@@ -567,6 +640,10 @@ func (t *Tailscale) consumeIPNBusFor(watcher tailscaleIPNBusWatcher, exitNodeNee
 		if err != nil {
 			return err
 		}
+		if server != nil && !t.isCurrentServer(server, serverGeneration) {
+			return errTailscaleServerRetired
+		}
+		t.observeControlNotify(n)
 		if n.ErrMessage != nil {
 			if server != nil && !t.isCurrentServer(server, serverGeneration) {
 				return errTailscaleServerRetired
@@ -619,6 +696,7 @@ func (t *Tailscale) observeBackendState(state ipn.State, exitNodeNeedsStatus boo
 
 func (t *Tailscale) observeBackendStateFor(state ipn.State, exitNodeNeedsStatus bool, gate *tailscaleBackendInitGate, server *tsnet.Server, serverGeneration uint64) {
 	t.backendStateAccess.Lock()
+	t.observeControlNotify(ipn.Notify{State: &state})
 	if state != t.backendState {
 		t.backendState = state
 		t.backendGeneration++
@@ -677,6 +755,10 @@ func (t *Tailscale) retryExitNodePrefs(ctx context.Context, generation uint64, g
 
 func (t *Tailscale) markBackendUnavailable(err error) {
 	t.backendStateAccess.Lock()
+	t.controlAccess.Lock()
+	t.controlStatus.state = ipn.NoState
+	t.controlStatus.stateError = err
+	t.controlAccess.Unlock()
 	t.backendGeneration++
 	t.backendState = ipn.NoState
 	t.backendStateErr = err
@@ -1112,7 +1194,8 @@ func (t *Tailscale) Close() error {
 	t.startAccess.Lock()
 	defer t.startAccess.Unlock()
 	t.closed = true
-	t.startErr = errors.New("tailscale outbound closed")
-	t.completeBackendInitialized(t.currentBackendInitGate(), t.startErr)
+	t.startErr.Store(errors.New("tailscale outbound closed"))
+	t.resetControlStatus()
+	t.completeBackendInitialized(t.currentBackendInitGate(), t.startErr.Load())
 	return t.closeStartedServer()
 }
